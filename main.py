@@ -20,15 +20,15 @@ from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
 )
-import sklearn.neighbors._base
 from scipy.stats import randint
 from tableone import TableOne
 from lifelines import KaplanMeierFitter, CoxPHFitter
 from lifelines.statistics import logrank_test
 import sys
 
-sys.modules["sklearn.neighbors.base"] = sklearn.neighbors._base
-from missingpy import MissForest
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+from sklearn.impute import IterativeImputer
+from sklearn.ensemble import ExtraTreesRegressor
 from itertools import combinations
 
 pd.set_option("future.no_silent_downcasting", True)
@@ -59,9 +59,17 @@ def CG_equation(age, weight, female, serum_creatinine):
     return ((140 - age) * weight * constant) / (72 * serum_creatinine)
 
 # Load data
-survival_df = pd.read_excel(
-    "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/df.xlsx",
-)
+DATA_DIR = os.getenv("DATA_DIR", "/workspace/data")
+SURVIVAL_FILE = os.getenv("SURVIVAL_FILE", "df.xlsx")
+COHORT_FILE = os.getenv("COHORT_FILE", "NICM Arrhythmia Cohort for Xiaotan Final.xlsx")
+survival_path = os.path.join(DATA_DIR, SURVIVAL_FILE)
+cohort_path = os.path.join(DATA_DIR, COHORT_FILE)
+# Gracefully exit if required data files are missing
+if not os.path.exists(survival_path) or not os.path.exists(cohort_path):
+    print(f"Data files not found. Expected SURVIVAL_FILE at '{survival_path}' and COHORT_FILE at '{cohort_path}'. Set DATA_DIR/SURVIVAL_FILE/COHORT_FILE environment variables accordingly.")
+    sys.exit(0)
+
+survival_df = pd.read_excel(survival_path)
 survival_df["PE_Time"] = survival_df.apply(
     lambda row: (
         row["Time from ICD Implant to Primary Endpoint (in days)"]
@@ -88,12 +96,12 @@ survival_df = survival_df[
     ]
 ]
 with_icd = pd.read_excel(
-    "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/NICM Arrhythmia Cohort for Xiaotan Final.xlsx",
+    cohort_path,
     sheet_name="ICD",
 )
 with_icd["ICD"] = 1
 without_icd = pd.read_excel(
-    "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/NICM Arrhythmia Cohort for Xiaotan Final.xlsx",
+    cohort_path,
     sheet_name="No_ICD",
 )
 without_icd["ICD"] = 0
@@ -150,28 +158,35 @@ print(missing_pct)
 
 def impute_misforest(X, random_seed):
     """
-    Non-parametric iterative imputation method based on random forest.
+    Iterative imputation with ExtraTreesRegressor (tree-based, robust to scaling).
     """
-    scaler = StandardScaler()
-    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns)
-    imputer = MissForest(random_state=random_seed)
-    X_imputed_scaled = pd.DataFrame(
-        imputer.fit_transform(X_scaled), columns=X.columns, index=X.index
+    estimator = ExtraTreesRegressor(
+        n_estimators=100,
+        random_state=random_seed,
+        n_jobs=-1,
     )
-    X_imputed_unscaled = pd.DataFrame(
-        scaler.inverse_transform(X_imputed_scaled), columns=X.columns, index=X.index
+    imputer = IterativeImputer(
+        estimator=estimator,
+        random_state=random_seed,
+        max_iter=10,
+        sample_posterior=False,
+        initial_strategy="median",
     )
-    return X_imputed_unscaled
+    X_imputed = pd.DataFrame(
+        imputer.fit_transform(X), columns=X.columns, index=X.index
+    )
+    return X_imputed
 
 
 def conversion_and_imputation(df, features, labels):
     df = df.copy()
     df = df[features + labels]
 
-    # Convert multiclass categorical variables to numerical format
+    # Safely convert NYHA Class (ordinal) to numeric codes; preserve NaN for imputation
     ordinal = "NYHA Class"
-    le = LabelEncoder()
-    df[ordinal] = le.fit_transform(df[ordinal])
+    if ordinal in df.columns:
+        codes, uniques = pd.factorize(df[ordinal], sort=True)
+        df[ordinal] = np.where(codes == -1, np.nan, codes).astype("float")
 
     # Convert binary columns to int
     binary_cols = [
@@ -215,7 +230,7 @@ def conversion_and_imputation(df, features, labels):
 clean_df = conversion_and_imputation(df, features, labels)
 
 # Additional
-clean_df["Age by decade"] = df["Age at CMR"] // 10
+clean_df["Age by decade"] = (clean_df["Age at CMR"] // 10).astype(int)
 clean_df["CrCl>45"] = (
     clean_df["Cockcroft-Gault Creatinine Clearance (mL/min)"] > 45
 ).astype(int)
@@ -328,7 +343,7 @@ def rf_evaluate(
     search = RandomizedSearchCV(
         estimator=base_clf,
         param_distributions=param_dist,
-        n_iter=50,
+        n_iter=int(os.getenv("RF_N_ITER", "20")),
         scoring=ap_scorer,
         cv=cv,
         random_state=random_state,
@@ -344,7 +359,7 @@ def rf_evaluate(
         importances = best_model.feature_importances_
         idx = np.argsort(importances)[::-1]
         # highlight LVEF and NYHA Class in red
-        highlight = {"LVEF", "NYHA"}
+        highlight = {"LVEF", "NYHA Class", "NYHA>2"}
         colors = ["red" if feat_names[i] in highlight else "lightgray" for i in idx]
         plt.figure(figsize=(8, 4))
         plt.bar(range(len(feat_names)), importances[idx], color=colors)
@@ -693,6 +708,9 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         eval_df = y_te_b.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
+        y_true = y_te_b[label].values
+        mask_m = eval_df["Female"] == 0
+        mask_f = eval_df["Female"] == 1
 
         # Overall
         acc = accuracy_score(y_true, pred_sa)
@@ -1027,6 +1045,9 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         eval_df = y_te_p.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
+        y_true = y_te_p[label].values
+        mask_m = eval_df["Female"] == 0
+        mask_f = eval_df["Female"] == 1
 
         # Overall
         acc = accuracy_score(y_true, pred_sa)
@@ -1359,6 +1380,9 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         eval_df = y_te_r.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
+        y_true = y_te_r[label].values
+        mask_m = eval_df["Female"] == 0
+        mask_f = eval_df["Female"] == 1
 
         # Overall
         acc = accuracy_score(y_true, pred_sa)
@@ -1727,7 +1751,7 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
     summary_table = summary_table.drop(index=rows_to_drop)
 
     # Save result
-    output_dir = "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff"
+    output_dir = os.getenv("OUTPUT_DIR", "/workspace/output")
     output_file = "summary_results.xlsx"
     os.makedirs(output_dir, exist_ok=True)
     full_path = os.path.join(output_dir, output_file)
@@ -1737,7 +1761,8 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
     return results, summary_table
 
 
-res, summary = multiple_random_splits(train_df, 100)
+N_SPLITS = int(os.getenv("N_SPLITS", "10"))
+res, summary = multiple_random_splits(train_df, N_SPLITS)
 print(summary)
 
 from sklearn.tree import plot_tree
@@ -1793,7 +1818,7 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     search = RandomizedSearchCV(
         estimator=base_clf,
         param_distributions=param_dist,
-        n_iter=50,
+        n_iter=int(os.getenv("RF_N_ITER", "20")),
         scoring=ap_scorer,
         cv=cv,
         random_state=seed,
@@ -1807,7 +1832,7 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     best_male = search.best_estimator_
     print("Best hyperparameters (Male):", search.best_params_)
     train_prob_m = best_male.predict_proba(X_train_m)[:, 1]
-    best_thr_m = find_best_threshold(y_train_m, train_prob_m)
+    best_thr_m = find_best_threshold(y_train_m["VT/VF/SCD"], train_prob_m)
     prob_m = best_male.predict_proba(X_test_m)[:, 1]
     pred_m = (prob_m >= best_thr_m).astype(int)
     df.loc[df["Female"] == 0, "pred_male"] = pred_m
@@ -1850,7 +1875,7 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     best_female = search.best_estimator_
     print("Best hyperparameters (Female):", search.best_params_)
     train_prob_f = best_female.predict_proba(X_train_f)[:, 1]
-    best_thr_f = find_best_threshold(y_train_f, train_prob_f)
+    best_thr_f = find_best_threshold(y_train_f["VT/VF/SCD"], train_prob_f)
     prob_f = best_female.predict_proba(X_test_f)[:, 1]
     pred_f = (prob_f >= best_thr_f).astype(int)
     df.loc[df["Female"] == 1, "pred_female"] = pred_f
@@ -2164,7 +2189,7 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
         m_boot = df_boot[df_boot["Female"] == 0]
         if not m_boot.empty:
             X_m_boot = m_boot[features]
-            y_m_boot = m_boot[labels]
+            y_m_boot = m_boot["VT/VF/SCD"]
             prob_m_boot = best_male.predict_proba(X_m_boot)[:, 1]
             pred_m_boot = (prob_m_boot >= best_thr_m).astype(int)
             acc_m = accuracy_score(y_m_boot, pred_m_boot)
@@ -2182,7 +2207,7 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
         f_boot = df_boot[df_boot["Female"] == 1]
         if not f_boot.empty:
             X_f_boot = f_boot[features]
-            y_f_boot = f_boot[labels]
+            y_f_boot = f_boot["VT/VF/SCD"]
             prob_f_boot = best_female.predict_proba(X_f_boot)[:, 1]
             pred_f_boot = (prob_f_boot >= best_thr_f).astype(int)
             acc_f = accuracy_score(y_f_boot, pred_f_boot)
