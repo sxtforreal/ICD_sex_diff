@@ -686,9 +686,9 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
             feat_names=benchmark_features,
             random_state=seed,
         )
-        prob_sa_us = model_sa_us.predict_proba(X_te_b_us)[:, 1]
+        prob_sa_us = model_sa_us.predict_proba(X_te_b)[:, 1]
         pred_sa_us = (prob_sa_us >= threshold_sa_us).astype(int)
-        eval_df = y_te_b_us.reset_index(drop=True).copy()
+        eval_df = y_te_b.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa_us
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
 
@@ -1021,9 +1021,9 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
             feat_names=proposed_features,
             random_state=seed,
         )
-        prob_sa_us = model_sa_us.predict_proba(X_te_p_us)[:, 1]
+        prob_sa_us = model_sa_us.predict_proba(X_te_p)[:, 1]
         pred_sa_us = (prob_sa_us >= threshold_sa_us).astype(int)
-        eval_df = y_te_p_us.reset_index(drop=True).copy()
+        eval_df = y_te_p.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa_us
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
 
@@ -1356,9 +1356,9 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
             feat_names=real_proposed_features,
             random_state=seed,
         )
-        prob_sa_us = model_sa_us.predict_proba(X_te_r_us)[:, 1]
+        prob_sa_us = model_sa_us.predict_proba(X_te_r)[:, 1]
         pred_sa_us = (prob_sa_us >= threshold_sa_us).astype(int)
-        eval_df = y_te_r_us.reset_index(drop=True).copy()
+        eval_df = y_te_r.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa_us
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
 
