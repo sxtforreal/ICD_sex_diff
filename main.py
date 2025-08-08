@@ -3,6 +3,7 @@
 # Key improvements: removed duplicate imports, merged data processing, simplified function structure, and reduced unnecessary output.
 
 import sys
+import os
 import re
 import warnings
 from math import ceil
@@ -149,7 +150,7 @@ def impute_misforest(X, random_seed):
         sample_posterior=False,
         initial_strategy="median",
     )
-    # 直接返回DataFrame，避免重复赋值
+    # Return a DataFrame directly to avoid redundant assignments
     return pd.DataFrame(
         imputer.fit_transform(X), columns=X.columns, index=X.index
     )
@@ -159,12 +160,12 @@ def conversion_and_imputation(df, features, labels):
     df = df.copy()
     df = df[features + labels]
 
-    # NYHA Class (ordinal) 转为数字，保留NaN
+    # Convert NYHA Class (ordinal) to numeric while preserving NaN
     if "NYHA Class" in df.columns:
         codes, _ = pd.factorize(df["NYHA Class"], sort=True)
         df["NYHA Class"] = np.where(codes == -1, np.nan, codes).astype(float)
 
-    # 二元变量转为float
+    # Convert binary variables to float
     binary_cols = [
         "Female", "DM", "HTN", "HLP", "AF", "Beta Blocker",
         "ACEi/ARB/ARNi", "Aldosterone Antagonist", "VT/VF/SCD",
@@ -175,12 +176,12 @@ def conversion_and_imputation(df, features, labels):
             df[c] = df[c].replace({"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0})
         df[c] = df[c].astype(float)
 
-    # 缺失值插补
+    # Impute missing values
     X = df[features]
     imputed_X = impute_misforest(X, 0)
     for col in labels:
         imputed_X[col] = df[col].values
-    # 二元变量阈值化
+    # Threshold binary variables
     for c in [col for col in binary_cols if col in imputed_X.columns]:
         imputed_X[c] = (imputed_X[c] >= 0.5).astype(float)
     return imputed_X
@@ -233,7 +234,7 @@ def find_best_threshold(y_true, y_scores):
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_scores)
     f1_scores = 2 * precisions * recalls / (precisions + recalls + 1e-8)
     best_idx = np.nanargmax(f1_scores)
-    # thresholds长度比f1_scores少1，需判断
+    # thresholds has one fewer element than f1_scores; guard the index
     if best_idx >= len(thresholds):
         best_idx = len(thresholds) - 1
     return thresholds[best_idx]
@@ -377,7 +378,7 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
     results = {m: {met: [] for met in metrics} for m in model_names}
 
     for seed in range(N):
-        # print(f"Running split #{seed+1}")  # 可选保留
+        # print(f"Running split #{seed+1}")  # optional to keep
         # 1) Split into train/test + male/female
         train_df, test_df = train_test_split(
             df, test_size=0.3, random_state=seed, stratify=df[label]
@@ -685,9 +686,9 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
             feat_names=benchmark_features,
             random_state=seed,
         )
-        prob_sa_us = model_sa_us.predict_proba(X_te_b_us)[:, 1]
+        prob_sa_us = model_sa_us.predict_proba(X_te_b)[:, 1]
         pred_sa_us = (prob_sa_us >= threshold_sa_us).astype(int)
-        eval_df = y_te_b_us.reset_index(drop=True).copy()
+        eval_df = y_te_b.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa_us
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
 
@@ -1020,9 +1021,9 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
             feat_names=proposed_features,
             random_state=seed,
         )
-        prob_sa_us = model_sa_us.predict_proba(X_te_p_us)[:, 1]
+        prob_sa_us = model_sa_us.predict_proba(X_te_p)[:, 1]
         pred_sa_us = (prob_sa_us >= threshold_sa_us).astype(int)
-        eval_df = y_te_p_us.reset_index(drop=True).copy()
+        eval_df = y_te_p.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa_us
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
 
@@ -1355,9 +1356,9 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
             feat_names=real_proposed_features,
             random_state=seed,
         )
-        prob_sa_us = model_sa_us.predict_proba(X_te_r_us)[:, 1]
+        prob_sa_us = model_sa_us.predict_proba(X_te_r)[:, 1]
         pred_sa_us = (prob_sa_us >= threshold_sa_us).astype(int)
-        eval_df = y_te_r_us.reset_index(drop=True).copy()
+        eval_df = y_te_r.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa_us
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
 
@@ -1736,7 +1737,7 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     pred_f = (prob_f >= best_thr_f).astype(int)
     df.loc[df["Female"] == 1, "pred_female"] = pred_f
     df.loc[df["Female"] == 1, "prob_female"] = prob_f
-    # 合并预测
+    # Combine predictions
     df["pred_sexspecific"] = np.nan
     df["prob_sexspecific"] = np.nan
     if "pred_male" in df.columns:
@@ -1747,7 +1748,7 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
         df.loc[df["Female"] == 1, "prob_sexspecific"] = df.loc[df["Female"] == 1, "prob_female"]
     pred_labels = df[["MRN", "pred_sexspecific"]].drop_duplicates()
     merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
-    # 仅保留生存分析和Cox部分，去除可视化和聚类
+    # Keep only survival analysis and Cox models; remove visualization and clustering
     kmf = KaplanMeierFitter()
     endpoints = [
         ("Primary Endpoint", "PE_Time", "Was Primary Endpoint Reached? (Appropriate ICD Therapy)"),
