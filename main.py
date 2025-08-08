@@ -3,6 +3,7 @@
 # Key improvements: removed duplicate imports, merged data processing, simplified function structure, and reduced unnecessary output.
 
 import sys
+import os
 import re
 import warnings
 from math import ceil
