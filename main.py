@@ -2,7 +2,6 @@
 # This file has been refactored for clarity, speed, and maintainability.
 # Key improvements: removed duplicate imports, merged data processing, simplified function structure, and reduced unnecessary output.
 
-import os
 import sys
 import re
 import warnings
@@ -70,11 +69,11 @@ def CG_equation(age, weight, female, serum_creatinine):
     return ((140 - age) * weight * constant) / (72 * serum_creatinine)
 
 # Load data
-DATA_DIR = os.getenv("DATA_DIR", "/workspace/data")
-SURVIVAL_FILE = os.getenv("SURVIVAL_FILE", "df.xlsx")
-COHORT_FILE = os.getenv("COHORT_FILE", "NICM Arrhythmia Cohort for Xiaotan Final.xlsx")
-survival_path = os.path.join(DATA_DIR, SURVIVAL_FILE)
-cohort_path = os.path.join(DATA_DIR, COHORT_FILE)
+DATA_DIR = "/workspace/data"
+SURVIVAL_FILE = "df.xlsx"
+COHORT_FILE = "NICM Arrhythmia Cohort for Xiaotan Final.xlsx"
+survival_path = f"{DATA_DIR}/{SURVIVAL_FILE}"
+cohort_path = f"{DATA_DIR}/{COHORT_FILE}"
 if not os.path.exists(survival_path) or not os.path.exists(cohort_path):
     print(f"Data files not found. Expected SURVIVAL_FILE at '{survival_path}' and COHORT_FILE at '{cohort_path}'. Set DATA_DIR/SURVIVAL_FILE/COHORT_FILE environment variables accordingly.")
     sys.exit(0)
@@ -298,7 +297,7 @@ def rf_evaluate(
     search = RandomizedSearchCV(
         estimator=base_clf,
         param_distributions=param_dist,
-        n_iter=int(os.getenv("RF_N_ITER", "20")),
+        n_iter=20,
         scoring=ap_scorer,
         cv=cv,
         random_state=random_state,
@@ -1649,16 +1648,15 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
     summary_table = summary_table.drop(index=rows_to_drop)
 
     # Save result
-    output_dir = os.getenv("OUTPUT_DIR", "/workspace/output")
+    output_dir = "/workspace/output"
     output_file = "summary_results.xlsx"
-    os.makedirs(output_dir, exist_ok=True)
-    full_path = os.path.join(output_dir, output_file)
+    full_path = f"{output_dir}/{output_file}"
     summary_table.to_excel(full_path, index=True)
     print(f"Summary table saved to: {full_path}")
     return results, summary_table
 
 
-N_SPLITS = int(os.getenv("N_SPLITS", "10"))
+N_SPLITS = 10
 res, summary = multiple_random_splits(train_df, N_SPLITS)
 print(summary)
 
@@ -1709,7 +1707,7 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     search = RandomizedSearchCV(
         estimator=base_clf,
         param_distributions=param_dist,
-        n_iter=int(os.getenv("RF_N_ITER", "20")),
+        n_iter=20,
         scoring=ap_scorer,
         cv=cv,
         random_state=seed,
