@@ -71,88 +71,127 @@ def CG_equation(age, weight, female, serum_creatinine):
     return ((140 - age) * weight * constant) / (72 * serum_creatinine)
 
 
-# Load data
-DATA_DIR = "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff"
-SURVIVAL_FILE = "df.xlsx"
-COHORT_FILE = "NICM Arrhythmia Cohort for Xiaotan Final.xlsx"
-survival_path = f"{DATA_DIR}/{SURVIVAL_FILE}"
-cohort_path = f"{DATA_DIR}/{COHORT_FILE}"
-if not os.path.exists(survival_path) or not os.path.exists(cohort_path):
-    print(
-        f"Data files not found. Expected SURVIVAL_FILE at '{survival_path}' and COHORT_FILE at '{cohort_path}'. Set DATA_DIR/SURVIVAL_FILE/COHORT_FILE environment variables accordingly."
+def prepare_data():
+    # Load data
+    DATA_DIR = "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff"
+    SURVIVAL_FILE = "df.xlsx"
+    COHORT_FILE = "NICM Arrhythmia Cohort for Xiaotan Final.xlsx"
+    survival_path = f"{DATA_DIR}/{SURVIVAL_FILE}"
+    cohort_path = f"{DATA_DIR}/{COHORT_FILE}"
+    if not os.path.exists(survival_path) or not os.path.exists(cohort_path):
+        print(
+            f"Data files not found. Expected SURVIVAL_FILE at '{survival_path}' and COHORT_FILE at '{cohort_path}'. Set DATA_DIR/SURVIVAL_FILE/COHORT_FILE environment variables accordingly."
+        )
+        sys.exit(0)
+
+    survival_df = pd.read_excel(survival_path)
+    survival_df["PE_Time"] = np.where(
+        survival_df["Was Primary Endpoint Reached? (Appropriate ICD Therapy)"] == 1,
+        survival_df["Time from ICD Implant to Primary Endpoint (in days)"],
+        survival_df["Time from ICD Implant to Last Cardiology Encounter (in days)"],
     )
-    sys.exit(0)
-
-survival_df = pd.read_excel(survival_path)
-survival_df["PE_Time"] = np.where(
-    survival_df["Was Primary Endpoint Reached? (Appropriate ICD Therapy)"] == 1,
-    survival_df["Time from ICD Implant to Primary Endpoint (in days)"],
-    survival_df["Time from ICD Implant to Last Cardiology Encounter (in days)"],
-)
-survival_df["SE_Time"] = np.where(
-    survival_df["Was Secondary Endpoint Reached?"] == 1,
-    survival_df["Time from ICD Implant to Secondary Endpoint (in days)"],
-    survival_df["Time from ICD Implant to Last Cardiology Encounter (in days)"],
-)
-survival_df = survival_df[
-    [
-        "MRN",
-        "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
-        "PE_Time",
-        "Was Secondary Endpoint Reached?",
-        "SE_Time",
+    survival_df["SE_Time"] = np.where(
+        survival_df["Was Secondary Endpoint Reached?"] == 1,
+        survival_df["Time from ICD Implant to Secondary Endpoint (in days)"],
+        survival_df["Time from ICD Implant to Last Cardiology Encounter (in days)"],
+    )
+    survival_df = survival_df[
+        [
+            "MRN",
+            "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
+            "PE_Time",
+            "Was Secondary Endpoint Reached?",
+            "SE_Time",
+        ]
     ]
-]
 
-with_icd = pd.read_excel(cohort_path, sheet_name="ICD")
-with_icd["ICD"] = 1
-without_icd = pd.read_excel(cohort_path, sheet_name="No_ICD")
-without_icd["ICD"] = 0
-without_icd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = without_icd.apply(
-    lambda row: CG_equation(
-        row["Age at CMR"],
-        row["Weight (Kg)"],
-        row["Female"],
-        row["Serum creatinine (within 3 months of MRI)"],
-    ),
-    axis=1,
-)
-common_cols = with_icd.columns.intersection(without_icd.columns)
-df = pd.concat([with_icd[common_cols], without_icd[common_cols]], ignore_index=True)
-df.drop(
-    [
-        "Date VT/VF/SCD",
-        "End follow-up date",
-        "CRT Date",
-        "QRS",
-    ],
-    axis=1,
-    inplace=True,
-)
+    with_icd = pd.read_excel(cohort_path, sheet_name="ICD")
+    with_icd["ICD"] = 1
+    without_icd = pd.read_excel(cohort_path, sheet_name="No_ICD")
+    without_icd["ICD"] = 0
+    without_icd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = without_icd.apply(
+        lambda row: CG_equation(
+            row["Age at CMR"],
+            row["Weight (Kg)"],
+            row["Female"],
+            row["Serum creatinine (within 3 months of MRI)"],
+        ),
+        axis=1,
+    )
+    common_cols = with_icd.columns.intersection(without_icd.columns)
+    df = pd.concat([with_icd[common_cols], without_icd[common_cols]], ignore_index=True)
+    df.drop(
+        [
+            "Date VT/VF/SCD",
+            "End follow-up date",
+            "CRT Date",
+            "QRS",
+        ],
+        axis=1,
+        inplace=True,
+    )
 
-# Variables
-categorical = [
-    "Female",
-    "DM",
-    "HTN",
-    "HLP",
-    "AF",
-    "NYHA Class",
-    "Beta Blocker",
-    "ACEi/ARB/ARNi",
-    "Aldosterone Antagonist",
-    "VT/VF/SCD",
-    "AAD",
-    "CRT",
-    "ICD",
-]
-df[categorical] = df[categorical].astype("object")
-labels = ["MRN", "Female", "VT/VF/SCD", "ICD"]
-features = [c for c in df.columns if c not in labels]
+    # Variables
+    categorical = [
+        "Female",
+        "DM",
+        "HTN",
+        "HLP",
+        "AF",
+        "NYHA Class",
+        "Beta Blocker",
+        "ACEi/ARB/ARNi",
+        "Aldosterone Antagonist",
+        "VT/VF/SCD",
+        "AAD",
+        "CRT",
+        "ICD",
+    ]
+    df[categorical] = df[categorical].astype("object")
+    labels = ["MRN", "Female", "VT/VF/SCD", "ICD"]
+    features = [c for c in df.columns if c not in labels]
 
-# Missing percentage
-print("\nMissing value percentage:")
-print(df.isnull().sum() / len(df) * 100)
+    # Missing percentage
+    print("\nMissing value percentage:")
+    print(df.isnull().sum() / len(df) * 100)
+
+    # Impute and feature engineering
+    clean_df = conversion_and_imputation(df, features, labels)
+    clean_df["Age by decade"] = (clean_df["Age at CMR"] // 10).astype(int)
+    clean_df["CrCl>45"] = (
+        clean_df["Cockcroft-Gault Creatinine Clearance (mL/min)"] > 45
+    ).astype(int)
+    clean_df["NYHA>2"] = (clean_df["NYHA Class"] > 2).astype(int)
+    clean_df["Significant LGE"] = (clean_df["LGE Burden 5SD"] > 2).astype(int)
+
+    # Distribution summaries
+    print("\nSex distribution:")
+    print(clean_df["Female"].value_counts())
+    print("\nArrhythmia distribution:")
+    print(clean_df["VT/VF/SCD"].value_counts())
+
+    # Proportion in ICD population that follows the rule-based guideline
+    icd_df = clean_df[clean_df["ICD"] == 1]
+    cond = (icd_df["NYHA Class"] >= 2) & (icd_df["LVEF"] <= 35)
+    pct = cond.sum() / len(icd_df) * 100
+    print(
+        f"\nProportion of ICD population following the rule-based guideline: {pct:.2f}%"
+    )
+
+    # Train/test split
+    df_split = clean_df.copy()
+    stratify_column = df_split["Female"].astype(str) + "_" + df_split["VT/VF/SCD"].astype(str)
+    train_df, test_df = train_test_split(
+        df_split, test_size=0.2, stratify=stratify_column, random_state=100
+    )
+    print(
+        f"Overall female proportion: {df_split['Female'].mean():.2f}, training set: {train_df['Female'].mean():.2f}, test set: {test_df['Female'].mean():.2f}"
+    )
+    print(
+        f"Overall arrhythmia proportion: {df_split['VT/VF/SCD'].mean():.2f}, training set: {train_df['VT/VF/SCD'].mean():.2f}, test set: {test_df['VT/VF/SCD'].mean():.2f}"
+    )
+
+    return clean_df, train_df, test_df, survival_df
 
 
 def impute_misforest(X, random_seed):
@@ -1748,9 +1787,11 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
     return results, summary_table
 
 
-N_SPLITS = 10
-res, summary = multiple_random_splits(train_df, N_SPLITS)
-print(summary)
+def main():
+    clean_df, train_df, test_df, survival_df = prepare_data()
+    N_SPLITS = 10
+    res, summary = multiple_random_splits(train_df, N_SPLITS)
+    print(summary)
 
 from sklearn.tree import plot_tree
 from sklearn.utils import resample
@@ -1918,3 +1959,6 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     print(f"\nCox PH Model for Secondary endpoint:")
     print(cph_secondary.summary)
     return None
+
+if __name__ == "__main__":
+    main()
