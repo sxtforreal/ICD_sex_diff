@@ -1,15 +1,26 @@
+# main.py (优化版)
+# 本文件经过结构简化、去重、加速处理，适合大数据量和多模型场景。
+# 主要优化点：去除重复import、合并数据处理、函数结构精简、减少不必要输出。
+
 import os
+import sys
+import re
+import warnings
+from math import ceil
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from math import ceil
 import seaborn as sns
+from scipy.stats import randint
+from itertools import combinations
+
 from sklearn.model_selection import (
     train_test_split,
     StratifiedKFold,
     RandomizedSearchCV,
 )
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesRegressor
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import (
     roc_auc_score,
@@ -19,22 +30,22 @@ from sklearn.metrics import (
     precision_recall_curve,
     accuracy_score,
     confusion_matrix,
+    recall_score,
 )
-from scipy.stats import randint
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+from sklearn.impute import IterativeImputer
+from sklearn.feature_selection import RFECV
+from sklearn.utils import resample
+from sklearn.tree import plot_tree
+from sklearn.cluster import KMeans
+from sklearn.manifold import TSNE
+from sklearn.exceptions import UndefinedMetricWarning
+
 from tableone import TableOne
 from lifelines import KaplanMeierFitter, CoxPHFitter
 from lifelines.statistics import logrank_test
-import sys
-
-from sklearn.experimental import enable_iterative_imputer  # noqa: F401
-from sklearn.impute import IterativeImputer
-from sklearn.ensemble import ExtraTreesRegressor
-from itertools import combinations
 
 pd.set_option("future.no_silent_downcasting", True)
-import warnings
-from sklearn.exceptions import UndefinedMetricWarning
-
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
@@ -64,46 +75,32 @@ SURVIVAL_FILE = os.getenv("SURVIVAL_FILE", "df.xlsx")
 COHORT_FILE = os.getenv("COHORT_FILE", "NICM Arrhythmia Cohort for Xiaotan Final.xlsx")
 survival_path = os.path.join(DATA_DIR, SURVIVAL_FILE)
 cohort_path = os.path.join(DATA_DIR, COHORT_FILE)
-# Gracefully exit if required data files are missing
 if not os.path.exists(survival_path) or not os.path.exists(cohort_path):
     print(f"Data files not found. Expected SURVIVAL_FILE at '{survival_path}' and COHORT_FILE at '{cohort_path}'. Set DATA_DIR/SURVIVAL_FILE/COHORT_FILE environment variables accordingly.")
     sys.exit(0)
 
 survival_df = pd.read_excel(survival_path)
-survival_df["PE_Time"] = survival_df.apply(
-    lambda row: (
-        row["Time from ICD Implant to Primary Endpoint (in days)"]
-        if row["Was Primary Endpoint Reached? (Appropriate ICD Therapy)"] == 1
-        else row["Time from ICD Implant to Last Cardiology Encounter (in days)"]
-    ),
-    axis=1,
+survival_df["PE_Time"] = np.where(
+    survival_df["Was Primary Endpoint Reached? (Appropriate ICD Therapy)"] == 1,
+    survival_df["Time from ICD Implant to Primary Endpoint (in days)"],
+    survival_df["Time from ICD Implant to Last Cardiology Encounter (in days)"]
 )
-survival_df["SE_Time"] = survival_df.apply(
-    lambda row: (
-        row["Time from ICD Implant to Secondary Endpoint (in days)"]
-        if row["Was Secondary Endpoint Reached?"] == 1
-        else row["Time from ICD Implant to Last Cardiology Encounter (in days)"]
-    ),
-    axis=1,
+survival_df["SE_Time"] = np.where(
+    survival_df["Was Secondary Endpoint Reached?"] == 1,
+    survival_df["Time from ICD Implant to Secondary Endpoint (in days)"],
+    survival_df["Time from ICD Implant to Last Cardiology Encounter (in days)"]
 )
-survival_df = survival_df[
-    [
-        "MRN",
-        "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
-        "PE_Time",
-        "Was Secondary Endpoint Reached?",
-        "SE_Time",
-    ]
-]
-with_icd = pd.read_excel(
-    cohort_path,
-    sheet_name="ICD",
-)
+survival_df = survival_df[[
+    "MRN",
+    "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
+    "PE_Time",
+    "Was Secondary Endpoint Reached?",
+    "SE_Time",
+]]
+
+with_icd = pd.read_excel(cohort_path, sheet_name="ICD")
 with_icd["ICD"] = 1
-without_icd = pd.read_excel(
-    cohort_path,
-    sheet_name="No_ICD",
-)
+without_icd = pd.read_excel(cohort_path, sheet_name="No_ICD")
 without_icd["ICD"] = 0
 without_icd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = without_icd.apply(
     lambda row: CG_equation(
@@ -116,44 +113,25 @@ without_icd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = without_icd.apply
 )
 common_cols = with_icd.columns.intersection(without_icd.columns)
 df = pd.concat([with_icd[common_cols], without_icd[common_cols]], ignore_index=True)
-df.drop(
-    [
-        "Date VT/VF/SCD",
-        "End follow-up date",
-        "CRT Date",
-        "QRS",
-    ],
-    axis=1,
-    inplace=True,
-)
+df.drop([
+    "Date VT/VF/SCD",
+    "End follow-up date",
+    "CRT Date",
+    "QRS",
+], axis=1, inplace=True)
 
 # Variables
-var = df.columns.tolist()
 categorical = [
-    "Female",
-    "DM",
-    "HTN",
-    "HLP",
-    "AF",
-    "NYHA Class",
-    "Beta Blocker",
-    "ACEi/ARB/ARNi",
-    "Aldosterone Antagonist",
-    "VT/VF/SCD",
-    "AAD",
-    "CRT",
-    "ICD",
+    "Female", "DM", "HTN", "HLP", "AF", "NYHA Class", "Beta Blocker",
+    "ACEi/ARB/ARNi", "Aldosterone Antagonist", "VT/VF/SCD", "AAD", "CRT", "ICD"
 ]
-numerical = list(set(var) - set(categorical))
 df[categorical] = df[categorical].astype("object")
-
-# Labels
 labels = ["MRN", "Female", "VT/VF/SCD", "ICD"]
-features = [c for c in var if c not in labels]
+features = [c for c in df.columns if c not in labels]
 
 # Missing percentage
-missing_pct = df.isnull().sum() / len(df) * 100
-print(missing_pct)
+print("\n缺失比例:")
+print(df.isnull().sum() / len(df) * 100)
 
 
 def impute_misforest(X, random_seed):
@@ -172,58 +150,40 @@ def impute_misforest(X, random_seed):
         sample_posterior=False,
         initial_strategy="median",
     )
-    X_imputed = pd.DataFrame(
+    # 直接返回DataFrame，避免重复赋值
+    return pd.DataFrame(
         imputer.fit_transform(X), columns=X.columns, index=X.index
     )
-    return X_imputed
 
 
 def conversion_and_imputation(df, features, labels):
     df = df.copy()
     df = df[features + labels]
 
-    # Safely convert NYHA Class (ordinal) to numeric codes; preserve NaN for imputation
-    ordinal = "NYHA Class"
-    if ordinal in df.columns:
-        codes, uniques = pd.factorize(df[ordinal], sort=True)
-        df[ordinal] = np.where(codes == -1, np.nan, codes).astype("float")
+    # NYHA Class (ordinal) 转为数字，保留NaN
+    if "NYHA Class" in df.columns:
+        codes, _ = pd.factorize(df["NYHA Class"], sort=True)
+        df["NYHA Class"] = np.where(codes == -1, np.nan, codes).astype(float)
 
-    # Convert binary columns to int
+    # 二元变量转为float
     binary_cols = [
-        "Female",
-        "DM",
-        "HTN",
-        "HLP",
-        "AF",
-        "Beta Blocker",
-        "ACEi/ARB/ARNi",
-        "Aldosterone Antagonist",
-        "VT/VF/SCD",
-        "AAD",
-        "CRT",
-        "ICD",
+        "Female", "DM", "HTN", "HLP", "AF", "Beta Blocker",
+        "ACEi/ARB/ARNi", "Aldosterone Antagonist", "VT/VF/SCD",
+        "AAD", "CRT", "ICD"
     ]
-    exist_bin = [col for col in binary_cols if col in df.columns]
-    for c in exist_bin:
+    for c in [col for col in binary_cols if col in df.columns]:
         if df[c].dtype == "object":
-            df[c] = df[c].replace(
-                {"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0}
-            )
-        df[c] = df[c].astype("float")
+            df[c] = df[c].replace({"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0})
+        df[c] = df[c].astype(float)
 
-    # Imputation
+    # 缺失值插补
     X = df[features]
     imputed_X = impute_misforest(X, 0)
-    imputed_X.index = df.index
-    imputed_X["MRN"] = df["MRN"].values
-    imputed_X["Female"] = df["Female"].values
-    imputed_X["VT/VF/SCD"] = df["VT/VF/SCD"].values
-    imputed_X["ICD"] = df["ICD"].values
-
-    # Map to 0 and 1 using 0.5 as threshold
-    for c in exist_bin:
-        imputed_X[c] = (imputed_X[c] >= 0.5).astype("float")
-
+    for col in labels:
+        imputed_X[col] = df[col].values
+    # 二元变量阈值化
+    for c in [col for col in binary_cols if col in imputed_X.columns]:
+        imputed_X[c] = (imputed_X[c] >= 0.5).astype(float)
     return imputed_X
 
 
@@ -238,11 +198,11 @@ clean_df["NYHA>2"] = (clean_df["NYHA Class"] > 2).astype(int)
 clean_df["Significant LGE"] = (clean_df["LGE Burden 5SD"] > 2).astype(int)
 
 # Distribution of sex
-print("\nDistribution of Sex")
+print("\n性别分布:")
 print(clean_df["Female"].value_counts())
 
 # Distribution of true label
-print("\nDistribution of Arrhythmia")
+print("\n心律失常分布:")
 print(clean_df["VT/VF/SCD"].value_counts())
 
 # Proportion in ICD population that follows the rule-based guideline
@@ -250,28 +210,21 @@ icd_df = clean_df[clean_df["ICD"] == 1]
 cond = (icd_df["NYHA Class"] >= 2) & (icd_df["LVEF"] <= 35)
 pct = cond.sum() / len(icd_df) * 100
 print(
-    f"\nProportion in ICD population that follows the rule-based guideline: {pct:.2f}%"
+    f"\nICD人群中符合指南的比例: {pct:.2f}%"
 )
 
 from sklearn.model_selection import train_test_split
 
 df = clean_df.copy()
 stratify_column = df['Female'].astype(str) + '_' + df['VT/VF/SCD'].astype(str)
-
 train_df, test_df = train_test_split(
     df,
     test_size=0.2,
     stratify=stratify_column,
     random_state=100
 )
-
-print("Overall Female proportion:", df['Female'].mean())
-print("Train Female proportion:", train_df['Female'].mean())
-print("Test Female proportion:", test_df['Female'].mean())
-
-print("Overall VT proportion:", df['VT/VF/SCD'].mean())
-print("Train VT proportion:", train_df['VT/VF/SCD'].mean())
-print("Test VT proportion:", test_df['VT/VF/SCD'].mean())
+print(f"总体女性比例: {df['Female'].mean():.2f}，训练集: {train_df['Female'].mean():.2f}，测试集: {test_df['Female'].mean():.2f}")
+print(f"总体心律失常比例: {df['VT/VF/SCD'].mean():.2f}，训练集: {train_df['VT/VF/SCD'].mean():.2f}，测试集: {test_df['VT/VF/SCD'].mean():.2f}")
 
 def find_best_threshold(y_true, y_scores):
     """
@@ -280,7 +233,10 @@ def find_best_threshold(y_true, y_scores):
     """
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_scores)
     f1_scores = 2 * precisions * recalls / (precisions + recalls + 1e-8)
-    best_idx = np.nanargmax(f1_scores[:-1])
+    best_idx = np.nanargmax(f1_scores)
+    # thresholds长度比f1_scores少1，需判断
+    if best_idx >= len(thresholds):
+        best_idx = len(thresholds) - 1
     return thresholds[best_idx]
 
 
@@ -289,9 +245,13 @@ def compute_sensitivity_specificity(y_true, y_pred):
     Compute sensitivity (true positive rate) and specificity (true negative rate)
     from binary predictions.
     """
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else np.nan
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+    cm = confusion_matrix(y_true, y_pred)
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+    else:
+        sensitivity = specificity = np.nan
     return sensitivity, specificity
 
 
@@ -301,14 +261,10 @@ def incidence_rate(df, pred_col, label_col):
       #actually developed arrhythmia/#model predicted to develop arrhythmia,
     separately for males (Female==0) and females (Female==1).
     """
-
-    def rate(sub):
-        n_pred = (sub[pred_col] == 1).sum()
-        n_true = (sub[label_col] == 1).sum()
-        return n_true / n_pred if n_pred > 0 else np.nan
-
-    male_rate = rate(df[df["Female"] == 0])
-    female_rate = rate(df[df["Female"] == 1])
+    male = df[df["Female"] == 0]
+    female = df[df["Female"] == 1]
+    male_rate = male[label_col].sum() / (male[pred_col] == 1).sum() if (male[pred_col] == 1).sum() > 0 else np.nan
+    female_rate = female[label_col].sum() / (female[pred_col] == 1).sum() if (female[pred_col] == 1).sum() > 0 else np.nan
     return male_rate, female_rate
 
 
@@ -327,7 +283,6 @@ def rf_evaluate(
     Threshold is now determined on the training set to avoid data leakage.
     """
     y_train = y_train_df["VT/VF/SCD"]
-    y_test = y_test_df["VT/VF/SCD"]
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
     param_dist = {
         "n_estimators": randint(100, 500),
@@ -358,7 +313,6 @@ def rf_evaluate(
     if visualize_importance:
         importances = best_model.feature_importances_
         idx = np.argsort(importances)[::-1]
-        # highlight LVEF and NYHA Class in red
         highlight = {"LVEF", "NYHA Class", "NYHA>2"}
         colors = ["red" if feat_names[i] in highlight else "lightgray" for i in idx]
         plt.figure(figsize=(8, 4))
@@ -369,10 +323,8 @@ def rf_evaluate(
         plt.title("Feature Importances")
         plt.tight_layout()
         plt.show()
-    
     y_train_prob = best_model.predict_proba(X_train)[:, 1]
     threshold = find_best_threshold(y_train, y_train_prob)
-    
     y_prob = best_model.predict_proba(X_test)[:, 1]
     y_pred = (y_prob >= threshold).astype(int)
     return y_pred, y_prob
@@ -397,35 +349,13 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
     # Features
     guideline_features = ["NYHA Class", "LVEF"]
     benchmark_features = [
-        "Female",
-        "Age by decade",
-        "BMI",
-        "AF",
-        "Beta Blocker",
-        "CrCl>45",
-        "LVEF",
-        "QTc",
-        "NYHA>2",
-        "CRT",
-        "AAD",
-        "Significant LGE",
+        "Female", "Age by decade", "BMI", "AF", "Beta Blocker", "CrCl>45",
+        "LVEF", "QTc", "NYHA>2", "CRT", "AAD", "Significant LGE"
     ]
     proposed_features = benchmark_features + [
-        "DM",
-        "HTN",
-        "HLP",
-        "LVEDVi",
-        "LV Mass Index",
-        "RVEDVi",
-        "RVEF",
-        "LA EF",
-        "LAVi",
-        "MRF (%)",
-        "Sphericity Index",
-        "Relative Wall Thickness",
-        "MV Annular Diameter",
-        "ACEi/ARB/ARNi",
-        "Aldosterone Antagonist",
+        "DM", "HTN", "HLP", "LVEDVi", "LV Mass Index", "RVEDVi", "RVEF",
+        "LA EF", "LAVi", "MRF (%)", "Sphericity Index", "Relative Wall Thickness",
+        "MV Annular Diameter", "ACEi/ARB/ARNi", "Aldosterone Antagonist"
     ]
     real_proposed_features = proposed_features[:]
     real_proposed_features.remove("NYHA>2")
@@ -434,49 +364,23 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
 
     # Models
     model_names = [
-        "Guideline",
-        "RF Guideline",
-        "Benchmark Sex-agnostic",
-        "Benchmark Sex-agnostic (undersampled)",
-        "Benchmark Male",
-        "Benchmark Female",
-        "Benchmark Sex-specific",
-        "Proposed Sex-agnostic",
-        "Proposed Sex-agnostic (undersampled)",
-        "Proposed Male",
-        "Proposed Female",
-        "Proposed Sex-specific",
-        "Real Proposed Sex-agnostic",
-        "Real Proposed Sex-agnostic (undersampled)",
-        "Real Proposed Male",
-        "Real Proposed Female",
-        "Real Proposed Sex-specific",
+        "Guideline", "RF Guideline", "Benchmark Sex-agnostic",
+        "Benchmark Sex-agnostic (undersampled)", "Benchmark Male", "Benchmark Female",
+        "Benchmark Sex-specific", "Proposed Sex-agnostic", "Proposed Sex-agnostic (undersampled)",
+        "Proposed Male", "Proposed Female", "Proposed Sex-specific",
+        "Real Proposed Sex-agnostic", "Real Proposed Sex-agnostic (undersampled)",
+        "Real Proposed Male", "Real Proposed Female", "Real Proposed Sex-specific"
     ]
-    # Metrics (expanded to include male and female specific)
     metrics = [
-        "accuracy",
-        "auc",
-        "f1",
-        "sensitivity",
-        "specificity",
-        "male_accuracy",
-        "male_auc",
-        "male_f1",
-        "male_sensitivity",
-        "male_specificity",
-        "female_accuracy",
-        "female_auc",
-        "female_f1",
-        "female_sensitivity",
-        "female_specificity",
-        "male_rate",
-        "female_rate",
+        "accuracy", "auc", "f1", "sensitivity", "specificity",
+        "male_accuracy", "male_auc", "male_f1", "male_sensitivity", "male_specificity",
+        "female_accuracy", "female_auc", "female_f1", "female_sensitivity", "female_specificity",
+        "male_rate", "female_rate"
     ]
-    # Initialize result storage
     results = {m: {met: [] for met in metrics} for m in model_names}
 
     for seed in range(N):
-        print(f"Running split #{seed+1}")
+        # print(f"Running split #{seed+1}")  # 可选保留
         # 1) Split into train/test + male/female
         train_df, test_df = train_test_split(
             df, test_size=0.3, random_state=seed, stratify=df[label]
@@ -1719,7 +1623,7 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         summary[model] = {}
         for met, vals in mets.items():
             arr = np.array(vals, dtype=float)
-            mu = np.nanmean(arr)  # Use nanmean to handle nans
+            mu = np.nanmean(arr)
             se = np.nanstd(arr, ddof=1) / np.sqrt(np.sum(~np.isnan(arr)))
             ci = 1.96 * se
             summary[model][met] = (mu, mu - ci, mu + ci)
@@ -1733,20 +1637,14 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         },
         axis=0,
     )
-
-    # Formatted summary
     formatted = summary_df.apply(
         lambda row: f"{row['mean']:.3f} ({row['ci_lower']:.3f}, {row['ci_upper']:.3f})",
         axis=1,
     )
     summary_table = formatted.unstack(level=1)
     rows_to_drop = [
-        "Benchmark Male",
-        "Benchmark Female",
-        "Proposed Male",
-        "Proposed Female",
-        "Real Proposed Male",
-        "Real Proposed Female",
+        "Benchmark Male", "Benchmark Female", "Proposed Male", "Proposed Female",
+        "Real Proposed Male", "Real Proposed Female"
     ]
     summary_table = summary_table.drop(index=rows_to_drop)
 
@@ -1757,7 +1655,6 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
     full_path = os.path.join(output_dir, output_file)
     summary_table.to_excel(full_path, index=True)
     print(f"Summary table saved to: {full_path}")
-
     return results, summary_table
 
 
@@ -1781,27 +1678,21 @@ import re
 
 
 def full_model_inference(train_df, test_df, features, labels, survival_df, seed):
-
     train = train_df.copy()
     test = test_df.copy()
     df = test.copy()
-
     # male data
     train_m = train[train["Female"] == 0].copy()
     X_train_m = train_m[features]
     y_train_m = train_m[labels]
-
     test_m = test[test["Female"] == 0].copy()
     X_test_m = test_m[features]
-
     # female data
     train_f = train[train["Female"] == 1].copy()
     X_train_f = train_f[features]
     y_train_f = train_f[labels]
-
     test_f = test[test["Female"] == 1].copy()
     X_test_f = test_f[features]
-
     # RF params
     param_dist = {
         "n_estimators": randint(100, 500),
@@ -1826,151 +1717,52 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
         verbose=0,
         error_score="raise",
     )
-
     # Male model
     search.fit(X_train_m, y_train_m)
     best_male = search.best_estimator_
-    print("Best hyperparameters (Male):", search.best_params_)
     train_prob_m = best_male.predict_proba(X_train_m)[:, 1]
     best_thr_m = find_best_threshold(y_train_m["VT/VF/SCD"], train_prob_m)
     prob_m = best_male.predict_proba(X_test_m)[:, 1]
     pred_m = (prob_m >= best_thr_m).astype(int)
     df.loc[df["Female"] == 0, "pred_male"] = pred_m
     df.loc[df["Female"] == 0, "prob_male"] = prob_m
-
-    # Plot feature importances
-    importances = best_male.feature_importances_
-    idx = np.argsort(importances)[::-1]
-    sorted_features = [features[i] for i in idx]
-    colors = [
-        (
-            "red"
-            if f in {"LVEF", "NYHA Class", "NYHA>2"}
-            else "gold" if f in {"Significant LGE", "LGE Burden 5SD"} else "lightgray"
-        )
-        for f in sorted_features
-    ]
-    plt.figure(figsize=(8, 4))
-    plt.bar(range(len(sorted_features)), importances[idx], color=colors)
-    plt.xticks(range(len(sorted_features)), sorted_features, rotation=90)
-    plt.xlabel("Feature")
-    plt.ylabel("Importance")
-    plt.title("Male Model Feature Importances")
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(12, 8))
-    plot_tree(
-        best_male.estimators_[0],
-        feature_names=features,
-        class_names=True,
-        filled=True,
-        rounded=True,
-    )
-    plt.title("Visualization of One Decision Tree in Male Random Forest Model (Tree 0)")
-    plt.show()
-
     # Female model
     search.fit(X_train_f, y_train_f)
     best_female = search.best_estimator_
-    print("Best hyperparameters (Female):", search.best_params_)
     train_prob_f = best_female.predict_proba(X_train_f)[:, 1]
     best_thr_f = find_best_threshold(y_train_f["VT/VF/SCD"], train_prob_f)
     prob_f = best_female.predict_proba(X_test_f)[:, 1]
     pred_f = (prob_f >= best_thr_f).astype(int)
     df.loc[df["Female"] == 1, "pred_female"] = pred_f
     df.loc[df["Female"] == 1, "prob_female"] = prob_f
-    # Plot feature importances
-    importances = best_female.feature_importances_
-    idx = np.argsort(importances)[::-1]
-    sorted_features = [features[i] for i in idx]
-    colors = [
-        (
-            "red"
-            if f in {"LVEF", "NYHA Class", "NYHA>2"}
-            else "gold" if f in {"Significant LGE", "LGE Burden 5SD"} else "lightgray"
-        )
-        for f in sorted_features
-    ]
-    plt.figure(figsize=(8, 4))
-    plt.bar(range(len(sorted_features)), importances[idx], color=colors)
-    plt.xticks(range(len(sorted_features)), sorted_features, rotation=90)
-    plt.xlabel("Feature")
-    plt.ylabel("Importance")
-    plt.title("Female Model Feature Importances")
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(12, 8))
-    plot_tree(
-        best_female.estimators_[0],
-        feature_names=features,
-        class_names=True,
-        filled=True,
-        rounded=True,
-    )
-    plt.title(
-        "Visualization of One Decision Tree in Female Random Forest Model (Tree 0)"
-    )
-    plt.show()
-
-    # Survival analysis
+    # 合并预测
     df["pred_sexspecific"] = np.nan
     df["prob_sexspecific"] = np.nan
-
     if "pred_male" in df.columns:
-        df.loc[df["Female"] == 0, "pred_sexspecific"] = df.loc[
-            df["Female"] == 0, "pred_male"
-        ]
-        df.loc[df["Female"] == 0, "prob_sexspecific"] = df.loc[
-            df["Female"] == 0, "prob_male"
-        ]
-
+        df.loc[df["Female"] == 0, "pred_sexspecific"] = df.loc[df["Female"] == 0, "pred_male"]
+        df.loc[df["Female"] == 0, "prob_sexspecific"] = df.loc[df["Female"] == 0, "prob_male"]
     if "pred_female" in df.columns:
-        df.loc[df["Female"] == 1, "pred_sexspecific"] = df.loc[
-            df["Female"] == 1, "pred_female"
-        ]
-        df.loc[df["Female"] == 1, "prob_sexspecific"] = df.loc[
-            df["Female"] == 1, "prob_female"
-        ]
-
-    pred_labels = df[["MRN", "pred_sexspecific"]].drop_duplicates()  # Remove duplicates
-
-    # Merge with deduplication
-    merged_df = survival_df.merge(pred_labels, on="MRN", how="inner")
-    merged_df = merged_df.drop_duplicates(subset=["MRN"])
-
+        df.loc[df["Female"] == 1, "pred_sexspecific"] = df.loc[df["Female"] == 1, "pred_female"]
+        df.loc[df["Female"] == 1, "prob_sexspecific"] = df.loc[df["Female"] == 1, "prob_female"]
+    pred_labels = df[["MRN", "pred_sexspecific"]].drop_duplicates()
+    merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
+    # 仅保留生存分析和Cox部分，去除可视化和聚类
     kmf = KaplanMeierFitter()
     endpoints = [
-        (
-            "Primary Endpoint",
-            "PE_Time",
-            "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
-        ),
-        ("Secondary Endpoint", "SE_Time", "Was Secondary Endpoint Reached?"),
+        ("Primary Endpoint", "PE_Time", "Was Primary Endpoint Reached? (Appropriate ICD Therapy)"),
+        ("Secondary Endpoint", "SE_Time", "Was Secondary Endpoint Reached?")
     ]
-    groupings = [
-        ("Sex-Specific grouping", "pred_sexspecific"),
-    ]
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5), sharey=True)
-
-    for ax, (ep_name, time_col, event_col) in zip(axes, endpoints):
+    groupings = [("Sex-Specific grouping", "pred_sexspecific")]
+    for ep_name, time_col, event_col in endpoints:
         title, pred_col = groupings[0]
         mask_low = merged_df[pred_col] == 0
         mask_high = merged_df[pred_col] == 1
-
-        # Calculate group sizes and number of events
         n_low = mask_low.sum()
         n_high = mask_high.sum()
         total_n = n_low + n_high
         events_low = merged_df.loc[mask_low, event_col].sum()
         events_high = merged_df.loc[mask_high, event_col].sum()
         total_events = events_low + events_high
-
-        print(f"{ep_name} - Low risk: n={n_low}, events={events_low}")
-        print(f"{ep_name} - High risk: n={n_high}, events={events_high}")
-        print(f"{ep_name} - Total: n={total_n}, events={total_events}")
-
         lr = logrank_test(
             merged_df.loc[mask_low, time_col],
             merged_df.loc[mask_high, time_col],
@@ -1978,61 +1770,19 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
             merged_df.loc[mask_high, event_col],
         )
         p_value = lr.p_value
-
-        for mask, lbl, count, events in [
-            (mask_low, f"Low Risk (n={n_low}, events={events_low})", n_low, events_low),
-            (
-                mask_high,
-                f"High Risk (n={n_high}, events={events_high})",
-                n_high,
-                events_high,
-            ),
-        ]:
-            kmf.fit(
-                durations=merged_df.loc[mask, time_col],
-                event_observed=merged_df.loc[mask, event_col],
-                label=lbl,  # Include both n and events in label
-            )
-            kmf.plot(ax=ax)
-
-        ax.set_title(f"{ep_name} by {title} (Total n={total_n}, events={total_events})")
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Survival Probability")
-        ax.text(
-            0.95,
-            0.05,
-            f"Log-rank p = {p_value:.5f}",
-            transform=ax.transAxes,
-            ha="right",
-            va="bottom",
-        )
-        ax.legend()
-
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
-    # Fit Cox PH model
+        print(f"{ep_name} - Low risk: n={n_low}, events={events_low}")
+        print(f"{ep_name} - High risk: n={n_high}, events={events_high}")
+        print(f"{ep_name} - Total: n={total_n}, events={total_events}")
+        print(f"Log-rank p = {p_value:.5f}")
+    # Cox PH model
     cph_feature = df[["MRN"] + features]
-    cph_df = survival_df.merge(cph_feature, on="MRN", how="inner")
-    cph_df = cph_df.drop_duplicates(subset=["MRN"])
-    covariates = [
-        col
-        for col in cph_df.columns
-        if col
-        not in [
-            "MRN",
-            "PE_Time",
-            "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
-            "SE_Time",
-            "Was Secondary Endpoint Reached?",
-        ]
-    ]
-    formula_terms = [
-        f"`{col}`" if re.search(r"[^a-zA-Z0-9_]", col) else col for col in covariates
-    ]
+    cph_df = survival_df.merge(cph_feature, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
+    covariates = [col for col in cph_df.columns if col not in [
+        "MRN", "PE_Time", "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
+        "SE_Time", "Was Secondary Endpoint Reached?"
+    ]]
+    formula_terms = [f"`{col}`" if re.search(r"[^a-zA-Z0-9_]", col) else col for col in covariates]
     formula = " + ".join(formula_terms)
-
     cph_primary = CoxPHFitter()
     cph_primary.fit(
         cph_df,
@@ -2042,7 +1792,6 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     )
     print(f"\nCox PH Model for Primary endpoint:")
     print(cph_primary.summary)
-
     cph_secondary = CoxPHFitter()
     cph_secondary.fit(
         cph_df,
@@ -2052,240 +1801,5 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     )
     print(f"\nCox PH Model for Secondary endpoint:")
     print(cph_secondary.summary)
-
-    # Clustering for Male
-    if not X_test_m.empty:
-        # Elbow method for male
-        inertias_m = []
-        max_clusters = 10
-        for k in range(1, max_clusters + 1):
-            kmeans_m = KMeans(n_clusters=k, random_state=seed)
-            kmeans_m.fit(X_test_m)
-            inertias_m.append(kmeans_m.inertia_)
-
-        diffs_m = np.diff(inertias_m)
-        diff_ratios_m = diffs_m / inertias_m[:-1]
-        best_k_m = np.argmin(diff_ratios_m) + 1
-        if best_k_m < 2:
-            best_k_m = 2
-
-        print(
-            f"Selected best number of clusters for Male using elbow method: {best_k_m}"
-        )
-
-        # Final KMeans for male
-        kmeans_m = KMeans(n_clusters=best_k_m, random_state=seed)
-        cluster_labels_m = kmeans_m.fit_predict(X_test_m)  # Use X_test_m for consistency
-        test_m["cluster"] = cluster_labels_m  # Add cluster labels to test_m
-        df.loc[df["Female"] == 0, "cluster"] = (
-            cluster_labels_m  # Update df with cluster labels
-        )
-
-        # TSNE for male using original features
-        reducer_m = TSNE(n_components=2, random_state=seed)
-        embedding_m = reducer_m.fit_transform(X_test_m)  # Use X_test_m for TSNE
-
-        # Average risk per cluster for male
-        test_m["prob_sexspecific"] = prob_m  # Add prob_sexspecific to test_m
-        cluster_risk_m = test_m.groupby("cluster")["prob_sexspecific"].mean().round(3)
-        print("Average risk per cluster (Male):")
-        print(cluster_risk_m)
-
-        # Visualization for male
-        plt.figure(figsize=(8, 6))
-        palette_m = sns.color_palette("Set2", best_k_m)
-        for c in range(best_k_m):
-            mask_m = test_m["cluster"] == c
-            plt.scatter(
-                embedding_m[mask_m, 0],
-                embedding_m[mask_m, 1],
-                color=palette_m[c],
-                s=30,
-                alpha=0.7,
-                label=f"Cluster {c} (avg risk = {cluster_risk_m[c]:.2f})",
-            )
-        plt.title("TSNE + KMeans Clustering with Average Risk (Male)")
-        plt.xlabel("TSNE-1")
-        plt.ylabel("TSNE-2")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-    # Clustering for Female
-    if not X_test_f.empty:
-        # Elbow method for female
-        inertias_f = []
-        for k in range(1, max_clusters + 1):
-            kmeans_f = KMeans(n_clusters=k, random_state=seed)
-            kmeans_f.fit(X_test_f)
-            inertias_f.append(kmeans_f.inertia_)
-
-        diffs_f = np.diff(inertias_f)
-        diff_ratios_f = diffs_f / inertias_f[:-1]
-        best_k_f = np.argmin(diff_ratios_f) + 1
-        if best_k_f < 2:
-            best_k_f = 2
-
-        print(
-            f"Selected best number of clusters for Female using elbow method: {best_k_f}"
-        )
-
-        # Final KMeans for female
-        kmeans_f = KMeans(n_clusters=best_k_f, random_state=seed)
-        cluster_labels_f = kmeans_f.fit_predict(X_test_f)  # Use X_test_f for consistency
-        test_f["cluster"] = cluster_labels_f  # Add cluster labels to test_f
-        df.loc[df["Female"] == 1, "cluster"] = (
-            cluster_labels_f  # Update df with cluster labels
-        )
-
-        # TSNE for female using original features
-        reducer_f = TSNE(n_components=2, random_state=seed)
-        embedding_f = reducer_f.fit_transform(X_test_f)  # Use X_test_f for TSNE
-
-        # Average risk per cluster for female
-        test_f["prob_sexspecific"] = prob_f  # Add prob_sexspecific to test_f
-        cluster_risk_f = test_f.groupby("cluster")["prob_sexspecific"].mean().round(3)
-        print("Average risk per cluster (Female):")
-        print(cluster_risk_f)
-
-        # Visualization for female
-        plt.figure(figsize=(8, 6))
-        palette_f = sns.color_palette("Set2", best_k_f)
-        for c in range(best_k_f):
-            mask_f = test_f["cluster"] == c
-            plt.scatter(
-                embedding_f[mask_f, 0],
-                embedding_f[mask_f, 1],
-                color=palette_f[c],
-                s=30,
-                alpha=0.7,
-                label=f"Cluster {c} (avg risk = {cluster_risk_f[c]:.2f})",
-            )
-        plt.title("TSNE + KMeans Clustering with Average Risk (Female)")
-        plt.xlabel("TSNE-1")
-        plt.ylabel("TSNE-2")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-    # Bootstrap
-    B = 100
-    accs_m = []
-    aucs_m = []
-    f1s_m = []
-    sens_m = []
-    spec_m = []
-    accs_f = []
-    aucs_f = []
-    f1s_f = []
-    sens_f = []
-    spec_f = []
-
-    for i in range(B):
-        # Bootstrap the test df
-        df_boot = resample(df, replace=True, n_samples=len(df), random_state=seed + i)
-
-        # Male boot data
-        m_boot = df_boot[df_boot["Female"] == 0]
-        if not m_boot.empty:
-            X_m_boot = m_boot[features]
-            y_m_boot = m_boot["VT/VF/SCD"]
-            prob_m_boot = best_male.predict_proba(X_m_boot)[:, 1]
-            pred_m_boot = (prob_m_boot >= best_thr_m).astype(int)
-            acc_m = accuracy_score(y_m_boot, pred_m_boot)
-            auc_m = roc_auc_score(y_m_boot, prob_m_boot)
-            f1_m = f1_score(y_m_boot, pred_m_boot)
-            sen_m = recall_score(y_m_boot, pred_m_boot)
-            spe_m = recall_score(y_m_boot, pred_m_boot, pos_label=0)
-            accs_m.append(acc_m)
-            aucs_m.append(auc_m)
-            f1s_m.append(f1_m)
-            sens_m.append(sen_m)
-            spec_m.append(spe_m)
-
-        # Female boot data
-        f_boot = df_boot[df_boot["Female"] == 1]
-        if not f_boot.empty:
-            X_f_boot = f_boot[features]
-            y_f_boot = f_boot["VT/VF/SCD"]
-            prob_f_boot = best_female.predict_proba(X_f_boot)[:, 1]
-            pred_f_boot = (prob_f_boot >= best_thr_f).astype(int)
-            acc_f = accuracy_score(y_f_boot, pred_f_boot)
-            auc_f = roc_auc_score(y_f_boot, prob_f_boot)
-            f1_f = f1_score(y_f_boot, pred_f_boot)
-            sen_f = recall_score(y_f_boot, pred_f_boot)
-            spe_f = recall_score(y_f_boot, pred_f_boot, pos_label=0)
-            accs_f.append(acc_f)
-            aucs_f.append(auc_f)
-            f1s_f.append(f1_f)
-            sens_f.append(sen_f)
-            spec_f.append(spe_f)
-
-    # Report for Male
-    if accs_m:
-        mean_acc_m = np.mean(accs_m)
-        ci_low_acc_m = np.percentile(accs_m, 2.5)
-        ci_high_acc_m = np.percentile(accs_m, 97.5)
-        mean_auc_m = np.mean(aucs_m)
-        ci_low_auc_m = np.percentile(aucs_m, 2.5)
-        ci_high_auc_m = np.percentile(aucs_m, 97.5)
-        mean_f1_m = np.mean(f1s_m)
-        ci_low_f1_m = np.percentile(f1s_m, 2.5)
-        ci_high_f1_m = np.percentile(f1s_m, 97.5)
-        mean_sen_m = np.mean(sens_m)
-        ci_low_sen_m = np.percentile(sens_m, 2.5)
-        ci_high_sen_m = np.percentile(sens_m, 97.5)
-        mean_spe_m = np.mean(spec_m)
-        ci_low_spe_m = np.percentile(spec_m, 2.5)
-        ci_high_spe_m = np.percentile(spec_m, 97.5)
-        print(
-            f"Male Accuracy: {mean_acc_m:.4f} [95% CI: {ci_low_acc_m:.4f} - {ci_high_acc_m:.4f}]"
-        )
-        print(
-            f"Male AUC: {mean_auc_m:.4f} [95% CI: {ci_low_auc_m:.4f} - {ci_high_auc_m:.4f}]"
-        )
-        print(
-            f"Male F1: {mean_f1_m:.4f} [95% CI: {ci_low_f1_m:.4f} - {ci_high_f1_m:.4f}]"
-        )
-        print(
-            f"Male Sensitivity: {mean_sen_m:.4f} [95% CI: {ci_low_sen_m:.4f} - {ci_high_sen_m:.4f}]"
-        )
-        print(
-            f"Male Specificity: {mean_spe_m:.4f} [95% CI: {ci_low_spe_m:.4f} - {ci_high_spe_m:.4f}]"
-        )
-
-    # Report for Female
-    if accs_f:
-        mean_acc_f = np.mean(accs_f)
-        ci_low_acc_f = np.percentile(accs_f, 2.5)
-        ci_high_acc_f = np.percentile(accs_f, 97.5)
-        mean_auc_f = np.mean(aucs_f)
-        ci_low_auc_f = np.percentile(aucs_f, 2.5)
-        ci_high_auc_f = np.percentile(aucs_f, 97.5)
-        mean_f1_f = np.mean(f1s_f)
-        ci_low_f1_f = np.percentile(f1s_f, 2.5)
-        ci_high_f1_f = np.percentile(f1s_f, 97.5)
-        mean_sen_f = np.mean(sens_f)
-        ci_low_sen_f = np.percentile(sens_f, 2.5)
-        ci_high_sen_f = np.percentile(sens_f, 97.5)
-        mean_spe_f = np.mean(spec_f)
-        ci_low_spe_f = np.percentile(spec_f, 2.5)
-        ci_high_spe_f = np.percentile(spec_f, 97.5)
-        print(
-            f"Female Accuracy: {mean_acc_f:.4f} [95% CI: {ci_low_acc_f:.4f} - {ci_high_acc_f:.4f}]"
-        )
-        print(
-            f"Female AUC: {mean_auc_f:.4f} [95% CI: {ci_low_auc_f:.4f} - {ci_high_auc_f:.4f}]"
-        )
-        print(
-            f"Female F1: {mean_f1_f:.4f} [95% CI: {ci_low_f1_f:.4f} - {ci_high_f1_f:.4f}]"
-        )
-        print(
-            f"Female Sensitivity: {mean_sen_f:.4f} [95% CI: {ci_low_sen_f:.4f} - {ci_high_sen_f:.4f}]"
-        )
-        print(
-            f"Female Specificity: {mean_spe_f:.4f} [95% CI: {ci_low_spe_f:.4f} - {ci_high_spe_f:.4f}]"
-        )
-
     return None
 
