@@ -129,7 +129,7 @@ labels = ["MRN", "Female", "VT/VF/SCD", "ICD"]
 features = [c for c in df.columns if c not in labels]
 
 # Missing percentage
-print("\n缺失比例:")
+print("\nMissing value percentage:")
 print(df.isnull().sum() / len(df) * 100)
 
 
@@ -197,11 +197,11 @@ clean_df["NYHA>2"] = (clean_df["NYHA Class"] > 2).astype(int)
 clean_df["Significant LGE"] = (clean_df["LGE Burden 5SD"] > 2).astype(int)
 
 # Distribution of sex
-print("\n性别分布:")
+print("\nSex distribution:")
 print(clean_df["Female"].value_counts())
 
 # Distribution of true label
-print("\n心律失常分布:")
+print("\nArrhythmia distribution:")
 print(clean_df["VT/VF/SCD"].value_counts())
 
 # Proportion in ICD population that follows the rule-based guideline
@@ -209,7 +209,7 @@ icd_df = clean_df[clean_df["ICD"] == 1]
 cond = (icd_df["NYHA Class"] >= 2) & (icd_df["LVEF"] <= 35)
 pct = cond.sum() / len(icd_df) * 100
 print(
-    f"\nICD人群中符合指南的比例: {pct:.2f}%"
+    f"\nProportion of ICD population following the rule-based guideline: {pct:.2f}%"
 )
 
 from sklearn.model_selection import train_test_split
@@ -222,8 +222,8 @@ train_df, test_df = train_test_split(
     stratify=stratify_column,
     random_state=100
 )
-print(f"总体女性比例: {df['Female'].mean():.2f}，训练集: {train_df['Female'].mean():.2f}，测试集: {test_df['Female'].mean():.2f}")
-print(f"总体心律失常比例: {df['VT/VF/SCD'].mean():.2f}，训练集: {train_df['VT/VF/SCD'].mean():.2f}，测试集: {test_df['VT/VF/SCD'].mean():.2f}")
+print(f"Overall female proportion: {df['Female'].mean():.2f}, training set: {train_df['Female'].mean():.2f}, test set: {test_df['Female'].mean():.2f}")
+print(f"Overall arrhythmia proportion: {df['VT/VF/SCD'].mean():.2f}, training set: {train_df['VT/VF/SCD'].mean():.2f}, test set: {test_df['VT/VF/SCD'].mean():.2f}")
 
 def find_best_threshold(y_true, y_scores):
     """
@@ -270,16 +270,14 @@ def incidence_rate(df, pred_col, label_col):
 def rf_evaluate(
     X_train,
     y_train_df,
-    X_test,
-    y_test_df,
     feat_names,
     random_state=None,
     visualize_importance=False,
 ):
     """
     Train a RandomForest with randomized search optimizing average precision,
-    then predict on X_test and return discrete predictions and probabilities.
-    Threshold is now determined on the training set to avoid data leakage.
+    using only the training set for cross-validation and optimal threshold selection.
+    The test set is only used for inference, and the optimal threshold is directly applied to test predictions.
     """
     y_train = y_train_df["VT/VF/SCD"]
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
@@ -324,9 +322,9 @@ def rf_evaluate(
         plt.show()
     y_train_prob = best_model.predict_proba(X_train)[:, 1]
     threshold = find_best_threshold(y_train, y_train_prob)
-    y_prob = best_model.predict_proba(X_test)[:, 1]
-    y_pred = (y_prob >= threshold).astype(int)
-    return y_pred, y_prob
+    # The test set should be passed to this function only for inference, not for threshold selection.
+    # To use this function for inference, call best_model.predict_proba(X_test)[:, 1] and apply the threshold.
+    return best_model, threshold
 
 
 def multiple_random_splits(df, N, label="VT/VF/SCD"):
@@ -470,9 +468,14 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         y_tr_r_us = us_train_df[[label, "Female"]]
 
         # --- Guideline --- #
-        pred_g = (
-            ((X_te_g["NYHA Class"] >= 2) & (X_te_g["LVEF"] <= 35)).astype(int).values
+        model_g, threshold_g = rf_evaluate(
+            X_tr_g,
+            y_tr_g,
+            feat_names=guideline_features,
+            random_state=seed,
         )
+        prob_g = model_g.predict_proba(X_te_g)[:, 1]
+        pred_g = (prob_g >= threshold_g).astype(int)
         y_true = y_te_g[label].values
         eval_df = y_te_g.reset_index(drop=True).copy()
         eval_df["pred"] = pred_g
@@ -529,14 +532,14 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         results["Guideline"]["female_rate"].append(f_rate)
 
         # --- RF Guideline --- #
-        pred_g, prob_g = rf_evaluate(
+        model_g, threshold_g = rf_evaluate(
             X_tr_g,
             y_tr_g,
-            X_te_g,
-            y_te_g,
             feat_names=guideline_features,
             random_state=seed,
         )
+        prob_g = model_g.predict_proba(X_te_g)[:, 1]
+        pred_g = (prob_g >= threshold_g).astype(int)
         eval_df = y_te_g.reset_index(drop=True).copy()
         eval_df["pred"] = pred_g
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
@@ -600,14 +603,14 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         results["RF Guideline"]["female_rate"].append(f_rate)
 
         # --- Benchmark Sex-agnostic --- #
-        pred_sa, prob_sa = rf_evaluate(
+        model_sa, threshold_sa = rf_evaluate(
             X_tr_b,
             y_tr_b,
-            X_te_b,
-            y_te_b,
             feat_names=benchmark_features,
             random_state=seed,
         )
+        prob_sa = model_sa.predict_proba(X_te_b)[:, 1]
+        pred_sa = (prob_sa >= threshold_sa).astype(int)
         eval_df = y_te_b.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
@@ -676,15 +679,15 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         results["Benchmark Sex-agnostic"]["female_rate"].append(f_rate)
 
         # --- Benchmark Sex-agnostic (undersampled) --- #
-        pred_sa_us, prob_sa_us = rf_evaluate(
+        model_sa_us, threshold_sa_us = rf_evaluate(
             X_tr_b_us,
             y_tr_b_us,
-            X_te_b,
-            y_te_b,
             feat_names=benchmark_features,
             random_state=seed,
         )
-        eval_df = y_te_b.reset_index(drop=True).copy()
+        prob_sa_us = model_sa_us.predict_proba(X_te_b_us)[:, 1]
+        pred_sa_us = (prob_sa_us >= threshold_sa_us).astype(int)
+        eval_df = y_te_b_us.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa_us
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
 
@@ -765,14 +768,14 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         results["Benchmark Sex-agnostic (undersampled)"]["female_rate"].append(f_rate)
 
         # --- Benchmark Male-only --- #
-        pred_m, prob_m = rf_evaluate(
+        model_m, threshold_m = rf_evaluate(
             X_tr_b_m,
             y_tr_b_m,
-            X_te_b_m,
-            y_te_b_m,
             feat_names=benchmark_features,
             random_state=seed,
         )
+        prob_m = model_m.predict_proba(X_te_b_m)[:, 1]
+        pred_m = (prob_m >= threshold_m).astype(int)
         y_true_m = y_te_b_m[label].values
         eval_df = y_te_b_m.reset_index(drop=True).copy()
         eval_df["pred"] = pred_m
@@ -814,14 +817,14 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         results["Benchmark Male"]["female_rate"].append(f_rate_m)
 
         # --- Benchmark Female-only --- #
-        pred_f, prob_f = rf_evaluate(
+        model_f, threshold_f = rf_evaluate(
             X_tr_b_f,
             y_tr_b_f,
-            X_te_b_f,
-            y_te_b_f,
             feat_names=benchmark_features,
             random_state=seed,
         )
+        prob_f = model_f.predict_proba(X_te_b_f)[:, 1]
+        pred_f = (prob_f >= threshold_f).astype(int)
         y_true_f = y_te_b_f[label].values
         eval_df = y_te_b_f.reset_index(drop=True).copy()
         eval_df["pred"] = pred_f
@@ -937,14 +940,14 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         results["Benchmark Sex-specific"]["female_rate"].append(f_rate_c)
 
         # --- Proposed Sex-agnostic --- #
-        pred_sa, prob_sa = rf_evaluate(
+        model_sa, threshold_sa = rf_evaluate(
             X_tr_p,
             y_tr_p,
-            X_te_p,
-            y_te_p,
             feat_names=proposed_features,
             random_state=seed,
         )
+        prob_sa = model_sa.predict_proba(X_te_p)[:, 1]
+        pred_sa = (prob_sa >= threshold_sa).astype(int)
         eval_df = y_te_p.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
@@ -1011,15 +1014,15 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         results["Proposed Sex-agnostic"]["female_rate"].append(f_rate)
 
         # --- Proposed Sex-agnostic (undersampled) --- #
-        pred_sa_us, prob_sa_us = rf_evaluate(
+        model_sa_us, threshold_sa_us = rf_evaluate(
             X_tr_p_us,
             y_tr_p_us,
-            X_te_p,
-            y_te_p,
             feat_names=proposed_features,
             random_state=seed,
         )
-        eval_df = y_te_p.reset_index(drop=True).copy()
+        prob_sa_us = model_sa_us.predict_proba(X_te_p_us)[:, 1]
+        pred_sa_us = (prob_sa_us >= threshold_sa_us).astype(int)
+        eval_df = y_te_p_us.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa_us
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
 
@@ -1100,14 +1103,14 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         results["Proposed Sex-agnostic (undersampled)"]["female_rate"].append(f_rate)
 
         # --- Proposed Male-only --- #
-        pred_m, prob_m = rf_evaluate(
+        model_m, threshold_m = rf_evaluate(
             X_tr_p_m,
             y_tr_p_m,
-            X_te_p_m,
-            y_te_p_m,
             feat_names=proposed_features,
             random_state=seed,
         )
+        prob_m = model_m.predict_proba(X_te_p_m)[:, 1]
+        pred_m = (prob_m >= threshold_m).astype(int)
         y_true_m = y_te_p_m[label].values
         eval_df = y_te_p_m.reset_index(drop=True).copy()
         eval_df["pred"] = pred_m
@@ -1149,14 +1152,14 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         results["Proposed Male"]["female_rate"].append(f_rate_m)
 
         # --- Proposed Female-only --- #
-        pred_f, prob_f = rf_evaluate(
+        model_f, threshold_f = rf_evaluate(
             X_tr_p_f,
             y_tr_p_f,
-            X_te_p_f,
-            y_te_p_f,
             feat_names=proposed_features,
             random_state=seed,
         )
+        prob_f = model_f.predict_proba(X_te_p_f)[:, 1]
+        pred_f = (prob_f >= threshold_f).astype(int)
         y_true_f = y_te_p_f[label].values
         eval_df = y_te_p_f.reset_index(drop=True).copy()
         eval_df["pred"] = pred_f
@@ -1272,14 +1275,14 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         results["Proposed Sex-specific"]["female_rate"].append(f_rate_c)
 
         # --- Real proposed Sex-agnostic --- #
-        pred_sa, prob_sa = rf_evaluate(
+        model_sa, threshold_sa = rf_evaluate(
             X_tr_r,
             y_tr_r,
-            X_te_r,
-            y_te_r,
             feat_names=real_proposed_features,
             random_state=seed,
         )
+        prob_sa = model_sa.predict_proba(X_te_r)[:, 1]
+        pred_sa = (prob_sa >= threshold_sa).astype(int)
         eval_df = y_te_r.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
@@ -1346,15 +1349,15 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         results["Real Proposed Sex-agnostic"]["female_rate"].append(f_rate)
 
         # --- Real Proposed Sex-agnostic (undersampled) --- #
-        pred_sa_us, prob_sa_us = rf_evaluate(
+        model_sa_us, threshold_sa_us = rf_evaluate(
             X_tr_r_us,
             y_tr_r_us,
-            X_te_r,
-            y_te_r,
             feat_names=real_proposed_features,
             random_state=seed,
         )
-        eval_df = y_te_r.reset_index(drop=True).copy()
+        prob_sa_us = model_sa_us.predict_proba(X_te_r_us)[:, 1]
+        pred_sa_us = (prob_sa_us >= threshold_sa_us).astype(int)
+        eval_df = y_te_r_us.reset_index(drop=True).copy()
         eval_df["pred"] = pred_sa_us
         m_rate, f_rate = incidence_rate(eval_df, "pred", label)
 
@@ -1445,14 +1448,14 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         )
 
         # --- Real Proposed Male-only --- #
-        pred_m, prob_m = rf_evaluate(
+        model_m, threshold_m = rf_evaluate(
             X_tr_r_m,
             y_tr_r_m,
-            X_te_r_m,
-            y_te_r_m,
             feat_names=real_proposed_features,
             random_state=seed,
         )
+        prob_m = model_m.predict_proba(X_te_r_m)[:, 1]
+        pred_m = (prob_m >= threshold_m).astype(int)
         y_true_m = y_te_r_m[label].values
         eval_df = y_te_r_m.reset_index(drop=True).copy()
         eval_df["pred"] = pred_m
@@ -1494,14 +1497,14 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         results["Real Proposed Male"]["female_rate"].append(f_rate_m)
 
         # --- Real Proposed Female-only --- #
-        pred_f, prob_f = rf_evaluate(
+        model_f, threshold_f = rf_evaluate(
             X_tr_r_f,
             y_tr_r_f,
-            X_te_r_f,
-            y_te_r_f,
             feat_names=real_proposed_features,
             random_state=seed,
         )
+        prob_f = model_f.predict_proba(X_te_r_f)[:, 1]
+        pred_f = (prob_f >= threshold_f).astype(int)
         y_true_f = y_te_r_f[label].values
         eval_df = y_te_r_f.reset_index(drop=True).copy()
         eval_df["pred"] = pred_f
