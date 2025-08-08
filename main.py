@@ -64,39 +64,45 @@ import pandas as pd
 from math import ceil
 from scipy.stats import randint
 
+
 def CG_equation(age, weight, female, serum_creatinine):
     """Cockcroft-Gault Equation."""
     constant = 0.85 if female else 1.0
     return ((140 - age) * weight * constant) / (72 * serum_creatinine)
 
+
 # Load data
-DATA_DIR = "/workspace/data"
+DATA_DIR = "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff"
 SURVIVAL_FILE = "df.xlsx"
 COHORT_FILE = "NICM Arrhythmia Cohort for Xiaotan Final.xlsx"
 survival_path = f"{DATA_DIR}/{SURVIVAL_FILE}"
 cohort_path = f"{DATA_DIR}/{COHORT_FILE}"
 if not os.path.exists(survival_path) or not os.path.exists(cohort_path):
-    print(f"Data files not found. Expected SURVIVAL_FILE at '{survival_path}' and COHORT_FILE at '{cohort_path}'. Set DATA_DIR/SURVIVAL_FILE/COHORT_FILE environment variables accordingly.")
+    print(
+        f"Data files not found. Expected SURVIVAL_FILE at '{survival_path}' and COHORT_FILE at '{cohort_path}'. Set DATA_DIR/SURVIVAL_FILE/COHORT_FILE environment variables accordingly."
+    )
     sys.exit(0)
 
 survival_df = pd.read_excel(survival_path)
 survival_df["PE_Time"] = np.where(
     survival_df["Was Primary Endpoint Reached? (Appropriate ICD Therapy)"] == 1,
     survival_df["Time from ICD Implant to Primary Endpoint (in days)"],
-    survival_df["Time from ICD Implant to Last Cardiology Encounter (in days)"]
+    survival_df["Time from ICD Implant to Last Cardiology Encounter (in days)"],
 )
 survival_df["SE_Time"] = np.where(
     survival_df["Was Secondary Endpoint Reached?"] == 1,
     survival_df["Time from ICD Implant to Secondary Endpoint (in days)"],
-    survival_df["Time from ICD Implant to Last Cardiology Encounter (in days)"]
+    survival_df["Time from ICD Implant to Last Cardiology Encounter (in days)"],
 )
-survival_df = survival_df[[
-    "MRN",
-    "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
-    "PE_Time",
-    "Was Secondary Endpoint Reached?",
-    "SE_Time",
-]]
+survival_df = survival_df[
+    [
+        "MRN",
+        "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
+        "PE_Time",
+        "Was Secondary Endpoint Reached?",
+        "SE_Time",
+    ]
+]
 
 with_icd = pd.read_excel(cohort_path, sheet_name="ICD")
 with_icd["ICD"] = 1
@@ -113,17 +119,32 @@ without_icd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = without_icd.apply
 )
 common_cols = with_icd.columns.intersection(without_icd.columns)
 df = pd.concat([with_icd[common_cols], without_icd[common_cols]], ignore_index=True)
-df.drop([
-    "Date VT/VF/SCD",
-    "End follow-up date",
-    "CRT Date",
-    "QRS",
-], axis=1, inplace=True)
+df.drop(
+    [
+        "Date VT/VF/SCD",
+        "End follow-up date",
+        "CRT Date",
+        "QRS",
+    ],
+    axis=1,
+    inplace=True,
+)
 
 # Variables
 categorical = [
-    "Female", "DM", "HTN", "HLP", "AF", "NYHA Class", "Beta Blocker",
-    "ACEi/ARB/ARNi", "Aldosterone Antagonist", "VT/VF/SCD", "AAD", "CRT", "ICD"
+    "Female",
+    "DM",
+    "HTN",
+    "HLP",
+    "AF",
+    "NYHA Class",
+    "Beta Blocker",
+    "ACEi/ARB/ARNi",
+    "Aldosterone Antagonist",
+    "VT/VF/SCD",
+    "AAD",
+    "CRT",
+    "ICD",
 ]
 df[categorical] = df[categorical].astype("object")
 labels = ["MRN", "Female", "VT/VF/SCD", "ICD"]
@@ -151,9 +172,7 @@ def impute_misforest(X, random_seed):
         initial_strategy="median",
     )
     # Return a DataFrame directly to avoid redundant assignments
-    return pd.DataFrame(
-        imputer.fit_transform(X), columns=X.columns, index=X.index
-    )
+    return pd.DataFrame(imputer.fit_transform(X), columns=X.columns, index=X.index)
 
 
 def conversion_and_imputation(df, features, labels):
@@ -167,13 +186,24 @@ def conversion_and_imputation(df, features, labels):
 
     # Convert binary variables to float
     binary_cols = [
-        "Female", "DM", "HTN", "HLP", "AF", "Beta Blocker",
-        "ACEi/ARB/ARNi", "Aldosterone Antagonist", "VT/VF/SCD",
-        "AAD", "CRT", "ICD"
+        "Female",
+        "DM",
+        "HTN",
+        "HLP",
+        "AF",
+        "Beta Blocker",
+        "ACEi/ARB/ARNi",
+        "Aldosterone Antagonist",
+        "VT/VF/SCD",
+        "AAD",
+        "CRT",
+        "ICD",
     ]
     for c in [col for col in binary_cols if col in df.columns]:
         if df[c].dtype == "object":
-            df[c] = df[c].replace({"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0})
+            df[c] = df[c].replace(
+                {"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0}
+            )
         df[c] = df[c].astype(float)
 
     # Impute missing values
@@ -209,22 +239,22 @@ print(clean_df["VT/VF/SCD"].value_counts())
 icd_df = clean_df[clean_df["ICD"] == 1]
 cond = (icd_df["NYHA Class"] >= 2) & (icd_df["LVEF"] <= 35)
 pct = cond.sum() / len(icd_df) * 100
-print(
-    f"\nProportion of ICD population following the rule-based guideline: {pct:.2f}%"
-)
+print(f"\nProportion of ICD population following the rule-based guideline: {pct:.2f}%")
 
 from sklearn.model_selection import train_test_split
 
 df = clean_df.copy()
-stratify_column = df['Female'].astype(str) + '_' + df['VT/VF/SCD'].astype(str)
+stratify_column = df["Female"].astype(str) + "_" + df["VT/VF/SCD"].astype(str)
 train_df, test_df = train_test_split(
-    df,
-    test_size=0.2,
-    stratify=stratify_column,
-    random_state=100
+    df, test_size=0.2, stratify=stratify_column, random_state=100
 )
-print(f"Overall female proportion: {df['Female'].mean():.2f}, training set: {train_df['Female'].mean():.2f}, test set: {test_df['Female'].mean():.2f}")
-print(f"Overall arrhythmia proportion: {df['VT/VF/SCD'].mean():.2f}, training set: {train_df['VT/VF/SCD'].mean():.2f}, test set: {test_df['VT/VF/SCD'].mean():.2f}")
+print(
+    f"Overall female proportion: {df['Female'].mean():.2f}, training set: {train_df['Female'].mean():.2f}, test set: {test_df['Female'].mean():.2f}"
+)
+print(
+    f"Overall arrhythmia proportion: {df['VT/VF/SCD'].mean():.2f}, training set: {train_df['VT/VF/SCD'].mean():.2f}, test set: {test_df['VT/VF/SCD'].mean():.2f}"
+)
+
 
 def find_best_threshold(y_true, y_scores):
     """
@@ -263,8 +293,16 @@ def incidence_rate(df, pred_col, label_col):
     """
     male = df[df["Female"] == 0]
     female = df[df["Female"] == 1]
-    male_rate = male[label_col].sum() / (male[pred_col] == 1).sum() if (male[pred_col] == 1).sum() > 0 else np.nan
-    female_rate = female[label_col].sum() / (female[pred_col] == 1).sum() if (female[pred_col] == 1).sum() > 0 else np.nan
+    male_rate = (
+        male[label_col].sum() / (male[pred_col] == 1).sum()
+        if (male[pred_col] == 1).sum() > 0
+        else np.nan
+    )
+    female_rate = (
+        female[label_col].sum() / (female[pred_col] == 1).sum()
+        if (female[pred_col] == 1).sum() > 0
+        else np.nan
+    )
     return male_rate, female_rate
 
 
@@ -347,13 +385,35 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
     # Features
     guideline_features = ["NYHA Class", "LVEF"]
     benchmark_features = [
-        "Female", "Age by decade", "BMI", "AF", "Beta Blocker", "CrCl>45",
-        "LVEF", "QTc", "NYHA>2", "CRT", "AAD", "Significant LGE"
+        "Female",
+        "Age by decade",
+        "BMI",
+        "AF",
+        "Beta Blocker",
+        "CrCl>45",
+        "LVEF",
+        "QTc",
+        "NYHA>2",
+        "CRT",
+        "AAD",
+        "Significant LGE",
     ]
     proposed_features = benchmark_features + [
-        "DM", "HTN", "HLP", "LVEDVi", "LV Mass Index", "RVEDVi", "RVEF",
-        "LA EF", "LAVi", "MRF (%)", "Sphericity Index", "Relative Wall Thickness",
-        "MV Annular Diameter", "ACEi/ARB/ARNi", "Aldosterone Antagonist"
+        "DM",
+        "HTN",
+        "HLP",
+        "LVEDVi",
+        "LV Mass Index",
+        "RVEDVi",
+        "RVEF",
+        "LA EF",
+        "LAVi",
+        "MRF (%)",
+        "Sphericity Index",
+        "Relative Wall Thickness",
+        "MV Annular Diameter",
+        "ACEi/ARB/ARNi",
+        "Aldosterone Antagonist",
     ]
     real_proposed_features = proposed_features[:]
     real_proposed_features.remove("NYHA>2")
@@ -362,18 +422,42 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
 
     # Models
     model_names = [
-        "Guideline", "RF Guideline", "Benchmark Sex-agnostic",
-        "Benchmark Sex-agnostic (undersampled)", "Benchmark Male", "Benchmark Female",
-        "Benchmark Sex-specific", "Proposed Sex-agnostic", "Proposed Sex-agnostic (undersampled)",
-        "Proposed Male", "Proposed Female", "Proposed Sex-specific",
-        "Real Proposed Sex-agnostic", "Real Proposed Sex-agnostic (undersampled)",
-        "Real Proposed Male", "Real Proposed Female", "Real Proposed Sex-specific"
+        "Guideline",
+        "RF Guideline",
+        "Benchmark Sex-agnostic",
+        "Benchmark Sex-agnostic (undersampled)",
+        "Benchmark Male",
+        "Benchmark Female",
+        "Benchmark Sex-specific",
+        "Proposed Sex-agnostic",
+        "Proposed Sex-agnostic (undersampled)",
+        "Proposed Male",
+        "Proposed Female",
+        "Proposed Sex-specific",
+        "Real Proposed Sex-agnostic",
+        "Real Proposed Sex-agnostic (undersampled)",
+        "Real Proposed Male",
+        "Real Proposed Female",
+        "Real Proposed Sex-specific",
     ]
     metrics = [
-        "accuracy", "auc", "f1", "sensitivity", "specificity",
-        "male_accuracy", "male_auc", "male_f1", "male_sensitivity", "male_specificity",
-        "female_accuracy", "female_auc", "female_f1", "female_sensitivity", "female_specificity",
-        "male_rate", "female_rate"
+        "accuracy",
+        "auc",
+        "f1",
+        "sensitivity",
+        "specificity",
+        "male_accuracy",
+        "male_auc",
+        "male_f1",
+        "male_sensitivity",
+        "male_specificity",
+        "female_accuracy",
+        "female_auc",
+        "female_f1",
+        "female_sensitivity",
+        "female_specificity",
+        "male_rate",
+        "female_rate",
     ]
     results = {m: {met: [] for met in metrics} for m in model_names}
 
@@ -1646,13 +1730,17 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
     )
     summary_table = formatted.unstack(level=1)
     rows_to_drop = [
-        "Benchmark Male", "Benchmark Female", "Proposed Male", "Proposed Female",
-        "Real Proposed Male", "Real Proposed Female"
+        "Benchmark Male",
+        "Benchmark Female",
+        "Proposed Male",
+        "Proposed Female",
+        "Real Proposed Male",
+        "Real Proposed Female",
     ]
     summary_table = summary_table.drop(index=rows_to_drop)
 
     # Save result
-    output_dir = "/workspace/output"
+    output_dir = "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff"
     output_file = "summary_results.xlsx"
     full_path = f"{output_dir}/{output_file}"
     summary_table.to_excel(full_path, index=True)
@@ -1741,18 +1829,32 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     df["pred_sexspecific"] = np.nan
     df["prob_sexspecific"] = np.nan
     if "pred_male" in df.columns:
-        df.loc[df["Female"] == 0, "pred_sexspecific"] = df.loc[df["Female"] == 0, "pred_male"]
-        df.loc[df["Female"] == 0, "prob_sexspecific"] = df.loc[df["Female"] == 0, "prob_male"]
+        df.loc[df["Female"] == 0, "pred_sexspecific"] = df.loc[
+            df["Female"] == 0, "pred_male"
+        ]
+        df.loc[df["Female"] == 0, "prob_sexspecific"] = df.loc[
+            df["Female"] == 0, "prob_male"
+        ]
     if "pred_female" in df.columns:
-        df.loc[df["Female"] == 1, "pred_sexspecific"] = df.loc[df["Female"] == 1, "pred_female"]
-        df.loc[df["Female"] == 1, "prob_sexspecific"] = df.loc[df["Female"] == 1, "prob_female"]
+        df.loc[df["Female"] == 1, "pred_sexspecific"] = df.loc[
+            df["Female"] == 1, "pred_female"
+        ]
+        df.loc[df["Female"] == 1, "prob_sexspecific"] = df.loc[
+            df["Female"] == 1, "prob_female"
+        ]
     pred_labels = df[["MRN", "pred_sexspecific"]].drop_duplicates()
-    merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
+    merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(
+        subset=["MRN"]
+    )
     # Keep only survival analysis and Cox models; remove visualization and clustering
     kmf = KaplanMeierFitter()
     endpoints = [
-        ("Primary Endpoint", "PE_Time", "Was Primary Endpoint Reached? (Appropriate ICD Therapy)"),
-        ("Secondary Endpoint", "SE_Time", "Was Secondary Endpoint Reached?")
+        (
+            "Primary Endpoint",
+            "PE_Time",
+            "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
+        ),
+        ("Secondary Endpoint", "SE_Time", "Was Secondary Endpoint Reached?"),
     ]
     groupings = [("Sex-Specific grouping", "pred_sexspecific")]
     for ep_name, time_col, event_col in endpoints:
@@ -1778,12 +1880,24 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
         print(f"Log-rank p = {p_value:.5f}")
     # Cox PH model
     cph_feature = df[["MRN"] + features]
-    cph_df = survival_df.merge(cph_feature, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
-    covariates = [col for col in cph_df.columns if col not in [
-        "MRN", "PE_Time", "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
-        "SE_Time", "Was Secondary Endpoint Reached?"
-    ]]
-    formula_terms = [f"`{col}`" if re.search(r"[^a-zA-Z0-9_]", col) else col for col in covariates]
+    cph_df = survival_df.merge(cph_feature, on="MRN", how="inner").drop_duplicates(
+        subset=["MRN"]
+    )
+    covariates = [
+        col
+        for col in cph_df.columns
+        if col
+        not in [
+            "MRN",
+            "PE_Time",
+            "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
+            "SE_Time",
+            "Was Secondary Endpoint Reached?",
+        ]
+    ]
+    formula_terms = [
+        f"`{col}`" if re.search(r"[^a-zA-Z0-9_]", col) else col for col in covariates
+    ]
     formula = " + ".join(formula_terms)
     cph_primary = CoxPHFitter()
     cph_primary.fit(
@@ -1804,4 +1918,3 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     print(f"\nCox PH Model for Secondary endpoint:")
     print(cph_secondary.summary)
     return None
-
