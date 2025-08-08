@@ -1,6 +1,6 @@
-# main.py (优化版)
-# 本文件经过结构简化、去重、加速处理，适合大数据量和多模型场景。
-# 主要优化点：去除重复import、合并数据处理、函数结构精简、减少不必要输出。
+# main.py (Optimized Version)
+# This file has been refactored for clarity, speed, and maintainability.
+# Key improvements: removed duplicate imports, merged data processing, simplified function structure, and reduced unnecessary output.
 
 import os
 import sys
