@@ -618,8 +618,8 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         ]
     }
     
-    # Model configurations
-    model_configs = [
+    # Model configurations - FULL VERSION (17 models)
+    model_configs_full = [
         {"name": "Guideline", "features": "Guideline", "type": "rule_based"},
         {"name": "RF Guideline", "features": "Guideline", "type": "rf"},
         {"name": "Benchmark Sex-agnostic", "features": "Benchmark", "type": "rf"},
@@ -638,6 +638,26 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
         {"name": "Real Proposed Female", "features": "Real_Proposed", "type": "rf_female_only"},
         {"name": "Real Proposed Sex-specific", "features": "Real_Proposed", "type": "rf_sex_specific"},
     ]
+    
+    # Model configurations - SIMPLIFIED VERSION (8 models, recommended for testing)
+    model_configs_simple = [
+        {"name": "Guideline", "features": "Guideline", "type": "rule_based"},
+        {"name": "RF Guideline", "features": "Guideline", "type": "rf"},
+        {"name": "Benchmark Sex-agnostic (undersampled)", "features": "Benchmark", "type": "rf_undersampled"},
+        {"name": "Benchmark Sex-specific", "features": "Benchmark", "type": "rf_sex_specific"},
+        {"name": "Proposed Sex-agnostic (undersampled)", "features": "Proposed", "type": "rf_undersampled"},
+        {"name": "Proposed Sex-specific", "features": "Proposed", "type": "rf_sex_specific"},
+        {"name": "Real Proposed Sex-agnostic (undersampled)", "features": "Real_Proposed", "type": "rf_undersampled"},
+        {"name": "Real Proposed Sex-specific", "features": "Real_Proposed", "type": "rf_sex_specific"},
+    ]
+    
+    # Choose configuration based on N (number of splits)
+    if N <= 5:  # For quick testing, use simplified version
+        model_configs = model_configs_simple
+        print("Using SIMPLIFIED version (7 models) for quick testing")
+    else:  # For full analysis, use full version
+        model_configs = model_configs_full
+        print("Using FULL version (17 models) for comprehensive analysis")
     
     # Metrics to collect
     metrics = [
@@ -776,7 +796,7 @@ def _evaluate_rule_based_model(features, train_df, test_df, label):
 def _evaluate_rf_model(features, train_df, test_df, label, seed):
     """Evaluate Random Forest model using optimized parameters for imbalanced data."""
     X_train = train_df[features]
-    y_train = train_df[[label, "Female"]]
+    y_train = train_df[label]  # Extract only the label column
     X_test = test_df[features]
     y_test = test_df[label].values
     
@@ -803,7 +823,7 @@ def _evaluate_rf_model(features, train_df, test_df, label, seed):
     for threshold in thresholds:
         fold_f1_scores = []
         
-        for train_idx, val_idx in cv.split(X_train, y_train[label]):
+        for train_idx, val_idx in cv.split(X_train, y_train):
             X_fold_train, X_fold_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
             y_fold_train, y_fold_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
             
@@ -817,11 +837,11 @@ def _evaluate_rf_model(features, train_df, test_df, label, seed):
                 class_weight="balanced",
                 n_jobs=-1
             )
-            model_fold.fit(X_fold_train, y_fold_train[label])
+            model_fold.fit(X_fold_train, y_fold_train)
             
             prob = model_fold.predict_proba(X_fold_val)[:, 1]
             pred = (prob >= threshold).astype(int)
-            f1 = f1_score(y_fold_train[label], pred, zero_division=0)
+            f1 = f1_score(y_fold_val, pred, zero_division=0)  # Fixed: use y_fold_val
             fold_f1_scores.append(f1)
         
         cv_f1_scores.append(np.mean(fold_f1_scores))
@@ -830,7 +850,7 @@ def _evaluate_rf_model(features, train_df, test_df, label, seed):
     best_threshold = thresholds[np.argmax(cv_f1_scores)]
     
     # Train final model with best threshold
-    model.fit(X_train, y_train[label])
+    model.fit(X_train, y_train)
     
     # Get predictions
     prob = model.predict_proba(X_test)[:, 1]
@@ -842,7 +862,7 @@ def _evaluate_rf_model(features, train_df, test_df, label, seed):
 def _evaluate_rf_undersampled_model(features, us_train_df, test_df, label, seed):
     """Evaluate Random Forest model on undersampled data using optimized parameters."""
     X_train = us_train_df[features]
-    y_train = us_train_df[[label, "Female"]]
+    y_train = us_train_df[label]  # Extract only the label column
     X_test = test_df[features]
     y_test = test_df[label].values
     
@@ -866,7 +886,7 @@ def _evaluate_rf_undersampled_model(features, us_train_df, test_df, label, seed)
     for threshold in thresholds:
         fold_f1_scores = []
         
-        for train_idx, val_idx in cv.split(X_train, y_train[label]):
+        for train_idx, val_idx in cv.split(X_train, y_train):
             X_fold_train, X_fold_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
             y_fold_train, y_fold_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
             
@@ -880,11 +900,11 @@ def _evaluate_rf_undersampled_model(features, us_train_df, test_df, label, seed)
                 class_weight="balanced",
                 n_jobs=-1
             )
-            model_fold.fit(X_fold_train, y_fold_train[label])
+            model_fold.fit(X_fold_train, y_fold_train)
             
             prob = model_fold.predict_proba(X_fold_val)[:, 1]
             pred = (prob >= threshold).astype(int)
-            f1 = f1_score(y_fold_val[label], pred, zero_division=0)
+            f1 = f1_score(y_fold_val, pred, zero_division=0)  # Fixed: use y_fold_val
             fold_f1_scores.append(f1)
         
         cv_f1_scores.append(np.mean(fold_f1_scores))
@@ -893,7 +913,7 @@ def _evaluate_rf_undersampled_model(features, us_train_df, test_df, label, seed)
     best_threshold = thresholds[np.argmax(cv_f1_scores)]
     
     # Train final model with best threshold
-    model.fit(X_train, y_train[label])
+    model.fit(X_train, y_train)
     
     # Get predictions
     prob = model.predict_proba(X_test)[:, 1]
@@ -913,7 +933,7 @@ def _evaluate_rf_sex_specific(features, train_sex, test_sex, label, seed, sex_ty
         ]}
     
     X_train = train_sex[features]
-    y_train = train_sex[[label, "Female"]]
+    y_train = train_sex[label]  # Extract only the label column
     X_test = test_sex[features]
     y_test = test_sex[label].values
     
@@ -937,7 +957,7 @@ def _evaluate_rf_sex_specific(features, train_sex, test_sex, label, seed, sex_ty
     for threshold in thresholds:
         fold_f1_scores = []
         
-        for train_idx, val_idx in cv.split(X_train, y_train[label]):
+        for train_idx, val_idx in cv.split(X_train, y_train):
             X_fold_train, X_fold_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
             y_fold_train, y_fold_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
             
@@ -951,11 +971,11 @@ def _evaluate_rf_sex_specific(features, train_sex, test_sex, label, seed, sex_ty
                 class_weight="balanced",
                 n_jobs=-1
             )
-            model_fold.fit(X_fold_train, y_fold_train[label])
+            model_fold.fit(X_fold_train, y_fold_train)
             
             prob = model_fold.predict_proba(X_fold_val)[:, 1]
             pred = (prob >= threshold).astype(int)
-            f1 = f1_score(y_fold_val[label], pred, zero_division=0)
+            f1 = f1_score(y_fold_val, pred, zero_division=0)  # Fixed: use y_fold_val
             fold_f1_scores.append(f1)
         
         cv_f1_scores.append(np.mean(fold_f1_scores))
@@ -964,7 +984,7 @@ def _evaluate_rf_sex_specific(features, train_sex, test_sex, label, seed, sex_ty
     best_threshold = thresholds[np.argmax(cv_f1_scores)]
     
     # Train final model with best threshold
-    model.fit(X_train, y_train[label])
+    model.fit(X_train, y_train)
     
     # Get predictions
     prob = model.predict_proba(X_test)[:, 1]
@@ -1036,7 +1056,7 @@ def _train_sex_model(features, train_sex, label, seed):
         return None, 0.5
     
     X_train = train_sex[features]
-    y_train = train_sex[[label, "Female"]]
+    y_train = train_sex[label]  # Extract only the label column
     
     try:
         # Use optimized parameters for better performance
@@ -1059,7 +1079,7 @@ def _train_sex_model(features, train_sex, label, seed):
         for threshold in thresholds:
             fold_f1_scores = []
             
-            for train_idx, val_idx in cv.split(X_train, y_train[label]):
+            for train_idx, val_idx in cv.split(X_train, y_train):
                 X_fold_train, X_fold_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
                 y_fold_train, y_fold_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
                 
@@ -1073,11 +1093,11 @@ def _train_sex_model(features, train_sex, label, seed):
                     class_weight="balanced",
                     n_jobs=-1
                 )
-                model_fold.fit(X_fold_train, y_fold_train[label])
+                model_fold.fit(X_fold_train, y_fold_train)
                 
                 prob = model_fold.predict_proba(X_fold_val)[:, 1]
                 pred = (prob >= threshold).astype(int)
-                f1 = f1_score(y_fold_val[label], pred, zero_division=0)
+                f1 = f1_score(y_fold_val, pred, zero_division=0)  # Fixed: use y_fold_val
                 fold_f1_scores.append(f1)
             
             cv_f1_scores.append(np.mean(fold_f1_scores))
@@ -1086,7 +1106,7 @@ def _train_sex_model(features, train_sex, label, seed):
         best_threshold = thresholds[np.argmax(cv_f1_scores)]
         
         # Train final model
-        model.fit(X_train, y_train[label])
+        model.fit(X_train, y_train)
         
         return model, best_threshold
         
@@ -1189,6 +1209,20 @@ def _save_results(summary_table):
         print(f"Summary table saved to: {full_path}")
     except Exception as e:
         print(f"Warning: Could not save results: {e}")
+
+
+def main():
+    """Main execution function."""
+    clean_df, train_df, test_df, survival_df = prepare_data()
+    
+    print("=== Standard Evaluation ===")
+    N_SPLITS = 10
+    res, summary = multiple_random_splits(train_df, N_SPLITS)
+    print(summary)
+    
+    print("\n=== Enhanced Imbalanced Data Evaluation ===")
+    # Test the new imbalanced data handling methods
+    test_imbalanced_methods(train_df, test_df, clean_df.columns)
 
 
 def full_model_inference(train_df, test_df, features, labels, survival_df, seed):
@@ -1710,12 +1744,4 @@ def find_optimal_threshold_balanced(X_train, y_train_df, X_test, y_test, feature
 
 # Main execution block
 if __name__ == "__main__":
-    clean_df, train_df, test_df, survival_df = prepare_data()
-    
-    print("=== Standard Evaluation ===")
-    N_SPLITS = 2
-    res, summary = multiple_random_splits(train_df, N_SPLITS)
-    print(summary)
-    
-    print("\n=== Enhanced Imbalanced Data Evaluation ===")
-    test_imbalanced_methods(train_df, test_df, clean_df.columns)
+    main()
