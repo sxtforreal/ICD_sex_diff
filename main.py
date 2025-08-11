@@ -652,12 +652,9 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
     ]
     
     # Choose configuration based on N (number of splits)
-    if N <= 5:  # For quick testing, use simplified version
-        model_configs = model_configs_simple
-        print("Using SIMPLIFIED version (7 models) for quick testing")
-    else:  # For full analysis, use full version
-        model_configs = model_configs_full
-        print("Using FULL version (17 models) for comprehensive analysis")
+    # Force simplified version for any number of splits
+    model_configs = model_configs_simple
+    print(f"Using SIMPLIFIED version ({len(model_configs_simple)} models) for {N} iterations")
     
     # Metrics to collect
     metrics = [
@@ -1739,7 +1736,7 @@ if __name__ == "__main__":
     clean_df, train_df, test_df, survival_df = prepare_data()
     
     print("=== Standard Evaluation ===")
-    N_SPLITS = 10
+    N_SPLITS = 2  # Changed from 10 to 2 to use simplified version (8 models)
     res, summary = multiple_random_splits(train_df, N_SPLITS)
     print(summary)
     
