@@ -266,6 +266,27 @@ def find_best_threshold(y_true, y_scores):
     return thresholds[best_idx]
 
 
+def find_best_threshold_f1(y_true, y_scores):
+    """
+    Find the probability threshold that maximizes the F1 score.
+    More suitable for imbalanced data than precision-recall based approach.
+    """
+    thresholds = np.arange(0.1, 0.9, 0.01)
+    best_f1 = 0
+    best_threshold = 0.5
+    
+    for threshold in thresholds:
+        y_pred = (y_scores >= threshold).astype(int)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = threshold
+    
+    print(f"Best F1 threshold: {best_threshold:.3f} (F1: {best_f1:.3f})")
+    return best_threshold
+
+
 def compute_sensitivity_specificity(y_true, y_pred):
     """
     Compute sensitivity (true positive rate) and specificity (true negative rate)
@@ -360,6 +381,200 @@ def rf_evaluate(
     # The test set should be passed to this function only for inference, not for threshold selection.
     # To use this function for inference, call best_model.predict_proba(X_test)[:, 1] and apply the threshold.
     return best_model, threshold
+
+
+def rf_evaluate_imbalanced(
+    X_train,
+    y_train_df,
+    feat_names,
+    random_state=None,
+    visualize_importance=False,
+    use_smote=True,
+    use_ensemble=True,
+):
+    """
+    Enhanced RandomForest evaluation specifically for imbalanced data.
+    Focuses on improving F1 and sensitivity scores.
+    """
+    y_train = y_train_df["VT/VF/SCD"]
+    
+    # Option 1: SMOTE for oversampling
+    if use_smote:
+        try:
+            from imblearn.over_sampling import SMOTE
+            from imblearn.pipeline import Pipeline
+            
+            # Apply SMOTE to balance the dataset
+            smote = SMOTE(random_state=random_state, k_neighbors=min(5, y_train.sum()-1))
+            X_train_balanced, y_train_balanced = smote.fit_resample(X_train, y_train)
+            
+            print(f"Original: {y_train.sum()} positive, {len(y_train) - y_train.sum()} negative")
+            print(f"After SMOTE: {y_train_balanced.sum()} positive, {len(y_train_balanced) - y_train_balanced.sum()} negative")
+            
+            X_train = X_train_balanced
+            y_train = y_train_balanced
+            
+        except ImportError:
+            print("SMOTE not available, using original data")
+    
+    # Option 2: Ensemble of multiple models
+    if use_ensemble:
+        # Train multiple models with different random states
+        models = []
+        thresholds = []
+        
+        for seed_offset in range(3):  # Train 3 models
+            current_seed = random_state + seed_offset if random_state else seed_offset
+            
+            cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=current_seed)
+            param_dist = {
+                "n_estimators": randint(200, 600),  # More trees
+                "max_depth": [None] + list(range(8, 31, 4)),
+                "min_samples_split": randint(2, 8),
+                "min_samples_leaf": randint(1, 4),
+                "max_features": ["sqrt", "log2", None],
+                "class_weight": ["balanced", "balanced_subsample"]
+            }
+            
+            base_clf = RandomForestClassifier(
+                random_state=current_seed, 
+                n_jobs=-1, 
+                class_weight="balanced"
+            )
+            
+            # Use F1 score as primary metric for imbalanced data
+            f1_scorer = make_scorer(f1_score, average='binary')
+            
+            search = RandomizedSearchCV(
+                estimator=base_clf,
+                param_distributions=param_dist,
+                n_iter=25,  # More iterations
+                scoring=f1_scorer,
+                cv=cv,
+                random_state=current_seed,
+                n_jobs=-1,
+                verbose=0,
+                error_score="raise",
+            )
+            
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                search.fit(X_train, y_train)
+            
+            best_model = search.best_estimator_
+            models.append(best_model)
+            
+            # Find optimal threshold for F1
+            y_train_prob = best_model.predict_proba(X_train)[:, 1]
+            threshold = find_best_threshold_f1(y_train, y_train_prob)
+            thresholds.append(threshold)
+        
+        # Return ensemble info
+        return models, thresholds, "ensemble"
+    
+    else:
+        # Single model approach
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+        param_dist = {
+            "n_estimators": randint(300, 800),  # More trees for better performance
+            "max_depth": [None] + list(range(10, 35, 5)),
+            "min_samples_split": randint(2, 6),
+            "min_samples_leaf": randint(1, 3),
+            "max_features": ["sqrt", "log2", None],
+            "class_weight": ["balanced", "balanced_subsample"]
+        }
+        
+        base_clf = RandomForestClassifier(
+            random_state=random_state, 
+            n_jobs=-1, 
+            class_weight="balanced"
+        )
+        
+        # Use F1 score as primary metric
+        f1_scorer = make_scorer(f1_score, average='binary')
+        
+        search = RandomizedSearchCV(
+            estimator=base_clf,
+            param_distributions=param_dist,
+            n_iter=30,  # More iterations
+            scoring=f1_scorer,
+            cv=cv,
+            random_state=random_state,
+            n_jobs=-1,
+            verbose=0,
+                error_score="raise",
+        )
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            search.fit(X_train, y_train)
+        
+        best_model = search.best_estimator_
+        
+        if visualize_importance:
+            importances = best_model.feature_importances_
+            idx = np.argsort(importances)[::-1]
+            highlight = {"LVEF", "NYHA Class", "NYHA>2"}
+            colors = ["red" if feat_names[i] in highlight else "lightgray" for i in idx]
+            plt.figure(figsize=(8, 4))
+            plt.bar(range(len(feat_names)), importances[idx], color=colors)
+            plt.xticks(range(len(feat_names)), [feat_names[i] for i in idx], rotation=90)
+            plt.xlabel("Feature")
+            plt.ylabel("Importance")
+            plt.title("Feature Importances")
+            plt.tight_layout()
+            plt.show()
+        
+        # Find optimal threshold for F1
+        y_train_prob = best_model.predict_proba(X_train)[:, 1]
+        threshold = find_best_threshold_f1(y_train, y_train_prob)
+        
+        return best_model, threshold, "single"
+
+
+def evaluate_ensemble_models(models, thresholds, X_test, y_test, method="voting"):
+    """
+    Evaluate ensemble models using different combination strategies.
+    """
+    if method == "voting":
+        # Hard voting
+        predictions = []
+        for model, threshold in zip(models, thresholds):
+            prob = model.predict_proba(X_test)[:, 1]
+            pred = (prob >= threshold).astype(int)
+            predictions.append(pred)
+        
+        # Majority vote
+        ensemble_pred = np.mean(predictions, axis=0) >= 0.5
+        ensemble_pred = ensemble_pred.astype(int)
+        
+    elif method == "probability":
+        # Average probabilities
+        probabilities = []
+        for model in models:
+            prob = model.predict_proba(X_test)[:, 1]
+            probabilities.append(prob)
+        
+        avg_prob = np.mean(probabilities, axis=0)
+        ensemble_pred = (avg_prob >= 0.5).astype(int)
+    
+    # Calculate metrics
+    acc = accuracy_score(y_test, ensemble_pred)
+    f1 = f1_score(y_test, ensemble_pred, zero_division=0)
+    sens, spec = compute_sensitivity_specificity(y_test, ensemble_pred)
+    
+    print(f"Ensemble Results ({method}):")
+    print(f"Accuracy: {acc:.3f}")
+    print(f"F1 Score: {f1:.3f}")
+    print(f"Sensitivity: {sens:.3f}")
+    print(f"Specificity: {spec:.3f}")
+    
+    return ensemble_pred, {
+        'accuracy': acc,
+        'f1': f1,
+        'sensitivity': sens,
+        'specificity': spec
+    }
 
 
 def multiple_random_splits(df, N, label="VT/VF/SCD"):
@@ -1747,9 +1962,15 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
 def main():
     """Main execution function."""
     clean_df, train_df, test_df, survival_df = prepare_data()
+    
+    print("=== Standard Evaluation ===")
     N_SPLITS = 10
     res, summary = multiple_random_splits(train_df, N_SPLITS)
     print(summary)
+    
+    print("\n=== Enhanced Imbalanced Data Evaluation ===")
+    # Test the new imbalanced data handling methods
+    test_imbalanced_methods(train_df, test_df, clean_df.columns)
 
 
 def full_model_inference(train_df, test_df, features, labels, survival_df, seed):
@@ -1903,6 +2124,121 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     print(f"\nCox PH Model for Secondary endpoint:")
     print(cph_secondary.summary)
     return None
+
+
+def test_imbalanced_methods(train_df, test_df, all_features):
+    """
+    Test different methods for handling imbalanced data.
+    """
+    print("Testing different approaches for imbalanced data...")
+    
+    # Define feature sets
+    guideline_features = ["NYHA Class", "LVEF"]
+    benchmark_features = [
+        "Female", "Age by decade", "BMI", "AF", "Beta Blocker", "CrCl>45",
+        "LVEF", "QTc", "NYHA>2", "CRT", "AAD", "Significant LGE"
+    ]
+    
+    # Test 1: Standard approach with F1 optimization
+    print("\n--- Test 1: Standard RF with F1 optimization ---")
+    X_train = train_df[benchmark_features]
+    y_train = train_df[["VT/VF/SCD", "Female"]]
+    X_test = test_df[benchmark_features]
+    y_test = test_df["VT/VF/SCD"]
+    
+    try:
+        model, threshold, method = rf_evaluate_imbalanced(
+            X_train, y_train, benchmark_features, 
+            random_state=42, use_smote=False, use_ensemble=False
+        )
+        
+        if method == "single":
+            prob = model.predict_proba(X_test)[:, 1]
+            pred = (prob >= threshold).astype(int)
+            
+            acc = accuracy_score(y_test, pred)
+            f1 = f1_score(y_test, pred, zero_division=0)
+            sens, spec = compute_sensitivity_specificity(y_test, pred)
+            
+            print(f"Single Model Results:")
+            print(f"Accuracy: {acc:.3f}")
+            print(f"F1 Score: {f1:.3f}")
+            print(f"Sensitivity: {sens:.3f}")
+            print(f"Specificity: {spec:.3f}")
+    
+    except Exception as e:
+        print(f"Error in single model approach: {e}")
+    
+    # Test 2: SMOTE + Single model
+    print("\n--- Test 2: SMOTE + Single RF ---")
+    try:
+        model, threshold, method = rf_evaluate_imbalanced(
+            X_train, y_train, benchmark_features, 
+            random_state=42, use_smote=True, use_ensemble=False
+        )
+        
+        if method == "single":
+            prob = model.predict_proba(X_test)[:, 1]
+            pred = (prob >= threshold).astype(int)
+            
+            acc = accuracy_score(y_test, pred)
+            f1 = f1_score(y_test, pred, zero_division=0)
+            sens, spec = compute_sensitivity_specificity(y_test, pred)
+            
+            print(f"SMOTE + Single Model Results:")
+            print(f"Accuracy: {acc:.3f}")
+            print(f"F1 Score: {f1:.3f}")
+            print(f"Sensitivity: {sens:.3f}")
+            print(f"Specificity: {spec:.3f}")
+    
+    except Exception as e:
+        print(f"Error in SMOTE approach: {e}")
+    
+    # Test 3: Ensemble approach
+    print("\n--- Test 3: Ensemble RF ---")
+    try:
+        models, thresholds, method = rf_evaluate_imbalanced(
+            X_train, y_train, benchmark_features, 
+            random_state=42, use_smote=False, use_ensemble=True
+        )
+        
+        if method == "ensemble":
+            # Test voting method
+            ensemble_pred, metrics = evaluate_ensemble_models(
+                models, thresholds, X_test, y_test, method="voting"
+            )
+            
+            # Test probability method
+            ensemble_pred_prob, metrics_prob = evaluate_ensemble_models(
+                models, thresholds, X_test, y_test, method="probability"
+            )
+    
+    except Exception as e:
+        print(f"Error in ensemble approach: {e}")
+    
+    # Test 4: SMOTE + Ensemble
+    print("\n--- Test 4: SMOTE + Ensemble RF ---")
+    try:
+        models, thresholds, method = rf_evaluate_imbalanced(
+            X_train, y_train, benchmark_features, 
+            random_state=42, use_smote=True, use_ensemble=True
+        )
+        
+        if method == "ensemble":
+            # Test voting method
+            ensemble_pred, metrics = evaluate_ensemble_models(
+                models, thresholds, X_test, y_test, method="voting"
+            )
+            
+            # Test probability method
+            ensemble_pred_prob, metrics_prob = evaluate_ensemble_models(
+                models, thresholds, X_test, y_test, method="probability"
+            )
+    
+    except Exception as e:
+        print(f"Error in SMOTE + ensemble approach: {e}")
+    
+    print("\n=== Imbalanced Data Testing Complete ===")
 
 
 # Main execution block
