@@ -2,19 +2,19 @@
 # This file has been refactored for clarity, speed, and maintainability.
 # Key improvements: removed duplicate imports, merged data processing, simplified function structure, and reduced unnecessary output.
 
+# Standard library imports
 import sys
 import os
 import re
 import warnings
 from math import ceil
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy.stats import randint
 from itertools import combinations
 
+# Scientific computing imports
+import numpy as np
+import pandas as pd
+
+# Machine learning imports
 from sklearn.model_selection import (
     train_test_split,
     StratifiedKFold,
@@ -41,28 +41,21 @@ from sklearn.cluster import KMeans
 from sklearn.manifold import TSNE
 from sklearn.exceptions import UndefinedMetricWarning
 
+# Statistical analysis imports
+from scipy.stats import randint
+
+# Visualization imports
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Medical/clinical analysis imports
 from tableone import TableOne
 from lifelines import KaplanMeierFitter, CoxPHFitter
 from lifelines.statistics import logrank_test
 
+# Configuration
 pd.set_option("future.no_silent_downcasting", True)
 warnings.filterwarnings("ignore", category=FutureWarning)
-
-
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.feature_selection import RFECV
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import average_precision_score, make_scorer
-from sklearn.model_selection import RandomizedSearchCV
-from lifelines import KaplanMeierFitter
-from lifelines.statistics import logrank_test
-from tableone import TableOne
-from sklearn.metrics import roc_auc_score, roc_curve, auc
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-from math import ceil
-from scipy.stats import randint
 
 
 def CG_equation(age, weight, female, serum_creatinine):
@@ -256,43 +249,7 @@ def conversion_and_imputation(df, features, labels):
     return imputed_X
 
 
-clean_df = conversion_and_imputation(df, features, labels)
 
-# Additional
-clean_df["Age by decade"] = (clean_df["Age at CMR"] // 10).astype(int)
-clean_df["CrCl>45"] = (
-    clean_df["Cockcroft-Gault Creatinine Clearance (mL/min)"] > 45
-).astype(int)
-clean_df["NYHA>2"] = (clean_df["NYHA Class"] > 2).astype(int)
-clean_df["Significant LGE"] = (clean_df["LGE Burden 5SD"] > 2).astype(int)
-
-# Distribution of sex
-print("\nSex distribution:")
-print(clean_df["Female"].value_counts())
-
-# Distribution of true label
-print("\nArrhythmia distribution:")
-print(clean_df["VT/VF/SCD"].value_counts())
-
-# Proportion in ICD population that follows the rule-based guideline
-icd_df = clean_df[clean_df["ICD"] == 1]
-cond = (icd_df["NYHA Class"] >= 2) & (icd_df["LVEF"] <= 35)
-pct = cond.sum() / len(icd_df) * 100
-print(f"\nProportion of ICD population following the rule-based guideline: {pct:.2f}%")
-
-from sklearn.model_selection import train_test_split
-
-df = clean_df.copy()
-stratify_column = df["Female"].astype(str) + "_" + df["VT/VF/SCD"].astype(str)
-train_df, test_df = train_test_split(
-    df, test_size=0.2, stratify=stratify_column, random_state=100
-)
-print(
-    f"Overall female proportion: {df['Female'].mean():.2f}, training set: {train_df['Female'].mean():.2f}, test set: {test_df['Female'].mean():.2f}"
-)
-print(
-    f"Overall arrhythmia proportion: {df['VT/VF/SCD'].mean():.2f}, training set: {train_df['VT/VF/SCD'].mean():.2f}, test set: {test_df['VT/VF/SCD'].mean():.2f}"
-)
 
 
 def find_best_threshold(y_true, y_scores):
@@ -1788,24 +1745,11 @@ def multiple_random_splits(df, N, label="VT/VF/SCD"):
 
 
 def main():
+    """Main execution function."""
     clean_df, train_df, test_df, survival_df = prepare_data()
     N_SPLITS = 10
     res, summary = multiple_random_splits(train_df, N_SPLITS)
     print(summary)
-
-from sklearn.tree import plot_tree
-from sklearn.utils import resample
-from sklearn.metrics import (
-    make_scorer,
-    average_precision_score,
-    accuracy_score,
-    roc_auc_score,
-    f1_score,
-    recall_score,
-)
-from sklearn.cluster import KMeans
-from sklearn.manifold import TSNE
-import re
 
 
 def full_model_inference(train_df, test_df, features, labels, survival_df, seed):
@@ -1960,5 +1904,7 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     print(cph_secondary.summary)
     return None
 
+
+# Main execution block
 if __name__ == "__main__":
     main()
