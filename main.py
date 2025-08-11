@@ -2238,7 +2238,160 @@ def test_imbalanced_methods(train_df, test_df, all_features):
     except Exception as e:
         print(f"Error in SMOTE + ensemble approach: {e}")
     
+    # Test 5: Cross-validation based threshold selection
+    print("\n--- Test 5: Cross-validation based threshold ---")
+    test_cv_threshold_selection(X_train, y_train, X_test, y_test, benchmark_features)
+    
+    # Test 6: Regularized model to reduce overfitting
+    print("\n--- Test 6: Regularized RF to reduce overfitting ---")
+    test_regularized_model(X_train, y_train, X_test, y_test, benchmark_features)
+    
     print("\n=== Imbalanced Data Testing Complete ===")
+
+
+def test_cv_threshold_selection(X_train, y_train_df, X_test, y_test, features):
+    """
+    Test cross-validation based threshold selection to reduce overfitting.
+    """
+    y_train = y_train_df["VT/VF/SCD"]
+    
+    # Use cross-validation to find optimal threshold
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    thresholds = np.arange(0.1, 0.9, 0.01)
+    cv_f1_scores = []
+    
+    for threshold in thresholds:
+        fold_f1_scores = []
+        
+        for train_idx, val_idx in cv.split(X_train, y_train):
+            X_fold_train, X_fold_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+            y_fold_train, y_fold_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+            
+            # Train model on fold
+            model = RandomForestClassifier(
+                n_estimators=100,
+                max_depth=10,  # Limit depth to reduce overfitting
+                min_samples_split=10,
+                min_samples_leaf=5,
+                random_state=42,
+                class_weight="balanced"
+            )
+            model.fit(X_fold_train, y_fold_train)
+            
+            # Predict on validation fold
+            prob = model.predict_proba(X_fold_val)[:, 1]
+            pred = (prob >= threshold).astype(int)
+            f1 = f1_score(y_fold_val, pred, zero_division=0)
+            fold_f1_scores.append(f1)
+        
+        cv_f1_scores.append(np.mean(fold_f1_scores))
+    
+    # Find best threshold based on CV
+    best_cv_threshold = thresholds[np.argmax(cv_f1_scores)]
+    best_cv_f1 = np.max(cv_f1_scores)
+    
+    print(f"Best CV threshold: {best_cv_threshold:.3f} (CV F1: {best_cv_f1:.3f})")
+    
+    # Train final model with best threshold
+    final_model = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=10,
+        min_samples_split=10,
+        min_samples_leaf=5,
+        random_state=42,
+        class_weight="balanced"
+    )
+    final_model.fit(X_train, y_train)
+    
+    # Test with CV-optimized threshold
+    prob = final_model.predict_proba(X_test)[:, 1]
+    pred = (prob >= best_cv_threshold).astype(int)
+    
+    acc = accuracy_score(y_test, pred)
+    f1 = f1_score(y_test, pred, zero_division=0)
+    sens, spec = compute_sensitivity_specificity(y_test, pred)
+    
+    print(f"CV-Optimized Threshold Results:")
+    print(f"Accuracy: {acc:.3f}")
+    print(f"F1 Score: {f1:.3f}")
+    print(f"Sensitivity: {sens:.3f}")
+    print(f"Specificity: {spec:.3f}")
+
+
+def test_regularized_model(X_train, y_train_df, X_test, y_test, features):
+    """
+    Test regularized RandomForest to reduce overfitting.
+    """
+    y_train = y_train_df["VT/VF/SCD"]
+    
+    # More conservative parameters to reduce overfitting
+    model = RandomForestClassifier(
+        n_estimators=50,  # Fewer trees
+        max_depth=6,      # Much shallower trees
+        min_samples_split=20,  # Require more samples to split
+        min_samples_leaf=10,   # Require more samples in leaves
+        max_features="sqrt",   # Limit features
+        random_state=42,
+        class_weight="balanced"
+    )
+    
+    # Use cross-validation to find threshold
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    thresholds = np.arange(0.1, 0.9, 0.01)
+    cv_f1_scores = []
+    
+    for threshold in thresholds:
+        fold_f1_scores = []
+        
+        for train_idx, val_idx in cv.split(X_train, y_train):
+            X_fold_train, X_fold_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+            y_fold_train, y_fold_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+            
+            model_fold = RandomForestClassifier(
+                n_estimators=50,
+                max_depth=6,
+                min_samples_split=20,
+                min_samples_leaf=10,
+                max_features="sqrt",
+                random_state=42,
+                class_weight="balanced"
+            )
+            model_fold.fit(X_fold_train, y_fold_train)
+            
+            prob = model_fold.predict_proba(X_fold_val)[:, 1]
+            pred = (prob >= threshold).astype(int)
+            f1 = f1_score(y_fold_val, pred, zero_division=0)
+            fold_f1_scores.append(f1)
+        
+        cv_f1_scores.append(np.mean(fold_f1_scores))
+    
+    best_threshold = thresholds[np.argmax(cv_f1_scores)]
+    print(f"Regularized model best threshold: {best_threshold:.3f}")
+    
+    # Train final regularized model
+    model.fit(X_train, y_train)
+    
+    # Test
+    prob = model.predict_proba(X_test)[:, 1]
+    pred = (prob >= best_threshold).astype(int)
+    
+    acc = accuracy_score(y_test, pred)
+    f1 = f1_score(y_test, pred, zero_division=0)
+    sens, spec = compute_sensitivity_specificity(y_test, pred)
+    
+    print(f"Regularized Model Results:")
+    print(f"Accuracy: {acc:.3f}")
+    print(f"F1 Score: {f1:.3f}")
+    print(f"Sensitivity: {sens:.3f}")
+    print(f"Specificity: {spec:.3f}")
+    
+    # Check for overfitting
+    train_prob = model.predict_proba(X_train)[:, 1]
+    train_pred = (train_prob >= best_threshold).astype(int)
+    train_f1 = f1_score(y_train, train_pred, zero_division=0)
+    
+    print(f"Training F1: {train_f1:.3f}, Test F1: {f1:.3f}")
+    print(f"Overfitting gap: {train_f1 - f1:.3f}")
 
 
 # Main execution block
