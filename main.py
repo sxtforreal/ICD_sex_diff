@@ -1189,12 +1189,15 @@ def _create_summary_dataframe(results, metrics):
     )
     summary_table = formatted.unstack(level=1)
     
-    # Drop single-sex models from summary
+    # Drop single-sex models from summary (only if they exist)
     rows_to_drop = [
         "Benchmark Male", "Benchmark Female", "Proposed Male", "Proposed Female",
         "Real Proposed Male", "Real Proposed Female",
     ]
-    summary_table = summary_table.drop(index=rows_to_drop)
+    # Only drop rows that actually exist in the summary table
+    existing_rows_to_drop = [row for row in rows_to_drop if row in summary_table.index]
+    if existing_rows_to_drop:
+        summary_table = summary_table.drop(index=existing_rows_to_drop)
     
     return summary_table
 
@@ -1211,18 +1214,7 @@ def _save_results(summary_table):
         print(f"Warning: Could not save results: {e}")
 
 
-def main():
-    """Main execution function."""
-    clean_df, train_df, test_df, survival_df = prepare_data()
-    
-    print("=== Standard Evaluation ===")
-    N_SPLITS = 10
-    res, summary = multiple_random_splits(train_df, N_SPLITS)
-    print(summary)
-    
-    print("\n=== Enhanced Imbalanced Data Evaluation ===")
-    # Test the new imbalanced data handling methods
-    test_imbalanced_methods(train_df, test_df, clean_df.columns)
+
 
 
 def full_model_inference(train_df, test_df, features, labels, survival_df, seed):
@@ -1744,4 +1736,13 @@ def find_optimal_threshold_balanced(X_train, y_train_df, X_test, y_test, feature
 
 # Main execution block
 if __name__ == "__main__":
-    main()
+    clean_df, train_df, test_df, survival_df = prepare_data()
+    
+    print("=== Standard Evaluation ===")
+    N_SPLITS = 10
+    res, summary = multiple_random_splits(train_df, N_SPLITS)
+    print(summary)
+    
+    print("\n=== Enhanced Imbalanced Data Evaluation ===")
+    # Test the new imbalanced data handling methods
+    test_imbalanced_methods(train_df, test_df, clean_df.columns)
