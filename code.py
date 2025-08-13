@@ -1,7 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.tree import plot_tree
 from sklearn.utils import resample
 from sklearn.metrics import (
     make_scorer,
@@ -19,7 +18,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, cross_val_predict
 from sklearn.utils.fixes import loguniform
 from scipy.stats import randint
-from lifelines import KaplanMeierFitter, CoxPHFitter, logrank_test
+from lifelines import KaplanMeierFitter, logrank_test
 import re
 
 
@@ -127,24 +126,13 @@ def plot_feature_importances(model, features, title, seed):
     plt.show()
 
 
-def plot_decision_tree(model, features, title):
-    """Plot a sample decision tree."""
-    plt.figure(figsize=(12, 8))
-    plot_tree(
-        model.estimators_[0],
-        feature_names=features,
-        class_names=True,
-        filled=True,
-        rounded=True,
-    )
-    plt.title(title)
-    plt.show()
 
 
-def perform_clustering(X_test, prob_values, gender, seed, max_clusters=10):
-    """Perform clustering analysis for a specific gender."""
+
+def perform_clustering_analysis(X_test, prob_values, gender, seed, max_clusters=10):
+    """Perform clustering analysis for a specific gender and return cluster risk scores."""
     if X_test.empty:
-        return None, None, None
+        return None, None
     
     # Elbow method
     inertias = []
@@ -165,36 +153,12 @@ def perform_clustering(X_test, prob_values, gender, seed, max_clusters=10):
     kmeans = KMeans(n_clusters=best_k, random_state=seed)
     cluster_labels = kmeans.fit_predict(X_test)
     
-    # TSNE visualization
-    reducer = TSNE(n_components=2, random_state=seed)
-    embedding = reducer.fit_transform(X_test)
-    
     # Calculate average risk per cluster
     cluster_risk = pd.Series(prob_values, index=range(len(prob_values))).groupby(cluster_labels).mean().round(3)
     print(f"Average risk per cluster ({gender}):")
     print(cluster_risk)
     
-    # Visualization
-    plt.figure(figsize=(8, 6))
-    palette = sns.color_palette("Set2", best_k)
-    for c in range(best_k):
-        mask = cluster_labels == c
-        plt.scatter(
-            embedding[mask, 0],
-            embedding[mask, 1],
-            color=palette[c],
-            s=30,
-            alpha=0.7,
-            label=f"Cluster {c} (avg risk = {cluster_risk[c]:.2f})",
-        )
-    plt.title(f"TSNE + KMeans Clustering with Average Risk ({gender})")
-    plt.xlabel("TSNE-1")
-    plt.ylabel("TSNE-2")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-    
-    return cluster_labels, embedding, cluster_risk
+    return cluster_labels, cluster_risk
 
 
 def bootstrap_evaluation(df, features, labels, male_model, female_model, 
@@ -254,8 +218,77 @@ def print_bootstrap_results(metrics, gender):
         print(f"{gender.title()} {metric_display}: {mean_val:.4f} [95% CI: {ci_low:.4f} - {ci_high:.4f}]")
 
 
+def plot_km_by_gender_and_risk(merged_df, gender_col, risk_col, time_col, event_col, title_prefix):
+    """Plot Kaplan-Meier curves separately for each gender and risk group."""
+    genders = merged_df[gender_col].unique()
+    
+    for gender in genders:
+        gender_data = merged_df[merged_df[gender_col] == gender]
+        gender_label = "Female" if gender == 1 else "Male"
+        
+        if gender_data.empty:
+            continue
+            
+        # Get risk groups for this gender
+        risk_groups = gender_data[risk_col].unique()
+        
+        if len(risk_groups) < 2:
+            continue
+            
+        fig, axes = plt.subplots(1, 2, figsize=(15, 5), sharey=True)
+        
+        for ax, (ep_name, ep_time_col, ep_event_col) in zip(axes, [
+            ("Primary Endpoint", "PE_Time", "Was Primary Endpoint Reached? (Appropriate ICD Therapy)"),
+            ("Secondary Endpoint", "SE_Time", "Was Secondary Endpoint Reached?")
+        ]):
+            kmf = KaplanMeierFitter()
+            
+            for risk_group in sorted(risk_groups):
+                mask = (gender_data[gender_col] == gender) & (gender_data[risk_col] == risk_group)
+                risk_data = gender_data[mask]
+                
+                if risk_data.empty:
+                    continue
+                    
+                n_risk = len(risk_data)
+                events_risk = risk_data[ep_event_col].sum()
+                risk_label = f"{'High' if risk_group == 1 else 'Low'} Risk (n={n_risk}, events={events_risk})"
+                
+                kmf.fit(
+                    durations=risk_data[ep_time_col],
+                    event_observed=risk_data[ep_event_col],
+                    label=risk_label
+                )
+                kmf.plot(ax=ax)
+            
+            # Perform log-rank test if we have both risk groups
+            if len(risk_groups) == 2:
+                low_mask = (gender_data[gender_col] == gender) & (gender_data[risk_col] == 0)
+                high_mask = (gender_data[gender_col] == gender) & (gender_data[risk_col] == 1)
+                
+                if low_mask.sum() > 0 and high_mask.sum() > 0:
+                    lr = logrank_test(
+                        gender_data.loc[low_mask, ep_time_col],
+                        gender_data.loc[high_mask, ep_time_col],
+                        gender_data.loc[low_mask, ep_event_col],
+                        gender_data.loc[high_mask, ep_event_col]
+                    )
+                    ax.text(0.95, 0.05, f"Log-rank p = {lr.p_value:.5f}", 
+                            transform=ax.transAxes, ha="right", va="bottom")
+            
+            ax.set_title(f"{ep_name} by Risk Group - {gender_label}")
+            ax.set_xlabel("Time")
+            ax.set_ylabel("Survival Probability")
+            ax.legend()
+        
+        plt.suptitle(f"{title_prefix} - {gender_label}")
+        plt.tight_layout()
+        plt.show()
+        plt.close()
+
+
 def full_model_inference(train_df, test_df, features, labels, survival_df, seed):
-    """Main function with simplified structure and cross-validation for thresholds."""
+    """Main function with separate male/female models and gender-specific KM plots."""
     import pandas as pd
     
     train = train_df.copy()
@@ -279,121 +312,53 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
         train_f[features], train_f[labels], features, seed
     )
 
-    # Make predictions on test set
+    # Make predictions on test set using respective models
     if not test_m.empty:
         prob_m = best_male.predict_proba(test_m[features])[:, 1]
         pred_m = (prob_m >= best_thr_m).astype(int)
-        df.loc[df["Female"] == 0, "pred_male"] = pred_m
-        df.loc[df["Female"] == 0, "prob_male"] = prob_m
+        df.loc[df["Female"] == 0, "pred_sexspecific"] = pred_m
+        df.loc[df["Female"] == 0, "prob_sexspecific"] = prob_m
     
     if not test_f.empty:
         prob_f = best_female.predict_proba(test_f[features])[:, 1]
         pred_f = (prob_f >= best_thr_f).astype(int)
-        df.loc[df["Female"] == 1, "pred_female"] = pred_f
-        df.loc[df["Female"] == 1, "prob_female"] = prob_f
+        df.loc[df["Female"] == 1, "pred_sexspecific"] = pred_f
+        df.loc[df["Female"] == 1, "prob_sexspecific"] = pred_f
 
-    # Plot feature importances and trees
+    # Plot feature importances
     plot_feature_importances(best_male, features, "Male Model Feature Importances", seed)
-    plot_decision_tree(best_male, features, "Visualization of One Decision Tree in Male Random Forest Model (Tree 0)")
-    
     plot_feature_importances(best_female, features, "Female Model Feature Importances", seed)
-    plot_decision_tree(best_female, features, "Visualization of One Decision Tree in Female Random Forest Model (Tree 0)")
 
-    # Create sex-specific predictions
-    df["pred_sexspecific"] = np.nan
-    df["prob_sexspecific"] = np.nan
-    
-    if "pred_male" in df.columns:
-        df.loc[df["Female"] == 0, "pred_sexspecific"] = df.loc[df["Female"] == 0, "pred_male"]
-        df.loc[df["Female"] == 0, "prob_sexspecific"] = df.loc[df["Female"] == 0, "prob_male"]
-    
-    if "pred_female" in df.columns:
-        df.loc[df["Female"] == 1, "pred_sexspecific"] = df.loc[df["Female"] == 1, "pred_female"]
-        df.loc[df["Female"] == 1, "prob_sexspecific"] = df.loc[df["Female"] == 1, "prob_female"]
-
-    # Survival analysis
-    pred_labels = df[["MRN", "pred_sexspecific"]].drop_duplicates()
+    # Survival analysis with gender-specific KM plots
+    pred_labels = df[["MRN", "pred_sexspecific", "Female"]].drop_duplicates()
     merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
 
-    # Kaplan-Meier analysis
-    kmf = KaplanMeierFitter()
-    endpoints = [
-        ("Primary Endpoint", "PE_Time", "Was Primary Endpoint Reached? (Appropriate ICD Therapy)"),
-        ("Secondary Endpoint", "SE_Time", "Was Secondary Endpoint Reached?"),
-    ]
-    
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5), sharey=True)
-    
-    for ax, (ep_name, time_col, event_col) in zip(axes, endpoints):
-        mask_low = merged_df["pred_sexspecific"] == 0
-        mask_high = merged_df["pred_sexspecific"] == 1
-        
-        n_low, n_high = mask_low.sum(), mask_high.sum()
-        events_low = merged_df.loc[mask_low, event_col].sum()
-        events_high = merged_df.loc[mask_high, event_col].sum()
-        
-        print(f"{ep_name} - Low risk: n={n_low}, events={events_low}")
-        print(f"{ep_name} - High risk: n={n_high}, events={events_high}")
-        
-        lr = logrank_test(
-            merged_df.loc[mask_low, time_col],
-            merged_df.loc[mask_high, time_col],
-            merged_df.loc[mask_low, event_col],
-            merged_df.loc[mask_high, event_col],
-        )
-        
-        for mask, lbl, count, events in [
-            (mask_low, f"Low Risk (n={n_low}, events={events_low})", n_low, events_low),
-            (mask_high, f"High Risk (n={n_high}, events={events_high})", n_high, events_high),
-        ]:
-            kmf.fit(
-                durations=merged_df.loc[mask, time_col],
-                event_observed=merged_df.loc[mask, event_col],
-                label=lbl,
-            )
-            kmf.plot(ax=ax)
-        
-        ax.set_title(f"{ep_name} by Sex-Specific grouping (Total n={n_low+n_high}, events={events_low+events_high})")
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Survival Probability")
-        ax.text(0.95, 0.05, f"Log-rank p = {lr.p_value:.5f}", 
-                transform=ax.transAxes, ha="right", va="bottom")
-        ax.legend()
-    
-    plt.tight_layout()
-    plt.show()
-    plt.close()
+    # Plot KM curves separately for each gender and risk group
+    plot_km_by_gender_and_risk(
+        merged_df, 
+        "Female", 
+        "pred_sexspecific", 
+        "PE_Time", 
+        "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
+        "Sex-Specific Model Predictions"
+    )
 
-    # Cox PH model
-    cph_feature = df[["MRN"] + features]
-    cph_df = survival_df.merge(cph_feature, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
-    
-    covariates = [col for col in cph_df.columns if col not in [
-        "MRN", "PE_Time", "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
-        "SE_Time", "Was Secondary Endpoint Reached?"
-    ]]
-    
-    formula_terms = [f"`{col}`" if re.search(r"[^a-zA-Z0-9_]", col) else col for col in covariates]
-    formula = " + ".join(formula_terms)
-
-    # Fit Cox models
-    for endpoint_name, time_col, event_col in [
-        ("Primary", "PE_Time", "Was Primary Endpoint Reached? (Appropriate ICD Therapy)"),
-        ("Secondary", "SE_Time", "Was Secondary Endpoint Reached?")
-    ]:
-        cph = CoxPHFitter()
-        cph.fit(cph_df, duration_col=time_col, event_col=event_col, formula=formula)
-        print(f"\nCox PH Model for {endpoint_name} endpoint:")
-        print(cph.summary)
-
-    # Clustering analysis
+    # Clustering analysis (without visualization, only risk score comparison)
     if not test_m.empty:
-        perform_clustering(test_m[features], prob_m, "Male", seed)
-        df.loc[df["Female"] == 0, "cluster"] = perform_clustering(test_m[features], prob_m, "Male", seed)[0]
+        print("\nMale Clustering Analysis:")
+        cluster_labels_m, cluster_risk_m = perform_clustering_analysis(
+            test_m[features], prob_m, "Male", seed
+        )
+        if cluster_labels_m is not None:
+            df.loc[df["Female"] == 0, "cluster"] = cluster_labels_m
     
     if not test_f.empty:
-        perform_clustering(test_f[features], prob_f, "Female", seed)
-        df.loc[df["Female"] == 1, "cluster"] = perform_clustering(test_f[features], prob_f, "Female", seed)[0]
+        print("\nFemale Clustering Analysis:")
+        cluster_labels_f, cluster_risk_f = perform_clustering_analysis(
+            test_f[features], prob_f, "Female", seed
+        )
+        if cluster_labels_f is not None:
+            df.loc[df["Female"] == 1, "cluster"] = cluster_labels_f
 
     # Bootstrap evaluation
     print("\nPerforming Bootstrap Evaluation...")
