@@ -1729,7 +1729,7 @@ def plot_km_by_gender_and_risk(merged_df, gender_col, risk_col, time_col, event_
 
 
 def full_model_inference(train_df, test_df, features, labels, survival_df, seed):
-    """Main function with separate male/female models and gender-specific KM plots."""
+    """Main function with separate male/female models and risk group analysis by ICD status."""
     import pandas as pd
     
     train = train_df.copy()
@@ -1770,19 +1770,104 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     plot_feature_importances(best_male, features, "Male Model Feature Importances", seed)
     plot_feature_importances(best_female, features, "Female Model Feature Importances", seed)
 
-    # Survival analysis with gender-specific KM plots
-    pred_labels = df[["MRN", "pred_sexspecific", "Female"]].drop_duplicates()
+    # Merge with survival data and ICD information for risk group analysis
+    pred_labels = df[["MRN", "pred_sexspecific", "ICD"]].drop_duplicates()
     merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
 
-    # Plot KM curves separately for each gender and risk group
-    plot_km_by_gender_and_risk(
-        merged_df, 
-        "Female", 
-        "pred_sexspecific", 
-        "PE_Time", 
-        "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
-        "Sex-Specific Model Predictions"
-    )
+    print("\n=== Risk Group Analysis by ICD Status ===")
+    
+    # Analyze ICD group (ICD=1) - Appropriate ICD Therapy endpoint
+    icd_df = merged_df[merged_df["ICD"] == 1].copy()
+    if not icd_df.empty:
+        print(f"\n--- ICD Group Analysis (n={len(icd_df)}) ---")
+        print("Endpoint: Appropriate ICD Therapy")
+        
+        # High vs Low risk comparison
+        mask_low = icd_df["pred_sexspecific"] == 0
+        mask_high = icd_df["pred_sexspecific"] == 1
+        
+        n_low = mask_low.sum()
+        n_high = mask_high.sum()
+        
+        if n_low > 0 and n_high > 0:
+            events_low = icd_df.loc[mask_low, "Was Primary Endpoint Reached? (Appropriate ICD Therapy)"].sum()
+            events_high = icd_df.loc[mask_high, "Was Primary Endpoint Reached? (Appropriate ICD Therapy)"].sum()
+            
+            # Calculate incidence rates
+            icd_low_rate = events_low / n_low if n_low > 0 else 0
+            icd_high_rate = events_high / n_high if n_high > 0 else 0
+            
+            print(f"Low Risk Group (n={n_low}): {events_low} events, Incidence Rate: {icd_low_rate:.4f}")
+            print(f"High Risk Group (n={n_high}): {events_high} events, Incidence Rate: {icd_high_rate:.4f}")
+            
+            # Statistical test for binary outcome
+            from scipy.stats import chi2_contingency
+            contingency_table = np.array([[events_low, n_low - events_low], 
+                                        [events_high, n_high - events_high]])
+            chi2, p_value, dof, expected = chi2_contingency(contingency_table)
+            print(f"Chi-square test p-value: {p_value:.5f}")
+            
+            # Risk ratio
+            if icd_low_rate > 0:
+                risk_ratio = icd_high_rate / icd_low_rate
+                print(f"Risk Ratio (High/Low): {risk_ratio:.3f}")
+            else:
+                print("Risk Ratio: Cannot calculate (no events in low risk group)")
+        else:
+            print("Cannot perform analysis: insufficient samples in one or both risk groups")
+    
+    # Analyze No-ICD group (ICD=0) - Mortality endpoint
+    no_icd_df = merged_df[merged_df["ICD"] == 0].copy()
+    if not no_icd_df.empty:
+        print(f"\n--- No-ICD Group Analysis (n={len(no_icd_df)}) ---")
+        print("Endpoint: Mortality (Secondary Endpoint)")
+        
+        # High vs Low risk comparison
+        mask_low = no_icd_df["pred_sexspecific"] == 0
+        mask_high = no_icd_df["pred_sexspecific"] == 1
+        
+        n_low = mask_low.sum()
+        n_high = mask_high.sum()
+        
+        if n_low > 0 and n_high > 0:
+            events_low = no_icd_df.loc[mask_low, "Was Secondary Endpoint Reached?"].sum()
+            events_high = no_icd_df.loc[mask_high, "Was Secondary Endpoint Reached?"].sum()
+            
+            # Calculate incidence rates
+            no_icd_low_rate = events_low / n_low if n_low > 0 else 0
+            no_icd_high_rate = events_high / n_high if n_high > 0 else 0
+            
+            print(f"Low Risk Group (n={n_low}): {events_low} events, Incidence Rate: {no_icd_low_rate:.4f}")
+            print(f"High Risk Group (n={n_high}): {events_high} events, Incidence Rate: {no_icd_high_rate:.4f}")
+            
+            # Statistical test for binary outcome
+            from scipy.stats import chi2_contingency
+            contingency_table = np.array([[events_low, n_low - events_low], 
+                                        [events_high, n_high - events_high]])
+            chi2, p_value, dof, expected = chi2_contingency(contingency_table)
+            print(f"Chi-square test p-value: {p_value:.5f}")
+            
+            # Risk ratio
+            if no_icd_low_rate > 0:
+                risk_ratio = no_icd_high_rate / no_icd_low_rate
+                print(f"Risk Ratio (High/Low): {risk_ratio:.3f}")
+            else:
+                print("Risk Ratio: Cannot calculate (no events in low risk group)")
+        else:
+            print("Cannot perform analysis: insufficient samples in one or both risk groups")
+    
+    # Overall summary
+    print(f"\n=== Overall Summary ===")
+    print(f"Total test samples: {len(df)}")
+    print(f"ICD group: {len(merged_df[merged_df['ICD'] == 1])}")
+    print(f"No-ICD group: {len(merged_df[merged_df['ICD'] == 0])}")
+    
+    # Risk group distribution
+    risk_dist = merged_df["pred_sexspecific"].value_counts().sort_index()
+    print(f"\nRisk Group Distribution:")
+    for risk_level, count in risk_dist.items():
+        risk_label = "Low Risk" if risk_level == 0 else "High Risk"
+        print(f"  {risk_label}: {count}")
 
     # Clustering analysis (without visualization, only risk score comparison)
     if not test_m.empty:
