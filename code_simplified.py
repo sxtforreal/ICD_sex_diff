@@ -221,19 +221,33 @@ def multiple_random_splits_simplified(df, N, label="VT/VF/SCD"):
                     "LVEF", "QTc", "NYHA>2", "CRT", "AAD", "Significant LGE", "DM", "HTN", 
                     "HLP", "LVEDVi", "LV Mass Index", "RVEDVi", "RVEF", "LA EF", "LAVi", 
                     "MRF (%)", "Sphericity Index", "Relative Wall Thickness", 
-                    "MV Annular Diameter", "ACEi/ARB/ARNi", "Aldosterone Antagonist"]
+                    "MV Annular Diameter", "ACEi/ARB/ARNi", "Aldosterone Antagonist"],
+        'real_proposed': ["Female", "Age by decade", "BMI", "AF", "Beta Blocker", "CrCl>45", 
+                         "LVEF", "QTc", "CRT", "AAD", "LGE Burden 5SD", "DM", "HTN", 
+                         "HLP", "LVEDVi", "LV Mass Index", "RVEDVi", "RVEF", "LA EF", "LAVi", 
+                         "MRF (%)", "Sphericity Index", "Relative Wall Thickness", 
+                         "MV Annular Diameter", "ACEi/ARB/ARNi", "Aldosterone Antagonist", "NYHA Class"]
     }
     
-    # Model configurations
+    # Model configurations - now with all 17 models
     model_configs = [
         {'name': 'Guideline', 'features': 'guideline', 'type': 'rule_based'},
         {'name': 'RF Guideline', 'features': 'guideline', 'type': 'ml'},
         {'name': 'Benchmark Sex-agnostic', 'features': 'benchmark', 'type': 'ml'},
         {'name': 'Benchmark Sex-agnostic (undersampled)', 'features': 'benchmark', 'type': 'ml_undersampled'},
+        {'name': 'Benchmark Male', 'features': 'benchmark', 'type': 'male_only'},
+        {'name': 'Benchmark Female', 'features': 'benchmark', 'type': 'female_only'},
         {'name': 'Benchmark Sex-specific', 'features': 'benchmark', 'type': 'sex_specific'},
         {'name': 'Proposed Sex-agnostic', 'features': 'proposed', 'type': 'ml'},
         {'name': 'Proposed Sex-agnostic (undersampled)', 'features': 'proposed', 'type': 'ml_undersampled'},
-        {'name': 'Proposed Sex-specific', 'features': 'proposed', 'type': 'sex_specific'}
+        {'name': 'Proposed Male', 'features': 'proposed', 'type': 'male_only'},
+        {'name': 'Proposed Female', 'features': 'proposed', 'type': 'female_only'},
+        {'name': 'Proposed Sex-specific', 'features': 'proposed', 'type': 'sex_specific'},
+        {'name': 'Real Proposed Sex-agnostic', 'features': 'real_proposed', 'type': 'ml'},
+        {'name': 'Real Proposed Sex-agnostic (undersampled)', 'features': 'real_proposed', 'type': 'ml_undersampled'},
+        {'name': 'Real Proposed Male', 'features': 'real_proposed', 'type': 'male_only'},
+        {'name': 'Real Proposed Female', 'features': 'real_proposed', 'type': 'female_only'},
+        {'name': 'Real Proposed Sex-specific', 'features': 'real_proposed', 'type': 'sex_specific'}
     ]
     
     # Metrics to track
@@ -296,6 +310,52 @@ def multiple_random_splits_simplified(df, N, label="VT/VF/SCD"):
                 eval_df = test_df[[label, "Female"]].reset_index(drop=True).copy()
                 eval_df["pred"] = pred
                 m_rate, f_rate = incidence_rate(eval_df, "pred", label)
+                
+            elif model_type == 'male_only':
+                # Male-only model
+                if not tr_m.empty and not te_m.empty:
+                    pred, prob = rf_evaluate(
+                        tr_m[feature_set], tr_m[[label, "Female"]],
+                        te_m[feature_set], te_m[[label, "Female"]],
+                        feature_set, seed
+                    )
+                    # Create full test set predictions (only male predictions)
+                    full_pred = np.zeros(len(test_df), dtype=int)
+                    full_prob = np.zeros(len(test_df), dtype=float)
+                    full_pred[mask_m] = pred
+                    full_prob[mask_m] = prob
+                    pred, prob = full_pred, full_prob
+                    eval_df = test_df[[label, "Female"]].reset_index(drop=True).copy()
+                    eval_df["pred"] = pred
+                    m_rate, f_rate = incidence_rate(eval_df, "pred", label)
+                else:
+                    # Handle case with no male data
+                    pred = np.zeros(len(test_df), dtype=int)
+                    prob = np.zeros(len(test_df), dtype=float)
+                    m_rate, f_rate = 0.0, 0.0
+                
+            elif model_type == 'female_only':
+                # Female-only model
+                if not tr_f.empty and not te_f.empty:
+                    pred, prob = rf_evaluate(
+                        tr_f[feature_set], tr_f[[label, "Female"]],
+                        te_f[feature_set], te_f[[label, "Female"]],
+                        feature_set, seed
+                    )
+                    # Create full test set predictions (only female predictions)
+                    full_pred = np.zeros(len(test_df), dtype=int)
+                    full_prob = np.zeros(len(test_df), dtype=float)
+                    full_pred[mask_f] = pred
+                    full_prob[mask_f] = prob
+                    pred, prob = full_pred, full_prob
+                    eval_df = test_df[[label, "Female"]].reset_index(drop=True).copy()
+                    eval_df["pred"] = pred
+                    m_rate, f_rate = incidence_rate(eval_df, "pred", label)
+                else:
+                    # Handle case with no female data
+                    pred = np.zeros(len(test_df), dtype=int)
+                    prob = np.zeros(len(test_df), dtype=float)
+                    m_rate, f_rate = 0.0, 0.0
                 
             elif model_type == 'sex_specific':
                 # Sex-specific models
