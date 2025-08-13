@@ -1,7 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.tree import plot_tree
 from sklearn.utils import resample
 from sklearn.metrics import (
     make_scorer,
@@ -127,18 +126,7 @@ def plot_feature_importances(model, features, title, seed):
     plt.show()
 
 
-def plot_decision_tree(model, features, title):
-    """Plot a sample decision tree."""
-    plt.figure(figsize=(12, 8))
-    plot_tree(
-        model.estimators_[0],
-        feature_names=features,
-        class_names=True,
-        filled=True,
-        rounded=True,
-    )
-    plt.title(title)
-    plt.show()
+
 
 
 def perform_clustering_analysis(X_test, prob_values, gender, seed, max_clusters=10):
@@ -337,12 +325,9 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
         df.loc[df["Female"] == 1, "pred_sexspecific"] = pred_f
         df.loc[df["Female"] == 1, "prob_sexspecific"] = pred_f
 
-    # Plot feature importances and trees
+    # Plot feature importances
     plot_feature_importances(best_male, features, "Male Model Feature Importances", seed)
-    plot_decision_tree(best_male, features, "Visualization of One Decision Tree in Male Random Forest Model (Tree 0)")
-    
     plot_feature_importances(best_female, features, "Female Model Feature Importances", seed)
-    plot_decision_tree(best_female, features, "Visualization of One Decision Tree in Female Random Forest Model (Tree 0)")
 
     # Survival analysis with gender-specific KM plots
     pred_labels = df[["MRN", "pred_sexspecific", "Female"]].drop_duplicates()
