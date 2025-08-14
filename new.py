@@ -583,18 +583,27 @@ def build_survival_based_label(
 
     if icd_source_df is None:
         # Keep icd indicator from survival_df when icd_source_df not provided
-        out = survival_unique[[id_col, icd_indicator_col, appropriate_icd_shock_col]].copy()
+        cols = [id_col, icd_indicator_col, appropriate_icd_shock_col]
+        available_cols = [c for c in cols if c in survival_unique.columns]
+        out = survival_unique[available_cols].copy()
         # Include death_col only for backward-compatible fallback when master_df is None
         if death_col in survival_unique.columns:
             out[death_col] = survival_unique[death_col]
     else:
-        out = survival_unique[[id_col, appropriate_icd_shock_col]].copy()
-        # Include death_col only for backward-compatible fallback when master_df is None
-        if death_col in survival_unique.columns:
-            out[death_col] = survival_unique[death_col]
         # Deduplicate icd_source_df to avoid duplication in merge
         icd_source_unique = icd_source_df.drop_duplicates(subset=[id_col], keep='first')
+        # Build a base ID frame from the union of IDs in survival_df and icd_source_df
+        base_ids = pd.Index(survival_unique[id_col].dropna().unique()).union(
+            pd.Index(icd_source_unique[id_col].dropna().unique())
+        )
+        out = pd.DataFrame({id_col: base_ids})
+        # Bring in ICD indicator from icd_source_df
         out = out.merge(icd_source_unique[[id_col, icd_indicator_col]], on=id_col, how="left")
+        # Bring in shock and optional death from survival_df
+        merge_cols = [id_col, appropriate_icd_shock_col]
+        if death_col in survival_unique.columns:
+            merge_cols.append(death_col)
+        out = out.merge(survival_unique[merge_cols], on=id_col, how="left")
 
     icd_values = pd.to_numeric(out[icd_indicator_col], errors="coerce").fillna(0).astype(int)
 
