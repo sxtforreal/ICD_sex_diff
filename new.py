@@ -470,6 +470,206 @@ def multiple_random_splits_simplified(df, N, label="VT/VF/SCD"):
     return results, summary_table
 
 
+def rf_train_and_predict_no_test_labels(X_train, y_train_df, X_test, feat_names, random_state=None, visualize_importance=False):
+    """Train RF on full training data and predict on X_test without needing test labels.
+
+    - Uses randomized search optimizing average precision
+    - Selects threshold from out-of-fold probabilities on training set
+    - Fits final model on full training data and predicts probabilities on X_test
+    - Returns (y_pred, y_prob, threshold)
+    """
+    y_train = y_train_df["VT/VF/SCD"]
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    param_dist = {
+        "n_estimators": randint(100, 500),
+        "max_depth": [None] + list(range(5, 26, 5)),
+        "min_samples_split": randint(2, 11),
+        "min_samples_leaf": randint(1, 5),
+        "max_features": ["sqrt", "log2", None],
+    }
+
+    base_clf = RandomForestClassifier(
+        random_state=random_state, n_jobs=-1, class_weight="balanced"
+    )
+    ap_scorer = make_scorer(average_precision_score, needs_proba=True)
+
+    search = RandomizedSearchCV(
+        estimator=base_clf,
+        param_distributions=param_dist,
+        n_iter=50,
+        scoring=ap_scorer,
+        cv=cv,
+        random_state=random_state,
+        n_jobs=-1,
+        verbose=0,
+        error_score="raise",
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        search.fit(X_train, y_train)
+
+    best_params = search.best_params_
+
+    # Determine threshold using OOF probabilities on the training set
+    oof_proba = np.zeros(len(y_train), dtype=float)
+    for tr_idx, val_idx in cv.split(X_train, y_train):
+        oof_model = RandomForestClassifier(
+            **best_params, random_state=random_state, n_jobs=-1, class_weight="balanced"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            oof_model.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
+        oof_proba[val_idx] = oof_model.predict_proba(X_train.iloc[val_idx])[:, 1]
+    threshold = find_best_threshold(y_train.values, oof_proba)
+
+    # Fit final model on the full training data
+    final_model = RandomForestClassifier(
+        **best_params, random_state=random_state, n_jobs=-1, class_weight="balanced"
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        final_model.fit(X_train, y_train)
+
+    # Optional: visualize feature importance
+    if visualize_importance:
+        importances = final_model.feature_importances_
+        idx = np.argsort(importances)[::-1]
+        highlight = {"LVEF", "NYHA"}
+        colors = ["red" if feat_names[i] in highlight else "lightgray" for i in idx]
+        plt.figure(figsize=(8, 4))
+        plt.bar(range(len(feat_names)), importances[idx], color=colors)
+        plt.xticks(range(len(feat_names)), [feat_names[i] for i in idx], rotation=90)
+        plt.xlabel("Feature")
+        plt.ylabel("Importance")
+        plt.title("Feature Importances")
+        plt.tight_layout()
+        plt.show()
+
+    # Predict on inference set
+    y_prob = final_model.predict_proba(X_test)[:, 1]
+    y_pred = (y_prob >= threshold).astype(int)
+    return y_pred, y_prob, threshold
+
+
+def build_survival_based_label(survival_df, id_col, icd_indicator_col, appropriate_icd_shock_col, death_col, output_label_col="DerivedOutcome"):
+    """Construct binary labels from a survival dataframe without using time.
+
+    Logic:
+      - If ICD implanted (icd_indicator_col == 1): label = appropriate_icd_shock_col
+      - If no ICD (icd_indicator_col == 0):       label = death_col
+    The resulting label is binarized to {0,1}.
+
+    Returns a DataFrame with columns [id_col, output_label_col].
+    """
+    out = survival_df[[id_col, icd_indicator_col, appropriate_icd_shock_col, death_col]].copy()
+    label = np.where(out[icd_indicator_col].astype(int) == 1, out[appropriate_icd_shock_col], out[death_col])
+    out[output_label_col] = (label.fillna(0).astype(float) > 0).astype(int)
+    return out[[id_col, output_label_col]]
+
+
+def run_full_train_sex_specific_inference(
+    train_df,
+    infer_df,
+    survival_df,
+    id_col,
+    icd_indicator_col,
+    appropriate_icd_shock_col,
+    death_col,
+    features,
+    train_label_col="VT/VF/SCD",
+    random_state=42,
+    survival_label_col="DerivedOutcome",
+    visualize_importance=False,
+):
+    """Train sex-specific RF models on ALL training data, run inference on infer_df, and
+    evaluate against labels derived from survival_df (ICD→shock, No-ICD→death).
+
+    Requirements:
+      - train_df: contains columns features + train_label_col + "Female"
+      - infer_df: contains columns features + "Female" + id_col
+      - survival_df: contains id_col, icd_indicator_col, appropriate_icd_shock_col, death_col
+
+    Returns:
+      - eval_metrics: dict of overall/male/female metrics
+      - incidence_rates: (male_rate, female_rate) using survival-derived label
+      - merged_predictions: DataFrame with [id, Female, prob, pred, survival_label]
+    """
+    # Split training data by sex
+    train_male_df = train_df[train_df["Female"] == 0]
+    train_female_df = train_df[train_df["Female"] == 1]
+
+    # Split inference data by sex
+    infer_male_df = infer_df[infer_df["Female"] == 0]
+    infer_female_df = infer_df[infer_df["Female"] == 1]
+
+    combined_pred = np.zeros(len(infer_df), dtype=int)
+    combined_prob = np.zeros(len(infer_df), dtype=float)
+
+    # Train male model on all male training data and predict on male inference cohort
+    if not train_male_df.empty and not infer_male_df.empty:
+        pred_m, prob_m, _thr_m = rf_train_and_predict_no_test_labels(
+            train_male_df[features],
+            train_male_df[[train_label_col, "Female"]],
+            infer_male_df[features],
+            features,
+            random_state=random_state,
+            visualize_importance=visualize_importance,
+        )
+        combined_pred[infer_df["Female"].values == 0] = pred_m
+        combined_prob[infer_df["Female"].values == 0] = prob_m
+
+    # Train female model on all female training data and predict on female inference cohort
+    if not train_female_df.empty and not infer_female_df.empty:
+        pred_f, prob_f, _thr_f = rf_train_and_predict_no_test_labels(
+            train_female_df[features],
+            train_female_df[[train_label_col, "Female"]],
+            infer_female_df[features],
+            features,
+            random_state=random_state,
+            visualize_importance=visualize_importance,
+        )
+        combined_pred[infer_df["Female"].values == 1] = pred_f
+        combined_prob[infer_df["Female"].values == 1] = prob_f
+
+    # Derive validation labels from survival_df (no time, binary)
+    survival_labels = build_survival_based_label(
+        survival_df,
+        id_col=id_col,
+        icd_indicator_col=icd_indicator_col,
+        appropriate_icd_shock_col=appropriate_icd_shock_col,
+        death_col=death_col,
+        output_label_col=survival_label_col,
+    )
+
+    # Merge predictions with survival-derived labels by id
+    merged = infer_df[[id_col, "Female"]].copy()
+    merged["pred"] = combined_pred
+    merged["prob"] = combined_prob
+    merged = merged.merge(survival_labels, on=id_col, how="left")
+
+    # Drop rows without survival labels (if any) for metric computation
+    valid_mask = merged[survival_label_col].notna().values
+    y_true = merged.loc[valid_mask, survival_label_col].astype(int).values
+    y_pred = merged.loc[valid_mask, "pred"].astype(int).values
+    y_prob = merged.loc[valid_mask, "prob"].astype(float).values
+
+    # Gender masks aligned to the valid subset
+    valid_female = merged.loc[valid_mask, "Female"].values
+    mask_m = valid_female == 0
+    mask_f = valid_female == 1
+
+    # Compute performance metrics
+    eval_metrics = evaluate_model_performance(y_true, y_pred, y_prob, mask_m, mask_f)
+
+    # Incidence rates (events among predicted positives) by sex using survival-derived label
+    eval_df = merged.loc[valid_mask, [survival_label_col, "Female", "pred"]].rename(columns={survival_label_col: "label"}).reset_index(drop=True)
+    male_rate, female_rate = incidence_rate(eval_df, "pred", "label")
+
+    return eval_metrics, (male_rate, female_rate), merged
+
+
 # Example usage and testing
 if __name__ == "__main__":
     # This would be your actual data loading
