@@ -553,19 +553,28 @@ def rf_train_and_predict_no_test_labels(X_train, y_train_df, X_test, feat_names,
     return y_pred, y_prob, threshold
 
 
-def build_survival_based_label(survival_df, id_col, icd_indicator_col, appropriate_icd_shock_col, death_col, output_label_col="DerivedOutcome"):
-    """Construct binary labels from a survival dataframe without using time.
+def build_survival_based_label(survival_df, id_col, icd_indicator_col, appropriate_icd_shock_col, death_col, output_label_col="DerivedOutcome", icd_source_df=None):
+    """Construct binary labels from survival data, optionally merging ICD indicator from another DataFrame.
 
     Logic:
       - If ICD implanted (icd_indicator_col == 1): label = appropriate_icd_shock_col
       - If no ICD (icd_indicator_col == 0):       label = death_col
     The resulting label is binarized to {0,1}.
 
+    If icd_source_df is provided, the ICD indicator will be taken from icd_source_df (joined on id_col),
+    otherwise it is expected to be present in survival_df.
+
     Returns a DataFrame with columns [id_col, output_label_col].
     """
-    out = survival_df[[id_col, icd_indicator_col, appropriate_icd_shock_col, death_col]].copy()
-    label = np.where(out[icd_indicator_col].astype(int) == 1, out[appropriate_icd_shock_col], out[death_col])
-    out[output_label_col] = (label.fillna(0).astype(float) > 0).astype(int)
+    if icd_source_df is None:
+        out = survival_df[[id_col, icd_indicator_col, appropriate_icd_shock_col, death_col]].copy()
+    else:
+        out = survival_df[[id_col, appropriate_icd_shock_col, death_col]].copy()
+        out = out.merge(icd_source_df[[id_col, icd_indicator_col]], on=id_col, how="left")
+
+    icd_values = pd.to_numeric(out[icd_indicator_col], errors="coerce").fillna(0).astype(int)
+    label = np.where(icd_values == 1, out[appropriate_icd_shock_col], out[death_col])
+    out[output_label_col] = (pd.to_numeric(label, errors="coerce").fillna(0).astype(float) > 0).astype(int)
     return out[[id_col, output_label_col]]
 
 
@@ -588,8 +597,8 @@ def run_full_train_sex_specific_inference(
 
     Requirements:
       - train_df: contains columns features + train_label_col + "Female"
-      - infer_df: contains columns features + "Female" + id_col
-      - survival_df: contains id_col, icd_indicator_col, appropriate_icd_shock_col, death_col
+      - infer_df: contains columns features + "Female" + id_col + icd_indicator_col
+      - survival_df: contains id_col, appropriate_icd_shock_col, death_col
 
     Returns:
       - eval_metrics: dict of overall/male/female metrics
@@ -633,7 +642,7 @@ def run_full_train_sex_specific_inference(
         combined_pred[infer_df["Female"].values == 1] = pred_f
         combined_prob[infer_df["Female"].values == 1] = prob_f
 
-    # Derive validation labels from survival_df (no time, binary)
+    # Derive validation labels from survival_df (no time, binary), using ICD from infer_df
     survival_labels = build_survival_based_label(
         survival_df,
         id_col=id_col,
@@ -641,6 +650,7 @@ def run_full_train_sex_specific_inference(
         appropriate_icd_shock_col=appropriate_icd_shock_col,
         death_col=death_col,
         output_label_col=survival_label_col,
+        icd_source_df=infer_df,
     )
 
     # Merge predictions with survival-derived labels by id
