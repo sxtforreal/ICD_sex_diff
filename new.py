@@ -680,6 +680,182 @@ def run_full_train_sex_specific_inference(
     return eval_metrics, (male_rate, female_rate), merged
 
 
+def plot_incidence_rates_by_group(eval_df, label_col, title):
+    """Plot male/female incidence rates for a given label column.
+
+    Incidence rate is defined as (# true events among predicted positives) within each sex.
+    """
+    m_rate, f_rate = incidence_rate(eval_df.rename(columns={label_col: "label"}), "pred", "label")
+    rates = [m_rate, f_rate]
+    sexes = ["Male", "Female"]
+
+    plt.figure(figsize=(4, 4))
+    sns.barplot(x=sexes, y=rates, palette=["#4C72B0", "#DD8452"], edgecolor="black")
+    plt.ylim(0, 1)
+    plt.ylabel("Incidence rate")
+    plt.title(title)
+    for i, v in enumerate(rates):
+        if not np.isnan(v):
+            plt.text(i, v + 0.02, f"{v:.2f}", ha="center", va="bottom", fontsize=9)
+    plt.tight_layout()
+    plt.show()
+
+
+def sex_specific_train_and_grouped_eval(
+    train_df,
+    test_df,
+    survival_df,
+    id_col,
+    icd_indicator_col,
+    appropriate_icd_shock_col,
+    death_col,
+    features,
+    train_label_col="VT/VF/SCD",
+    random_state=42,
+    survival_label_col="DerivedOutcome",
+    visualize_importance=False,
+    plot_incidence=True,
+):
+    """Train sex-specific models on full training data, predict on test set, and
+    evaluate by ICD vs no-ICD groups using survival-derived labels.
+
+    For evaluation:
+      - ICD group: ground truth = appropriate ICD shock from survival_df (by MRN join)
+      - No-ICD group: ground truth = death from survival_df
+      - Compare each group's metrics against metrics computed with VT/VF/SCD labels
+
+    Returns a dict with per-group metrics and the merged prediction DataFrame.
+    """
+    # 1) Train sex-specific models on all training data and predict on full test set
+    eval_metrics_overall, _inc_rates_overall, merged_all = run_full_train_sex_specific_inference(
+        train_df=train_df,
+        infer_df=test_df,
+        survival_df=survival_df,
+        id_col=id_col,
+        icd_indicator_col=icd_indicator_col,
+        appropriate_icd_shock_col=appropriate_icd_shock_col,
+        death_col=death_col,
+        features=features,
+        train_label_col=train_label_col,
+        random_state=random_state,
+        survival_label_col=survival_label_col,
+        visualize_importance=visualize_importance,
+    )
+
+    # 2) Merge predictions with meta needed for grouped evaluation
+    merged = test_df[[id_col, "Female", icd_indicator_col, train_label_col]].copy()
+    merged = merged.merge(
+        merged_all[[id_col, "pred", "prob", survival_label_col]], on=id_col, how="left"
+    )
+
+    # Drop rows without survival labels
+    valid_mask = merged[survival_label_col].notna().values
+    merged = merged.loc[valid_mask].reset_index(drop=True)
+
+    # Masks for groups
+    mask_icd = merged[icd_indicator_col].astype(int).values == 1
+    mask_no_icd = merged[icd_indicator_col].astype(int).values == 0
+
+    out = {}
+
+    def eval_for_group(group_mask, group_name):
+        sub = merged.loc[group_mask].reset_index(drop=True)
+        if sub.empty:
+            print(f"[{group_name}] No samples. Skipping.")
+            return {
+                "survival_metrics": None,
+                "vtvfscd_metrics": None,
+                "survival_incidence": (np.nan, np.nan),
+                "vtvfscd_incidence": (np.nan, np.nan),
+            }
+
+        y_pred = sub["pred"].astype(int).values
+        y_prob = sub["prob"].astype(float).values
+        female_vals = sub["Female"].astype(int).values
+        mask_m = female_vals == 0
+        mask_f = female_vals == 1
+
+        # Survival-derived ground truth (ICD→shock, No-ICD→death)
+        y_true_surv = sub[survival_label_col].astype(int).values
+        surv_metrics = evaluate_model_performance(y_true_surv, y_pred, y_prob, mask_m, mask_f)
+
+        # VT/VF/SCD ground truth
+        y_true_vt = sub[train_label_col].astype(int).values
+        vtvfscd_metrics = evaluate_model_performance(y_true_vt, y_pred, y_prob, mask_m, mask_f)
+
+        # Incidence rates by sex
+        eval_df_surv = sub[["Female", "pred", survival_label_col]].rename(columns={survival_label_col: "label"})
+        m_rate_surv, f_rate_surv = incidence_rate(eval_df_surv, "pred", "label")
+
+        eval_df_vt = sub[["Female", "pred", train_label_col]].rename(columns={train_label_col: "label"})
+        m_rate_vt, f_rate_vt = incidence_rate(eval_df_vt, "pred", "label")
+
+        # Print comparison
+        def fmt_metric(d, key):
+            v = d.get(key, np.nan)
+            return "nan" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:.3f}"
+
+        print(f"\n===== {group_name} =====")
+        print("- Using survival-derived labels:")
+        print(
+            f"  Acc={fmt_metric(surv_metrics, 'accuracy')}, AUC={fmt_metric(surv_metrics, 'auc')}, F1={fmt_metric(surv_metrics, 'f1')}, "
+            f"Sens={fmt_metric(surv_metrics, 'sensitivity')}, Spec={fmt_metric(surv_metrics, 'specificity')}"
+        )
+        print(
+            f"  Male: Acc={fmt_metric(surv_metrics, 'male_accuracy')}, AUC={fmt_metric(surv_metrics, 'male_auc')}, F1={fmt_metric(surv_metrics, 'male_f1')}, "
+            f"Sens={fmt_metric(surv_metrics, 'male_sensitivity')}, Spec={fmt_metric(surv_metrics, 'male_specificity')}"
+        )
+        print(
+            f"  Female: Acc={fmt_metric(surv_metrics, 'female_accuracy')}, AUC={fmt_metric(surv_metrics, 'female_auc')}, F1={fmt_metric(surv_metrics, 'female_f1')}, "
+            f"Sens={fmt_metric(surv_metrics, 'female_sensitivity')}, Spec={fmt_metric(surv_metrics, 'female_specificity')}"
+        )
+        print(
+            f"  Incidence (M/F) = ({'nan' if np.isnan(m_rate_surv) else f'{m_rate_surv:.3f}'}/{'nan' if np.isnan(f_rate_surv) else f'{f_rate_surv:.3f}'})"
+        )
+
+        print("- Using VT/VF/SCD labels:")
+        print(
+            f"  Acc={fmt_metric(vtvfscd_metrics, 'accuracy')}, AUC={fmt_metric(vtvfscd_metrics, 'auc')}, F1={fmt_metric(vtvfscd_metrics, 'f1')}, "
+            f"Sens={fmt_metric(vtvfscd_metrics, 'sensitivity')}, Spec={fmt_metric(vtvfscd_metrics, 'specificity')}"
+        )
+        print(
+            f"  Male: Acc={fmt_metric(vtvfscd_metrics, 'male_accuracy')}, AUC={fmt_metric(vtvfscd_metrics, 'male_auc')}, F1={fmt_metric(vtvfscd_metrics, 'male_f1')}, "
+            f"Sens={fmt_metric(vtvfscd_metrics, 'male_sensitivity')}, Spec={fmt_metric(vtvfscd_metrics, 'male_specificity')}"
+        )
+        print(
+            f"  Female: Acc={fmt_metric(vtvfscd_metrics, 'female_accuracy')}, AUC={fmt_metric(vtvfscd_metrics, 'female_auc')}, F1={fmt_metric(vtvfscd_metrics, 'female_f1')}, "
+            f"Sens={fmt_metric(vtvfscd_metrics, 'female_sensitivity')}, Spec={fmt_metric(vtvfscd_metrics, 'female_specificity')}"
+        )
+        print(
+            f"  Incidence (M/F) = ({'nan' if np.isnan(m_rate_vt) else f'{m_rate_vt:.3f}'}/{'nan' if np.isnan(f_rate_vt) else f'{f_rate_vt:.3f}'})"
+        )
+
+        # Optional plots
+        if plot_incidence:
+            plot_incidence_rates_by_group(
+                eval_df_surv.rename(columns={"label": survival_label_col}),
+                label_col=survival_label_col,
+                title=f"Incidence rate ({group_name}) - Survival-derived",
+            )
+            plot_incidence_rates_by_group(
+                eval_df_vt.rename(columns={"label": train_label_col}),
+                label_col=train_label_col,
+                title=f"Incidence rate ({group_name}) - VT/VF/SCD",
+            )
+
+        return {
+            "survival_metrics": surv_metrics,
+            "vtvfscd_metrics": vtvfscd_metrics,
+            "survival_incidence": (m_rate_surv, f_rate_surv),
+            "vtvfscd_incidence": (m_rate_vt, f_rate_vt),
+        }
+
+    out["ICD"] = eval_for_group(mask_icd, "ICD group")
+    out["No-ICD"] = eval_for_group(mask_no_icd, "No-ICD group")
+
+    return out, merged
+
+
 # Example usage and testing
 if __name__ == "__main__":
     # This would be your actual data loading
