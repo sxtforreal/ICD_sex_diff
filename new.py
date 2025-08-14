@@ -64,7 +64,7 @@ def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state
     base_clf = RandomForestClassifier(
         random_state=random_state, n_jobs=-1, class_weight="balanced"
     )
-    ap_scorer = make_scorer(average_precision_score, needs_proba=True)
+    ap_scorer = make_scorer(average_precision_score, response_method="predict_proba")
     
     search = RandomizedSearchCV(
         estimator=base_clf,
@@ -492,7 +492,7 @@ def rf_train_and_predict_no_test_labels(X_train, y_train_df, X_test, feat_names,
     base_clf = RandomForestClassifier(
         random_state=random_state, n_jobs=-1, class_weight="balanced"
     )
-    ap_scorer = make_scorer(average_precision_score, needs_proba=True)
+    ap_scorer = make_scorer(average_precision_score, response_method="predict_proba")
 
     search = RandomizedSearchCV(
         estimator=base_clf,
@@ -573,8 +573,8 @@ def build_survival_based_label(survival_df, id_col, icd_indicator_col, appropria
         out = out.merge(icd_source_df[[id_col, icd_indicator_col]], on=id_col, how="left")
 
     icd_values = pd.to_numeric(out[icd_indicator_col], errors="coerce").fillna(0).astype(int)
-    label = np.where(icd_values == 1, out[appropriate_icd_shock_col], out[death_col])
-    out[output_label_col] = (pd.to_numeric(label, errors="coerce").fillna(0).astype(float) > 0).astype(int)
+    label_series = out[appropriate_icd_shock_col].where(icd_values == 1, out[death_col])
+    out[output_label_col] = (pd.to_numeric(label_series, errors="coerce").fillna(0).astype(float) > 0).astype(int)
     return out[[id_col, output_label_col]]
 
 
