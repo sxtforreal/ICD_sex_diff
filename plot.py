@@ -15,63 +15,65 @@ def parse_value(s):
         return float("nan"), float("nan"), float("nan")
 
 
-# Function to plot a single group (All, Male, or Female)
-def plot_group(ax, df, group_name, colors):
-    metrics = df.iloc[:, 0].values  # First column: metric names
-    models = df.columns[1:]  # Remaining columns: model names
-
-    x = np.arange(len(metrics))  # X-axis positions for metrics
-    width = 0.8 / len(models)  # Bar width, total width ~0.8
-
-    for i, model in enumerate(models):
-        means, lowers, uppers = [], [], []
-
-        # Parse mean and confidence interval for each metric
-        for val in df[model]:
-            mean, lower, upper = parse_value(val)
-            means.append(mean)
-            lowers.append(mean - lower)  # Lower error length
-            uppers.append(upper - mean)  # Upper error length
-
-        # Plot bars with error bars
-        ax.bar(
-            x + i * width - (len(models) - 1) / 2 * width,
-            means,
-            width,
-            color=colors[i],
-            yerr=[lowers, uppers],
-            capsize=3,
-            label=model,
-        )
-
-    # Remove anything after dash-like symbols (handles "-", "–", "—")
-    clean_labels = [re.split(r"\s*[-–—]\s*", label)[0] for label in metrics]
-    ax.set_xticks(x)
-    ax.set_xticklabels(clean_labels, rotation=45, ha="center", fontsize=8)
-
-    ax.set_ylabel("Metric Value")
-    ax.set_title(f"{group_name}")
-    ax.grid(axis="y", linestyle="--", alpha=0.3)
-
-
-# Function to create the 3-panel grouped bar plot
+# Function to create subplots grouped by metric, each subplot shows All/Male/Female per model
 def plot_metrics_with_ci_groups(df):
-    # Split into All, Male, Female (assuming repeating row order)
-    all_df = df.iloc[[i for i in range(len(df)) if i % 3 == 0]]
-    male_df = df.iloc[[i for i in range(len(df)) if i % 3 == 1]]
-    female_df = df.iloc[[i for i in range(len(df)) if i % 3 == 2]]
+    # Expect rows repeating by [All, Male, Female] for each metric
+    num_rows = len(df)
+    if num_rows % 3 != 0:
+        raise ValueError("Input table must have rows in multiples of 3: [All, Male, Female] per metric")
 
-    # Use seaborn theme and palette
+    models = df.columns[1:]
+    num_models = len(models)
+    group_names = ["All", "Male", "Female"]
+    group_colors = sns.color_palette("Set2", n_colors=3)
+
+    num_metrics = num_rows // 3
+
     sns.set_theme(style="whitegrid")
-    colors = sns.color_palette("Set2", n_colors=len(df.columns) - 1)
 
-    fig, axs = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
+    fig, axs = plt.subplots(1, num_metrics, figsize=(5 * num_metrics, 6), sharey=True)
+    if num_metrics == 1:
+        axs = [axs]
 
-    plot_group(axs[0], all_df, "All", colors)
-    plot_group(axs[1], male_df, "Male", colors)
-    plot_group(axs[2], female_df, "Female", colors)
+    for metric_index in range(num_metrics):
+        # Rows for this metric: All, Male, Female (in order)
+        subset = df.iloc[metric_index * 3 : metric_index * 3 + 3]
 
-    # Add shared legend above plots
+        # Derive a clean metric title from the first column value
+        raw_metric_label = str(subset.iloc[0, 0])
+        metric_label = re.split(r"\s*[-–—]\s*", raw_metric_label)[0]
+
+        x = np.arange(num_models)
+        width = 0.8 / 3.0
+
+        ax = axs[metric_index]
+
+        for group_idx, group_name in enumerate(group_names):
+            means, lowers, uppers = [], [], []
+            for model in models:
+                val = subset.iloc[group_idx][model]
+                mean, lower, upper = parse_value(val)
+                means.append(mean)
+                lowers.append(mean - lower)
+                uppers.append(upper - mean)
+
+            ax.bar(
+                x + group_idx * width - (len(group_names) - 1) / 2.0 * width,
+                means,
+                width,
+                color=group_colors[group_idx],
+                yerr=[lowers, uppers],
+                capsize=3,
+                label=group_name,
+            )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(models, rotation=45, ha="center", fontsize=8)
+        ax.set_ylabel("Metric Value")
+        ax.set_title(metric_label)
+        ax.grid(axis="y", linestyle="--", alpha=0.3)
+
+    # Shared legend above plots (groups)
     handles, labels = axs[0].get_legend_handles_labels()
     fig.legend(
         handles,
