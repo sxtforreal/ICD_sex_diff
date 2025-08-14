@@ -15,7 +15,7 @@ def parse_value(s):
         return float("nan"), float("nan"), float("nan")
 
 
-# Function to create subplots grouped by metric, each subplot shows All/Male/Female per model
+# Function to create subplots per metric, x-axis = [all, male, female]; color = model
 def plot_metrics_with_ci_groups(df):
     # Expect rows repeating by [All, Male, Female] for each metric
     num_rows = len(df)
@@ -24,8 +24,8 @@ def plot_metrics_with_ci_groups(df):
 
     models = df.columns[1:]
     num_models = len(models)
-    group_names = ["All", "Male", "Female"]
-    group_colors = sns.color_palette("Set2", n_colors=3)
+    group_names = ["all", "male", "female"]
+    model_colors = sns.color_palette("Set2", n_colors=num_models)
 
     num_metrics = num_rows // 3
 
@@ -43,14 +43,16 @@ def plot_metrics_with_ci_groups(df):
         raw_metric_label = str(subset.iloc[0, 0])
         metric_label = re.split(r"\s*[-–—]\s*", raw_metric_label)[0]
 
-        x = np.arange(num_models)
-        width = 0.8 / 3.0
+        # x-axis: groups (all, male, female)
+        x = np.arange(len(group_names))
+        width = 0.8 / max(num_models, 1)
 
         ax = axs[metric_index]
 
-        for group_idx, group_name in enumerate(group_names):
+        # For each model, draw bars across groups, color by model
+        for model_idx, model in enumerate(models):
             means, lowers, uppers = [], [], []
-            for model in models:
+            for group_idx in range(len(group_names)):
                 val = subset.iloc[group_idx][model]
                 mean, lower, upper = parse_value(val)
                 means.append(mean)
@@ -58,22 +60,22 @@ def plot_metrics_with_ci_groups(df):
                 uppers.append(upper - mean)
 
             ax.bar(
-                x + group_idx * width - (len(group_names) - 1) / 2.0 * width,
+                x + model_idx * width - (num_models - 1) / 2.0 * width,
                 means,
                 width,
-                color=group_colors[group_idx],
+                color=model_colors[model_idx],
                 yerr=[lowers, uppers],
                 capsize=3,
-                label=group_name,
+                label=model,
             )
 
         ax.set_xticks(x)
-        ax.set_xticklabels(models, rotation=45, ha="center", fontsize=8)
+        ax.set_xticklabels(group_names, ha="center", fontsize=9)
         ax.set_ylabel("Metric Value")
         ax.set_title(metric_label)
         ax.grid(axis="y", linestyle="--", alpha=0.3)
 
-    # Shared legend above plots (groups)
+    # Shared legend above plots (models)
     handles, labels = axs[0].get_legend_handles_labels()
     fig.legend(
         handles,
