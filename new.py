@@ -578,18 +578,23 @@ def build_survival_based_label(
 
     Returns a DataFrame with columns [id_col, output_label_col].
     """
+    # Deduplicate survival_df for unique IDs
+    survival_unique = survival_df.drop_duplicates(subset=[id_col], keep='first')
+
     if icd_source_df is None:
         # Keep icd indicator from survival_df when icd_source_df not provided
-        out = survival_df[[id_col, icd_indicator_col, appropriate_icd_shock_col]].copy()
+        out = survival_unique[[id_col, icd_indicator_col, appropriate_icd_shock_col]].copy()
         # Include death_col only for backward-compatible fallback when master_df is None
-        if death_col in survival_df.columns:
-            out = out.merge(survival_df[[id_col, death_col]], on=id_col, how="left")
+        if death_col in survival_unique.columns:
+            out[death_col] = survival_unique[death_col]
     else:
-        out = survival_df[[id_col, appropriate_icd_shock_col]].copy()
+        out = survival_unique[[id_col, appropriate_icd_shock_col]].copy()
         # Include death_col only for backward-compatible fallback when master_df is None
-        if death_col in survival_df.columns:
-            out = out.merge(survival_df[[id_col, death_col]], on=id_col, how="left")
-        out = out.merge(icd_source_df[[id_col, icd_indicator_col]], on=id_col, how="left")
+        if death_col in survival_unique.columns:
+            out[death_col] = survival_unique[death_col]
+        # Deduplicate icd_source_df to avoid duplication in merge
+        icd_source_unique = icd_source_df.drop_duplicates(subset=[id_col], keep='first')
+        out = out.merge(icd_source_unique[[id_col, icd_indicator_col]], on=id_col, how="left")
 
     icd_values = pd.to_numeric(out[icd_indicator_col], errors="coerce").fillna(0).astype(int)
 
@@ -597,23 +602,19 @@ def build_survival_based_label(
     if master_df is not None:
         if master_id_col is None:
             master_id_col = id_col
-        master_cols = [master_id_col, master_label_col]
-        master_cols = [c for c in master_cols if c in master_df.columns]
-        if len(master_cols) == 2:
-            out = out.merge(
-                master_df[[master_id_col, master_label_col]].rename(columns={master_id_col: id_col}),
-                on=id_col,
-                how="left",
-            )
-            label_source_no_icd = out[master_label_col]
-        else:
-            # Fallback to death if required columns are missing in master_df
-            label_source_no_icd = out[death_col] if death_col in out.columns else 0
+        # Deduplicate master_df to avoid duplication in merge
+        master_unique = master_df.drop_duplicates(subset=[master_id_col], keep='first')
+        out = out.merge(
+            master_unique[[master_id_col, master_label_col]].rename(columns={master_id_col: id_col}),
+            on=id_col,
+            how="left",
+        )
+        label_source_no_icd = out[master_label_col]
     else:
         # Backward-compatible fallback: use death for no-ICD
-        label_source_no_icd = out[death_col] if death_col in out.columns else 0
+        label_source_no_icd = out.get(death_col, pd.Series(0, index=out.index))
 
-    label = np.where(icd_values == 1, out[appropriate_icd_shock_col], label_source_no_icd)
+    label = out[appropriate_icd_shock_col].where(icd_values == 1, label_source_no_icd)
     out[output_label_col] = (pd.to_numeric(label, errors="coerce").fillna(0).astype(float) > 0).astype(int)
     return out[[id_col, output_label_col]]
 
@@ -934,14 +935,3 @@ def sex_specific_train_and_grouped_eval(
     out["No-ICD"] = eval_for_group(mask_no_icd, "No-ICD group")
 
     return out, merged
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # This would be your actual data loading
-    print("Simplified multiple random splits function created successfully!")
-    print("Key improvements:")
-    print("1. Reduced code duplication")
-    print("2. Better modularity with helper functions")
-    print("3. Cleaner model configuration system")
-    print("4. Easier to maintain and extend")
