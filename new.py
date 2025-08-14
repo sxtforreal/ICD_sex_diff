@@ -553,12 +553,24 @@ def rf_train_and_predict_no_test_labels(X_train, y_train_df, X_test, feat_names,
     return y_pred, y_prob, threshold
 
 
-def build_survival_based_label(survival_df, id_col, icd_indicator_col, appropriate_icd_shock_col, death_col, output_label_col="DerivedOutcome", icd_source_df=None):
-    """Construct binary labels from survival data, optionally merging ICD indicator from another DataFrame.
+def build_survival_based_label(
+    survival_df,
+    id_col,
+    icd_indicator_col,
+    appropriate_icd_shock_col,
+    death_col,
+    output_label_col="DerivedOutcome",
+    icd_source_df=None,
+    master_df=None,
+    master_label_col="Composite Outcome",
+    master_id_col=None,
+):
+    """Construct binary labels for evaluation using ICD status and external master spreadsheet.
 
     Logic:
-      - If ICD implanted (icd_indicator_col == 1): label = appropriate_icd_shock_col
-      - If no ICD (icd_indicator_col == 0):       label = death_col
+      - If ICD implanted (icd_indicator_col == 1): label = appropriate_icd_shock_col (from survival_df)
+      - If no ICD (icd_indicator_col == 0):       label = master_df[master_label_col] by MRN join
+        (falls back to death_col if master_df is not provided)
     The resulting label is binarized to {0,1}.
 
     If icd_source_df is provided, the ICD indicator will be taken from icd_source_df (joined on id_col),
@@ -567,13 +579,41 @@ def build_survival_based_label(survival_df, id_col, icd_indicator_col, appropria
     Returns a DataFrame with columns [id_col, output_label_col].
     """
     if icd_source_df is None:
-        out = survival_df[[id_col, icd_indicator_col, appropriate_icd_shock_col, death_col]].copy()
+        # Keep icd indicator from survival_df when icd_source_df not provided
+        out = survival_df[[id_col, icd_indicator_col, appropriate_icd_shock_col]].copy()
+        # Include death_col only for backward-compatible fallback when master_df is None
+        if death_col in survival_df.columns:
+            out = out.merge(survival_df[[id_col, death_col]], on=id_col, how="left")
     else:
-        out = survival_df[[id_col, appropriate_icd_shock_col, death_col]].copy()
+        out = survival_df[[id_col, appropriate_icd_shock_col]].copy()
+        # Include death_col only for backward-compatible fallback when master_df is None
+        if death_col in survival_df.columns:
+            out = out.merge(survival_df[[id_col, death_col]], on=id_col, how="left")
         out = out.merge(icd_source_df[[id_col, icd_indicator_col]], on=id_col, how="left")
 
     icd_values = pd.to_numeric(out[icd_indicator_col], errors="coerce").fillna(0).astype(int)
-    label = np.where(icd_values == 1, out[appropriate_icd_shock_col], out[death_col])
+
+    # If a master DF is provided, merge and use its Composite Outcome for no-ICD rows
+    if master_df is not None:
+        if master_id_col is None:
+            master_id_col = id_col
+        master_cols = [master_id_col, master_label_col]
+        master_cols = [c for c in master_cols if c in master_df.columns]
+        if len(master_cols) == 2:
+            out = out.merge(
+                master_df[[master_id_col, master_label_col]].rename(columns={master_id_col: id_col}),
+                on=id_col,
+                how="left",
+            )
+            label_source_no_icd = out[master_label_col]
+        else:
+            # Fallback to death if required columns are missing in master_df
+            label_source_no_icd = out[death_col] if death_col in out.columns else 0
+    else:
+        # Backward-compatible fallback: use death for no-ICD
+        label_source_no_icd = out[death_col] if death_col in out.columns else 0
+
+    label = np.where(icd_values == 1, out[appropriate_icd_shock_col], label_source_no_icd)
     out[output_label_col] = (pd.to_numeric(label, errors="coerce").fillna(0).astype(float) > 0).astype(int)
     return out[[id_col, output_label_col]]
 
@@ -591,22 +631,26 @@ def run_full_train_sex_specific_inference(
     random_state=42,
     survival_label_col="DerivedOutcome",
     visualize_importance=False,
+    master_df=None,
+    master_label_col="Composite Outcome",
+    master_id_col=None,
 ):
     """Train sex-specific RF models on ALL training data, run inference on infer_df, and
-    evaluate against labels derived from survival_df (ICD→shock, No-ICD→death).
+    evaluate against labels derived from survival_df/master_df (ICD→shock, No-ICD→Composite Outcome).
 
     Requirements:
       - train_df: contains columns features + train_label_col + "Female"
       - infer_df: contains columns features + "Female" + id_col + icd_indicator_col
-      - survival_df: contains id_col, appropriate_icd_shock_col, death_col
+      - survival_df: contains id_col and appropriate_icd_shock_col
+      - master_df (optional): contains MRN (or id_col) and master_label_col (default "Composite Outcome")
 
     Notes:
       - survival_label_col is the name to give to the derived survival-based binary label
-        produced by combining survival_df with the ICD indicator. Specifically, for rows
+        produced by combining survival_df/master_df with the ICD indicator. Specifically, for rows
         with ICD implanted (icd_indicator_col == 1), the label comes from appropriate_icd_shock_col;
-        for rows without ICD (icd_indicator_col == 0), the label comes from death_col. The
-        resulting label is binarized to {0, 1}. This label is used only for evaluation,
-        not for training.
+        for rows without ICD (icd_indicator_col == 0), the label comes from master_df[master_label_col]
+        via MRN/id_col join. If master_df is not provided, it falls back to death_col for no-ICD rows.
+        This label is used only for evaluation, not for training.
 
     Returns:
       - eval_metrics: dict of overall/male/female metrics
@@ -650,7 +694,7 @@ def run_full_train_sex_specific_inference(
         combined_pred[infer_df["Female"].values == 1] = pred_f
         combined_prob[infer_df["Female"].values == 1] = prob_f
 
-    # Derive validation labels from survival_df (no time, binary), using ICD from infer_df
+    # Derive validation labels using ICD from infer_df and Composite Outcome for no-ICD
     survival_labels = build_survival_based_label(
         survival_df,
         id_col=id_col,
@@ -659,6 +703,9 @@ def run_full_train_sex_specific_inference(
         death_col=death_col,
         output_label_col=survival_label_col,
         icd_source_df=infer_df,
+        master_df=master_df,
+        master_label_col=master_label_col,
+        master_id_col=master_id_col,
     )
 
     # Merge predictions with survival-derived labels by id
@@ -723,22 +770,23 @@ def sex_specific_train_and_grouped_eval(
     survival_label_col="DerivedOutcome",
     visualize_importance=False,
     plot_incidence=True,
+    master_df=None,
+    master_label_col="Composite Outcome",
+    master_id_col=None,
 ):
     """Train sex-specific models on full training data, predict on test set, and
-    evaluate by ICD vs no-ICD groups using survival-derived labels.
+    evaluate by ICD vs no-ICD groups using survival/master-derived labels.
 
     For evaluation:
-      - ICD group: ground truth = appropriate ICD shock from survival_df (by MRN join)
-      - No-ICD group: ground truth = death from survival_df
+      - ICD group: ground truth = appropriate ICD shock from survival_df (by MRN/id join)
+      - No-ICD group: ground truth = Composite Outcome from master_df (by MRN/id join)
       - Compare each group's metrics against metrics computed with VT/VF/SCD labels
 
     Notes:
-      - survival_label_col is the output column name for the survival-derived binary label
-        created by combining ICD shocks (for ICD patients) and death (for non-ICD patients).
-      - If a group's rows do not have survival-derived labels (e.g., missing in survival_df
-        after joining), the group will no longer be skipped. We will still compute VT/VF/SCD
-        metrics, and print a clear message that survival-derived evaluation is unavailable
-        for that group.
+      - survival_label_col is the output column name for the survival/master-derived binary label
+        created by combining ICD shocks (for ICD patients) and master_df Composite Outcome (for non-ICD patients).
+      - If a group's rows do not have survival/master-derived labels (e.g., missing joins),
+        the group will still compute VT/VF/SCD metrics, and report survival-based evaluation as unavailable.
 
     Returns a dict with per-group metrics and the merged prediction DataFrame.
     """
@@ -756,6 +804,9 @@ def sex_specific_train_and_grouped_eval(
         random_state=random_state,
         survival_label_col=survival_label_col,
         visualize_importance=visualize_importance,
+        master_df=master_df,
+        master_label_col=master_label_col,
+        master_id_col=master_id_col,
     )
 
     # 2) Merge predictions with meta needed for grouped evaluation
@@ -788,7 +839,7 @@ def sex_specific_train_and_grouped_eval(
         mask_m_all = female_vals_all == 0
         mask_f_all = female_vals_all == 1
 
-        # Subset where survival-derived labels are available
+        # Subset where survival/master-derived labels are available
         sub_surv = sub_all[sub_all[survival_label_col].notna()].reset_index(drop=True)
         has_surv = not sub_surv.empty
 
@@ -821,7 +872,7 @@ def sex_specific_train_and_grouped_eval(
 
         print(f"\n===== {group_name} =====")
         print(f"- Samples: total={len(sub_all)}, with_survival_label={len(sub_surv)}")
-        print("- Using survival-derived labels:")
+        print("- Using survival/master-derived labels:")
         if has_surv:
             print(
                 f"  Acc={fmt_metric(surv_metrics, 'accuracy')}, AUC={fmt_metric(surv_metrics, 'auc')}, F1={fmt_metric(surv_metrics, 'f1')}, "
@@ -839,7 +890,7 @@ def sex_specific_train_and_grouped_eval(
                 f"  Incidence (M/F) = ({'nan' if np.isnan(m_rate_surv) else f'{m_rate_surv:.3f}'}/{'nan' if np.isnan(f_rate_surv) else f'{f_rate_surv:.3f}'})"
             )
         else:
-            print("  No survival-derived labels found for this group; skipping survival-based evaluation.")
+            print("  No survival/master-derived labels found for this group; skipping survival-based evaluation.")
 
         print("- Using VT/VF/SCD labels:")
         print(
