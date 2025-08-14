@@ -9,7 +9,6 @@ from sklearn.metrics import (
 )
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, train_test_split
-from sklearn.utils.fixes import loguniform
 from scipy.stats import randint
 import warnings
 from math import ceil
@@ -44,7 +43,11 @@ def incidence_rate(df, pred_col, label_col):
 
 
 def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state=None, visualize_importance=False):
-    """Train RandomForest with randomized search and return predictions."""
+    """Train RandomForest with randomized search and return predictions.
+
+    Uses out-of-fold predictions on the training set to select a robust
+    probability threshold (maximizing F1) without leaking test labels.
+    """
     y_train = y_train_df["VT/VF/SCD"]
     y_test = y_test_df["VT/VF/SCD"]
     
@@ -79,11 +82,32 @@ def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state
         warnings.simplefilter("ignore")
         search.fit(X_train, y_train)
     
-    best_model = search.best_estimator_
+    # Best hyperparameters
+    best_params = search.best_params_
+    
+    # Determine threshold using OOF probabilities on the training set
+    oof_proba = np.zeros(len(y_train), dtype=float)
+    for tr_idx, val_idx in cv.split(X_train, y_train):
+        oof_model = RandomForestClassifier(
+            **best_params, random_state=random_state, n_jobs=-1, class_weight="balanced"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            oof_model.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
+        oof_proba[val_idx] = oof_model.predict_proba(X_train.iloc[val_idx])[:, 1]
+    threshold = find_best_threshold(y_train.values, oof_proba)
+    
+    # Fit final model on the full training data
+    final_model = RandomForestClassifier(
+        **best_params, random_state=random_state, n_jobs=-1, class_weight="balanced"
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        final_model.fit(X_train, y_train)
     
     # Feature importance visualization
     if visualize_importance:
-        importances = best_model.feature_importances_
+        importances = final_model.feature_importances_
         idx = np.argsort(importances)[::-1]
         highlight = {"LVEF", "NYHA"}
         colors = ["red" if feat_names[i] in highlight else "lightgray" for i in idx]
@@ -97,24 +121,33 @@ def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state
         plt.tight_layout()
         plt.show()
     
-    # Determine threshold on training set to avoid data leakage
-    y_train_prob = best_model.predict_proba(X_train)[:, 1]
-    threshold = find_best_threshold(y_train, y_train_prob)
-    
     # Predict on test set
-    y_prob = best_model.predict_proba(X_test)[:, 1]
+    y_prob = final_model.predict_proba(X_test)[:, 1]
     y_pred = (y_prob >= threshold).astype(int)
     
     return y_pred, y_prob
 
 
-def evaluate_model_performance(y_true, y_pred, y_prob, mask_m, mask_f):
-    """Evaluate model performance for overall, male, and female subsets."""
-    # Overall performance
-    acc = accuracy_score(y_true, y_pred)
-    auc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else np.nan
-    f1 = f1_score(y_true, y_pred)
-    sens, spec = compute_sensitivity_specificity(y_true, y_pred)
+def evaluate_model_performance(y_true, y_pred, y_prob, mask_m, mask_f, overall_mask=None):
+    """Evaluate model performance for overall, male, and female subsets.
+
+    If overall_mask is provided, overall metrics are computed using only the
+    entries where overall_mask is True.
+    """
+    # Overall performance (optionally on a subset)
+    if overall_mask is None:
+        y_true_overall = y_true
+        y_pred_overall = y_pred
+        y_prob_overall = y_prob
+    else:
+        y_true_overall = y_true[overall_mask]
+        y_pred_overall = y_pred[overall_mask]
+        y_prob_overall = y_prob[overall_mask]
+    
+    acc = accuracy_score(y_true_overall, y_pred_overall)
+    auc = roc_auc_score(y_true_overall, y_prob_overall) if len(np.unique(y_true_overall)) > 1 else np.nan
+    f1 = f1_score(y_true_overall, y_pred_overall)
+    sens, spec = compute_sensitivity_specificity(y_true_overall, y_pred_overall)
     
     # Male subset
     y_true_m = y_true[mask_m]
@@ -283,6 +316,11 @@ def multiple_random_splits_simplified(df, N, label="VT/VF/SCD"):
             feature_set = feature_sets[config['features']]
             model_type = config['type']
             
+            # Default: evaluate overall on full test and use true male/female masks
+            mask_m_eval = mask_m
+            mask_f_eval = mask_f
+            overall_mask_override = None
+            
             if model_type == 'rule_based':
                 # Guideline model
                 pred, prob, m_rate, f_rate = run_guideline_model(
@@ -328,11 +366,16 @@ def multiple_random_splits_simplified(df, N, label="VT/VF/SCD"):
                     eval_df = test_df[[label, "Female"]].reset_index(drop=True).copy()
                     eval_df["pred"] = pred
                     m_rate, f_rate = incidence_rate(eval_df, "pred", label)
+                    # Evaluate overall metrics only on the male subset
+                    mask_f_eval = np.zeros_like(mask_f, dtype=bool)
+                    overall_mask_override = mask_m
                 else:
                     # Handle case with no male data
                     pred = np.zeros(len(test_df), dtype=int)
                     prob = np.zeros(len(test_df), dtype=float)
                     m_rate, f_rate = 0.0, 0.0
+                    mask_f_eval = np.zeros_like(mask_f, dtype=bool)
+                    overall_mask_override = mask_m
                 
             elif model_type == 'female_only':
                 # Female-only model
@@ -351,11 +394,16 @@ def multiple_random_splits_simplified(df, N, label="VT/VF/SCD"):
                     eval_df = test_df[[label, "Female"]].reset_index(drop=True).copy()
                     eval_df["pred"] = pred
                     m_rate, f_rate = incidence_rate(eval_df, "pred", label)
+                    # Evaluate overall metrics only on the female subset
+                    mask_m_eval = np.zeros_like(mask_m, dtype=bool)
+                    overall_mask_override = mask_f
                 else:
                     # Handle case with no female data
                     pred = np.zeros(len(test_df), dtype=int)
                     prob = np.zeros(len(test_df), dtype=float)
                     m_rate, f_rate = 0.0, 0.0
+                    mask_m_eval = np.zeros_like(mask_m, dtype=bool)
+                    overall_mask_override = mask_f
                 
             elif model_type == 'sex_specific':
                 # Sex-specific models
@@ -380,7 +428,7 @@ def multiple_random_splits_simplified(df, N, label="VT/VF/SCD"):
                 m_rate, f_rate = incidence_rate(eval_df, "pred", label)
             
             # Evaluate performance
-            perf_metrics = evaluate_model_performance(y_true, pred, prob, mask_m, mask_f)
+            perf_metrics = evaluate_model_performance(y_true, pred, prob, mask_m_eval, mask_f_eval, overall_mask=overall_mask_override)
             
             # Store results
             for metric, value in perf_metrics.items():
