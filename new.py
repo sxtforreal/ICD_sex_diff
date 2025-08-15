@@ -934,8 +934,7 @@ def plot_km_by_pred_within_sex(
       - id_col: join key present in both df_with_pred and survival_df
       - female_col: sex indicator (1=female, 0=male)
       - pred_col: predicted binary label column (0/1)
-      - primary_time_col / primary_event_col: columns in survival_df for primary endpoint
-      - secondary_time_col / secondary_event_col: columns in survival_df for secondary endpoint
+      - primary_time_col / secondary_time_col: columns in survival_df for endpoints
       - time_unit: label for the x-axis
       - restrict_to_icd_col: optional column in df_with_pred; if provided, filter to rows with ICD==1
 
@@ -1028,6 +1027,66 @@ def plot_km_by_pred_within_sex(
     _plot_one("Secondary endpoint", secondary_time_col, secondary_event_col)
 
 
+def compute_group_metrics_by_sex_and_pred(
+    merged_df,
+    *,
+    survival_label_col="DerivedOutcome",
+    female_col="Female",
+    pred_col="pred",
+    prob_col="prob",
+):
+    """Compute metrics separately for four groups: Male/Female × High/Low risk.
+
+    - Uses survival/master-derived labels in survival_label_col
+    - High/Low risk is defined by pred_col (1/0)
+    Returns dict with keys: Male_high, Male_low, Female_high, Female_low
+    """
+    valid = merged_df[survival_label_col].notna().values
+    if valid.sum() == 0:
+        return {}
+
+    y_true = merged_df.loc[valid, survival_label_col].astype(int).values
+    y_pred = merged_df.loc[valid, pred_col].astype(int).values
+    y_prob = merged_df.loc[valid, prob_col].astype(float).values
+    females = merged_df.loc[valid, female_col].astype(int).values
+
+    def basic_metrics(mask):
+        if mask.sum() == 0:
+            return {
+                "accuracy": np.nan,
+                "auc": np.nan,
+                "f1": np.nan,
+                "sensitivity": np.nan,
+                "specificity": np.nan,
+                "n": 0,
+            }
+        yt = y_true[mask]
+        yp = y_pred[mask]
+        ys = y_prob[mask]
+        acc = accuracy_score(yt, yp)
+        auc = roc_auc_score(yt, ys) if len(np.unique(yt)) > 1 else np.nan
+        f1 = f1_score(yt, yp)
+        sens, spec = compute_sensitivity_specificity(yt, yp)
+        return {
+            "accuracy": acc,
+            "auc": auc,
+            "f1": f1,
+            "sensitivity": sens,
+            "specificity": spec,
+            "n": int(mask.sum()),
+        }
+
+    masks = {
+        "Male_high": (females == 0) & (y_pred == 1),
+        "Male_low": (females == 0) & (y_pred == 0),
+        "Female_high": (females == 1) & (y_pred == 1),
+        "Female_low": (females == 1) & (y_pred == 0),
+    }
+
+    out = {name: basic_metrics(msk) for name, msk in masks.items()}
+    return out
+
+
 def sex_specific_train_and_grouped_eval(
     train_df,
     test_df,
@@ -1041,7 +1100,7 @@ def sex_specific_train_and_grouped_eval(
     random_state=42,
     survival_label_col="DerivedOutcome",
     visualize_importance=False,
-    plot_incidence=True,
+    plot_incidence=False,
     master_df=None,
     master_label_col="Composite Outcome",
     master_id_col=None,
@@ -1092,6 +1151,23 @@ def sex_specific_train_and_grouped_eval(
     merged = merged.merge(
         merged_all[[id_col, "pred", "prob", survival_label_col]], on=id_col, how="left"
     )
+
+    # Also compute metrics by Sex×Pred groups using survival/master-derived labels
+    by_sex_pred_metrics = compute_group_metrics_by_sex_and_pred(
+        merged_all,
+        survival_label_col=survival_label_col,
+        female_col="Female",
+        pred_col="pred",
+        prob_col="prob",
+    )
+    if by_sex_pred_metrics:
+        print("\n===== Metrics by Sex × Predicted risk (using survival/master-derived labels) =====")
+        for k, v in by_sex_pred_metrics.items():
+            print(
+                f"{k}: N={v['n']}, Acc={v['accuracy'] if not np.isnan(v['accuracy']) else np.nan:.3f}, "
+                f"AUC={v['auc'] if not np.isnan(v['auc']) else np.nan:.3f}, F1={v['f1'] if not np.isnan(v['f1']) else np.nan:.3f}, "
+                f"Sens={v['sensitivity'] if not np.isnan(v['sensitivity']) else np.nan:.3f}, Spec={v['specificity'] if not np.isnan(v['specificity']) else np.nan:.3f}"
+            )
 
     # Do NOT drop rows without survival labels globally; handle per-group
     mask_icd = merged[icd_indicator_col].astype(int).values == 1
@@ -1187,20 +1263,6 @@ def sex_specific_train_and_grouped_eval(
             f"  Incidence (M/F) = ({'nan' if np.isnan(m_rate_vt) else f'{m_rate_vt:.3f}'}/{'nan' if np.isnan(f_rate_vt) else f'{f_rate_vt:.3f}'})"
         )
 
-        # Optional plots
-        if plot_incidence and has_surv:
-            plot_incidence_rates_by_group(
-                eval_df_surv.rename(columns={"label": survival_label_col}),
-                label_col=survival_label_col,
-                title=f"Incidence rate ({group_name}) - Survival-derived",
-            )
-        if plot_incidence:
-            plot_incidence_rates_by_group(
-                eval_df_vt.rename(columns={"label": train_label_col}),
-                label_col=train_label_col,
-                title=f"Incidence rate ({group_name}) - VT/VF/SCD",
-            )
-
         return {
             "survival_metrics": surv_metrics,
             "vtvfscd_metrics": vtvfscd_metrics,
@@ -1211,19 +1273,23 @@ def sex_specific_train_and_grouped_eval(
     out["ICD"] = eval_for_group(mask_icd, "ICD group")
     out["No-ICD"] = eval_for_group(mask_no_icd, "No-ICD group")
 
-    # Optional: KM plots for ICD group by sex, for primary and secondary endpoints
+    # Also attach Sex×Pred group metrics to output for convenience
+    out["BySexPred"] = by_sex_pred_metrics
+
+    # Optional: KM plots for ICD group by sex, using predicted risk groups within each sex and restricting to ICD==1
     if plot_km:
-        plot_km_by_sex_for_icd_group(
-            test_df,
-            survival_df,
+        plot_km_by_pred_within_sex(
+            df_with_pred=merged,
+            survival_df=survival_df,
             id_col=id_col,
-            icd_col=icd_indicator_col,
             female_col="Female",
+            pred_col="pred",
             primary_time_col=km_primary_time_col,
             primary_event_col=km_primary_event_col,
             secondary_time_col=km_secondary_time_col,
             secondary_event_col=km_secondary_event_col,
             time_unit=km_time_unit,
+            restrict_to_icd_col=icd_indicator_col,
         )
 
     return out, merged
