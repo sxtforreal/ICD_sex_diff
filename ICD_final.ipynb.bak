@@ -1,4 +1,88 @@
-{
+# Re-run grouped evaluation with feature importance plots enabled
+features = [
+    "Female",
+    "Age by decade",
+    "BMI",
+    "AF",
+    "Beta Blocker",
+    "CrCl>45",
+    "LVEF",
+    "QTc",
+    "NYHA>2",
+    "CRT",
+    "AAD",
+    "Significant LGE",
+]
+
+grouped, merged = sex_specific_train_and_grouped_eval(
+    train_df, test_df, survival_df,
+    id_col="MRN",
+    icd_indicator_col="ICD",
+    appropriate_icd_shock_col="Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
+    death_col="Death",
+    features=features,
+    visualize_importance=True,
+    plot_incidence=True,
+    master_df=master_spreadsheet,
+    master_label_col="Composite Outcome",
+    master_id_col="MRN",
+)
+
+# Plot per-group metrics (male vs female) as simple barplots (no error bars)
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+sns.set_theme(style="whitegrid")
+
+def plot_metrics_by_sex(metrics_dict, title):
+    metric_keys = ["accuracy", "auc", "f1", "sensitivity", "specificity"]
+    male_vals = [metrics_dict.get(f"male_{m}", np.nan) for m in metric_keys]
+    female_vals = [metrics_dict.get(f"female_{m}", np.nan) for m in metric_keys]
+
+    x = np.arange(len(metric_keys))
+    width = 0.35
+
+    plt.figure(figsize=(7, 4))
+    plt.bar(x - width/2, male_vals, width, label="Male", color="#4C72B0", edgecolor="black")
+    plt.bar(x + width/2, female_vals, width, label="Female", color="#DD8452", edgecolor="black")
+    plt.xticks(x, [m.upper() for m in metric_keys])
+    plt.ylim(0, 1)
+    plt.ylabel("Score")
+    plt.title(title)
+    for i, v in enumerate(male_vals):
+        if not np.isnan(v):
+            plt.text(x[i] - width/2, min(v + 0.03, 0.98), f"{v:.2f}", ha="center", va="bottom", fontsize=9)
+    for i, v in enumerate(female_vals):
+        if not np.isnan(v):
+            plt.text(x[i] + width/2, min(v + 0.03, 0.98), f"{v:.2f}", ha="center", va="bottom", fontsize=9)
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.show()
+
+for group_name, info in grouped.items():
+    if info.get("survival_metrics") is not None:
+        plot_metrics_by_sex(info["survival_metrics"], f"{group_name} — Survival-derived metrics")
+    if info.get("vtvfscd_metrics") is not None:
+        plot_metrics_by_sex(info["vtvfscd_metrics"], f"{group_name} — VT/VF/SCD metrics")
+
+# KM plots for ICD patients: predicted low/high risk groups (0/1)
+# Merge test predictions with survival times/events
+icd_km_df = merged[merged["ICD"] == 1].merge(
+    survival_df[["MRN", "PE_Time", "Was Primary Endpoint Reached? (Appropriate ICD Therapy)"]],
+    on="MRN", how="left"
+)
+
+if not icd_km_df.empty:
+    icd_km_df = icd_km_df.rename(columns={"pred": "Risk"})
+    plot_km_by_gender_and_risk(
+        icd_km_df,
+        gender_col="Female",
+        risk_col="Risk",
+        time_col="PE_Time",
+        event_col="Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
+        title_prefix="ICD group — KM by predicted risk",
+    )
  "cells": [
   {
    "cell_type": "code",
