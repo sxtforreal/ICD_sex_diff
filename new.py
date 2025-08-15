@@ -12,6 +12,12 @@ from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, train_t
 from scipy.stats import randint
 import warnings
 from math import ceil
+try:
+    from lifelines import KaplanMeierFitter
+    from lifelines.statistics import logrank_test
+except ImportError:
+    KaplanMeierFitter = None
+    logrank_test = None
 
 
 def to_binary(series):
@@ -797,6 +803,89 @@ def plot_incidence_rates_by_group(eval_df, label_col, title):
     plt.show()
 
 
+def plot_km_by_sex_for_icd_group(
+    test_df,
+    survival_df,
+    *,
+    id_col,
+    icd_col,
+    female_col="Female",
+    primary_time_col=None,
+    primary_event_col=None,
+    secondary_time_col=None,
+    secondary_event_col=None,
+    time_unit="days",
+):
+    """Plot KM curves and perform logrank tests for the ICD group split by sex.
+
+    Parameters:
+      - test_df: DataFrame with at least [id_col, icd_col, female_col]
+      - survival_df: DataFrame with time-to-event and event indicator columns
+      - id_col: join key present in both test_df and survival_df
+      - icd_col: column in test_df indicating ICD implantation (1/0)
+      - female_col: sex indicator (1=female, 0=male)
+      - primary_time_col / primary_event_col: columns in survival_df for primary endpoint
+      - secondary_time_col / secondary_event_col: columns in survival_df for secondary endpoint
+      - time_unit: label for the x-axis
+
+    Notes:
+      - Requires lifelines. If not installed, this function will print a message and skip plotting.
+      - Event columns are binarized with to_binary; time columns coerced to numeric and rows with missing values are dropped.
+    """
+    if KaplanMeierFitter is None or logrank_test is None:
+        print("[KM] lifelines is not installed. Please `pip install lifelines` to enable KM plots.")
+        return
+
+    def _plot_one(name, time_col, event_col):
+        if time_col is None or event_col is None:
+            return
+        if time_col not in survival_df.columns or event_col not in survival_df.columns:
+            print(f"[KM] Columns for {name} not found in survival_df: {time_col}, {event_col}. Skipping.")
+            return
+        icd_mask = to_binary(test_df[icd_col]).fillna(0).astype(int).values == 1
+        icd_ids = test_df.loc[icd_mask, [id_col, female_col]].dropna()
+        if icd_ids.empty:
+            print(f"[KM] No ICD subjects for {name}. Skipping.")
+            return
+        merged = icd_ids.merge(survival_df[[id_col, time_col, event_col]], on=id_col, how="left")
+        durations = pd.to_numeric(merged[time_col], errors="coerce")
+        events = to_binary(merged[event_col])
+        keep = durations.notna() & events.notna()
+        merged = merged.loc[keep].reset_index(drop=True)
+        if merged.empty:
+            print(f"[KM] No valid time/event data for {name}. Skipping.")
+            return
+        durations = pd.to_numeric(merged[time_col], errors="coerce").values
+        events = to_binary(merged[event_col]).astype(int).values
+        females = merged[female_col].astype(int).values
+        mask_m = females == 0
+        mask_f = females == 1
+        if mask_m.sum() == 0 or mask_f.sum() == 0:
+            print(f"[KM] Not enough subjects in one sex for {name}. Skipping logrank.")
+        kmf_m = KaplanMeierFitter()
+        kmf_f = KaplanMeierFitter()
+        plt.figure(figsize=(5.5, 4))
+        kmf_m.fit(durations[mask_m], events[mask_m], label=f"Male (n={mask_m.sum()})")
+        ax = kmf_m.plot(ci_show=True)
+        kmf_f.fit(durations[mask_f], events[mask_f], label=f"Female (n={mask_f.sum()})")
+        kmf_f.plot(ax=ax, ci_show=True)
+        plt.xlabel(f"Time ({time_unit})")
+        plt.ylabel("Survival probability")
+        plt.title(f"KM: {name} (ICD group)")
+        pval = np.nan
+        if mask_m.sum() > 0 and mask_f.sum() > 0:
+            lr = logrank_test(durations[mask_m], durations[mask_f], events[mask_m], events[mask_f])
+            pval = lr.p_value
+            plt.text(0.7, 0.1, f"logrank p={pval:.3g}", transform=ax.transAxes)
+            print(f"[KM] {name} logrank p-value: {pval:.3g}")
+        plt.tight_layout()
+        plt.show()
+        return pval
+
+    _plot_one("Primary endpoint", primary_time_col, primary_event_col)
+    _plot_one("Secondary endpoint", secondary_time_col, secondary_event_col)
+
+
 def sex_specific_train_and_grouped_eval(
     train_df,
     test_df,
@@ -814,6 +903,12 @@ def sex_specific_train_and_grouped_eval(
     master_df=None,
     master_label_col="Composite Outcome",
     master_id_col=None,
+    plot_km=False,
+    km_primary_time_col=None,
+    km_primary_event_col=None,
+    km_secondary_time_col=None,
+    km_secondary_event_col=None,
+    km_time_unit="days",
 ):
     """Train sex-specific models on full training data, predict on test set, and
     evaluate by ICD vs no-ICD groups using survival/master-derived labels.
@@ -822,14 +917,14 @@ def sex_specific_train_and_grouped_eval(
       - ICD group: ground truth = appropriate ICD shock from survival_df (by MRN/id join)
       - No-ICD group: ground truth = Composite Outcome from master_df (by MRN/id join)
       - Compare each group's metrics against metrics computed with VT/VF/SCD labels
+      - Optionally: For ICD group only, plot KM curves and logrank tests by sex for
+        specified primary and secondary endpoints present in survival_df.
 
     Notes:
       - survival_label_col is the output column name for the survival/master-derived binary label
         created by combining ICD shocks (for ICD patients) and master_df Composite Outcome (for non-ICD patients).
       - If a group's rows do not have survival/master-derived labels (e.g., missing joins),
         the group will still compute VT/VF/SCD metrics, and report survival-based evaluation as unavailable.
-
-    Returns a dict with per-group metrics and the merged prediction DataFrame.
     """
     # 1) Train sex-specific models on all training data and predict on full test set
     eval_metrics_overall, _inc_rates_overall, merged_all = run_full_train_sex_specific_inference(
@@ -973,6 +1068,21 @@ def sex_specific_train_and_grouped_eval(
 
     out["ICD"] = eval_for_group(mask_icd, "ICD group")
     out["No-ICD"] = eval_for_group(mask_no_icd, "No-ICD group")
+
+    # Optional: KM plots for ICD group by sex, for primary and secondary endpoints
+    if plot_km:
+        plot_km_by_sex_for_icd_group(
+            test_df,
+            survival_df,
+            id_col=id_col,
+            icd_col=icd_indicator_col,
+            female_col="Female",
+            primary_time_col=km_primary_time_col,
+            primary_event_col=km_primary_event_col,
+            secondary_time_col=km_secondary_time_col,
+            secondary_event_col=km_secondary_event_col,
+            time_unit=km_time_unit,
+        )
 
     return out, merged
 
