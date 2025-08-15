@@ -14,6 +14,32 @@ import warnings
 from math import ceil
 
 
+def to_binary(series):
+    """Convert a pandas Series with mixed types (numeric, Yes/No, True/False) to {0,1} with NaNs preserved.
+
+    Rules:
+      - Numeric values: > 0 -> 1, else 0 (NaN preserved)
+      - Strings (case-insensitive, trimmed): {"yes","y","true","t","positive","pos","present"} -> 1,
+        {"no","n","false","f","negative","neg","absent"} -> 0; others -> NaN
+    """
+    if series is None:
+        return pd.Series(dtype="float64")
+    s = pd.Series(series)
+    # First, try numeric
+    num = pd.to_numeric(s, errors="coerce")
+    out = pd.Series(index=s.index, dtype="float64")
+    is_num = num.notna()
+    out.loc[is_num] = (num.loc[is_num].astype(float) > 0).astype(int)
+    # For non-numeric entries, map common textual labels
+    non = ~is_num
+    if non.any():
+        mapped = s.loc[non].astype(str).str.strip().str.lower()
+        ones = {"yes", "y", "true", "t", "positive", "pos", "present"}
+        zeros = {"no", "n", "false", "f", "negative", "neg", "absent"}
+        out.loc[non] = mapped.map(lambda v: 1 if v in ones else (0 if v in zeros else np.nan))
+    return out
+
+
 def find_best_threshold(y_true, y_scores):
     """Find the probability threshold that maximizes the F1 score."""
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_scores)
@@ -571,7 +597,7 @@ def build_survival_based_label(
       - If ICD implanted (icd_indicator_col == 1): label = appropriate_icd_shock_col (from survival_df)
       - If no ICD (icd_indicator_col == 0):       label = master_df[master_label_col] by MRN join
         (falls back to death_col if master_df is not provided)
-    The resulting label is binarized to {0,1}.
+    The resulting label is binarized to {0,1} using robust conversion from mixed types.
 
     If icd_source_df is provided, the ICD indicator will be taken from icd_source_df (joined on id_col),
     otherwise it is expected to be present in survival_df.
@@ -605,7 +631,8 @@ def build_survival_based_label(
             merge_cols.append(death_col)
         out = out.merge(survival_unique[merge_cols], on=id_col, how="left")
 
-    icd_values = pd.to_numeric(out[icd_indicator_col], errors="coerce").fillna(0).astype(int)
+    # Robustly binarize ICD indicator and possible label sources
+    icd_values = to_binary(out[icd_indicator_col]).fillna(0).astype(int)
 
     # If a master DF is provided, merge and use its Composite Outcome for no-ICD rows
     if master_df is not None:
@@ -618,13 +645,14 @@ def build_survival_based_label(
             on=id_col,
             how="left",
         )
-        label_source_no_icd = out[master_label_col]
+        label_source_no_icd = to_binary(out[master_label_col])
     else:
         # Backward-compatible fallback: use death for no-ICD
-        label_source_no_icd = out.get(death_col, pd.Series(0, index=out.index))
+        label_source_no_icd = to_binary(out.get(death_col, pd.Series(index=out.index)))
 
-    label = out[appropriate_icd_shock_col].where(icd_values == 1, label_source_no_icd)
-    out[output_label_col] = (pd.to_numeric(label, errors="coerce").fillna(0).astype(float) > 0).astype(int)
+    shock_labels = to_binary(out[appropriate_icd_shock_col])
+    label = shock_labels.where(icd_values == 1, label_source_no_icd)
+    out[output_label_col] = label
     return out[[id_col, output_label_col]]
 
 
@@ -667,6 +695,9 @@ def run_full_train_sex_specific_inference(
       - incidence_rates: (male_rate, female_rate) using survival-derived label
       - merged_predictions: DataFrame with [id, Female, prob, pred, survival_label]
     """
+    # Remove 'Female' from features for sex-specific models to avoid constant feature
+    features_clean = [f for f in features if f != "Female"]
+
     # Split training data by sex
     train_male_df = train_df[train_df["Female"] == 0]
     train_female_df = train_df[train_df["Female"] == 1]
@@ -681,10 +712,10 @@ def run_full_train_sex_specific_inference(
     # Train male model on all male training data and predict on male inference cohort
     if not train_male_df.empty and not infer_male_df.empty:
         pred_m, prob_m, _thr_m = rf_train_and_predict_no_test_labels(
-            train_male_df[features],
+            train_male_df[features_clean],
             train_male_df[[train_label_col, "Female"]],
-            infer_male_df[features],
-            features,
+            infer_male_df[features_clean],
+            features_clean,
             random_state=random_state,
             visualize_importance=visualize_importance,
         )
@@ -694,10 +725,10 @@ def run_full_train_sex_specific_inference(
     # Train female model on all female training data and predict on female inference cohort
     if not train_female_df.empty and not infer_female_df.empty:
         pred_f, prob_f, _thr_f = rf_train_and_predict_no_test_labels(
-            train_female_df[features],
+            train_female_df[features_clean],
             train_female_df[[train_label_col, "Female"]],
-            infer_female_df[features],
-            features,
+            infer_female_df[features_clean],
+            features_clean,
             random_state=random_state,
             visualize_importance=visualize_importance,
         )
@@ -944,3 +975,51 @@ def sex_specific_train_and_grouped_eval(
     out["No-ICD"] = eval_for_group(mask_no_icd, "No-ICD group")
 
     return out, merged
+
+
+def train_and_eval_sex_specific_by_icd(
+    train_df,
+    test_df,
+    survival_df,
+    *,
+    id_col,
+    icd_col,
+    shock_col,
+    death_col,
+    features,
+    train_label_col="VT/VF/SCD",
+    random_state=42,
+    survival_label_col="DerivedOutcome",
+    visualize_importance=False,
+    master_df=None,
+    master_label_col="Composite Outcome",
+    master_id_col=None,
+):
+    """End-to-end: Train separate RF models for males and females on all train_df to predict VT/VF/SCD,
+    apply to all rows in test_df by sex, then evaluate using ground-truth chosen by test_df's ICD:
+      - ICD==1 -> compare to survival_df[shock_col]
+      - ICD==0 -> compare to master_df[master_label_col]
+
+    Returns:
+      - eval_metrics: dict with overall/male/female metrics computed on survival/master-derived labels
+      - incidence_rates: (male_rate, female_rate) among predicted positives using the same labels
+      - merged_predictions: DataFrame with [id_col, Female, pred, prob, survival_label_col]
+    """
+    eval_metrics, incidence_rates, merged = run_full_train_sex_specific_inference(
+        train_df=train_df,
+        infer_df=test_df.rename(columns={icd_col: icd_col}),
+        survival_df=survival_df,
+        id_col=id_col,
+        icd_indicator_col=icd_col,
+        appropriate_icd_shock_col=shock_col,
+        death_col=death_col,
+        features=features,
+        train_label_col=train_label_col,
+        random_state=random_state,
+        survival_label_col=survival_label_col,
+        visualize_importance=visualize_importance,
+        master_df=master_df,
+        master_label_col=master_label_col,
+        master_id_col=master_id_col,
+    )
+    return eval_metrics, incidence_rates, merged
