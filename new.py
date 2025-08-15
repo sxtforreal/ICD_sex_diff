@@ -20,6 +20,63 @@ except ImportError:
     logrank_test = None
 
 
+def feature_color_for_importance(feature_name):
+    """Map feature name to a consistent color for importance plots.
+
+    - Red: NYHA>2 or (N/H)YHA Class
+    - Yellow: LGE Burden 5SD or Significant LGE
+    - Gray: everything else
+    """
+    name = str(feature_name).strip().lower()
+    if name in {"nyha>2", "nyha class", "hyha class"}:
+        return "red"
+    if name in {"lge burden 5sd", "significant lge"}:
+        return "#ffcc00"
+    return "lightgray"
+
+
+def plot_feature_importance_by_sex(importances_male, importances_female, feat_names, title=None):
+    """Plot feature importances for male and female as two subplots side-by-side."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
+    max_importance = 0.0
+
+    # Male subplot
+    if importances_male is not None and len(importances_male) == len(feat_names):
+        idx_m = np.argsort(importances_male)[::-1]
+        colors_m = [feature_color_for_importance(feat_names[i]) for i in idx_m]
+        axes[0].bar(range(len(feat_names)), importances_male[idx_m], color=colors_m)
+        axes[0].set_xticks(range(len(feat_names)))
+        axes[0].set_xticklabels([feat_names[i] for i in idx_m], rotation=90)
+        axes[0].set_title("Male")
+        axes[0].set_ylabel("Importance")
+        max_importance = max(max_importance, float(np.max(importances_male)))
+    else:
+        axes[0].set_visible(False)
+
+    # Female subplot
+    if importances_female is not None and len(importances_female) == len(feat_names):
+        idx_f = np.argsort(importances_female)[::-1]
+        colors_f = [feature_color_for_importance(feat_names[i]) for i in idx_f]
+        axes[1].bar(range(len(feat_names)), importances_female[idx_f], color=colors_f)
+        axes[1].set_xticks(range(len(feat_names)))
+        axes[1].set_xticklabels([feat_names[i] for i in idx_f], rotation=90)
+        axes[1].set_title("Female")
+        max_importance = max(max_importance, float(np.max(importances_female)))
+    else:
+        axes[1].set_visible(False)
+
+    # Harmonize y-limits
+    if max_importance > 0:
+        for ax in axes:
+            if ax.get_visible():
+                ax.set_ylim(0, max_importance * 1.1)
+
+    if title:
+        fig.suptitle(title)
+    plt.tight_layout()
+    plt.show()
+
+
 def to_binary(series):
     """Convert a pandas Series with mixed types (numeric, Yes/No, True/False) to {0,1} with NaNs preserved.
 
@@ -167,8 +224,7 @@ def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state
     if visualize_importance:
         importances = final_model.feature_importances_
         idx = np.argsort(importances)[::-1]
-        highlight = {"LVEF", "NYHA"}
-        colors = ["red" if feat_names[i] in highlight else "lightgray" for i in idx]
+        colors = [feature_color_for_importance(feat_names[i]) for i in idx]
         
         plt.figure(figsize=(8, 4))
         plt.bar(range(len(feat_names)), importances[idx], color=colors)
@@ -528,13 +584,13 @@ def multiple_random_splits_simplified(df, N, label="VT/VF/SCD"):
     return results, summary_table
 
 
-def rf_train_and_predict_no_test_labels(X_train, y_train_df, X_test, feat_names, random_state=None, visualize_importance=False):
+def rf_train_and_predict_no_test_labels(X_train, y_train_df, X_test, feat_names, random_state=None, visualize_importance=False, return_importance=False):
     """Train RF on full training data and predict on X_test without needing test labels.
 
     - Uses randomized search optimizing average precision
     - Selects threshold from out-of-fold probabilities on training set
     - Fits final model on full training data and predicts probabilities on X_test
-    - Returns (y_pred, y_prob, threshold)
+    - Returns (y_pred, y_prob, threshold[, importances])
     """
     y_train = y_train_df["VT/VF/SCD"]
 
@@ -590,12 +646,13 @@ def rf_train_and_predict_no_test_labels(X_train, y_train_df, X_test, feat_names,
         warnings.simplefilter("ignore")
         final_model.fit(X_train, y_train)
 
-    # Optional: visualize feature importance
-    if visualize_importance:
-        importances = final_model.feature_importances_
+    # Compute importances (always available for optional return)
+    importances = final_model.feature_importances_
+
+    # Optional: visualize feature importance (skip if we plan to return importances for external combined plotting)
+    if visualize_importance and not return_importance:
         idx = np.argsort(importances)[::-1]
-        highlight = {"LVEF", "NYHA"}
-        colors = ["red" if feat_names[i] in highlight else "lightgray" for i in idx]
+        colors = [feature_color_for_importance(feat_names[i]) for i in idx]
         plt.figure(figsize=(8, 4))
         plt.bar(range(len(feat_names)), importances[idx], color=colors)
         plt.xticks(range(len(feat_names)), [feat_names[i] for i in idx], rotation=90)
@@ -608,6 +665,8 @@ def rf_train_and_predict_no_test_labels(X_train, y_train_df, X_test, feat_names,
     # Predict on inference set
     y_prob = final_model.predict_proba(X_test)[:, 1]
     y_pred = (y_prob >= threshold).astype(int)
+    if return_importance:
+        return y_pred, y_prob, threshold, importances
     return y_pred, y_prob, threshold
 
 
@@ -743,29 +802,47 @@ def run_full_train_sex_specific_inference(
 
     # Train male model on all male training data and predict on male inference cohort
     if not train_male_df.empty and not infer_male_df.empty:
-        pred_m, prob_m, _thr_m = rf_train_and_predict_no_test_labels(
+        pred_m, prob_m, _thr_m, male_importances = rf_train_and_predict_no_test_labels(
             train_male_df[features_clean],
             train_male_df[[train_label_col, "Female"]],
             infer_male_df[features_clean],
             features_clean,
             random_state=random_state,
             visualize_importance=visualize_importance,
+            return_importance=True,
         )
         combined_pred[infer_df["Female"].values == 0] = pred_m
         combined_prob[infer_df["Female"].values == 0] = prob_m
+    else:
+        male_importances = None
 
     # Train female model on all female training data and predict on female inference cohort
     if not train_female_df.empty and not infer_female_df.empty:
-        pred_f, prob_f, _thr_f = rf_train_and_predict_no_test_labels(
+        pred_f, prob_f, _thr_f, female_importances = rf_train_and_predict_no_test_labels(
             train_female_df[features_clean],
             train_female_df[[train_label_col, "Female"]],
             infer_female_df[features_clean],
             features_clean,
             random_state=random_state,
             visualize_importance=visualize_importance,
+            return_importance=True,
         )
         combined_pred[infer_df["Female"].values == 1] = pred_f
         combined_prob[infer_df["Female"].values == 1] = prob_f
+    else:
+        female_importances = None
+
+    # If requested, draw combined male/female feature importance subplots
+    if visualize_importance:
+        try:
+            plot_feature_importance_by_sex(
+                male_importances,
+                female_importances,
+                features_clean,
+                title="Feature Importances by Sex",
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to plot sex-specific feature importances: {e}")
 
     # Derive validation labels using ICD from infer_df and Composite Outcome for no-ICD
     survival_labels = build_survival_based_label(
