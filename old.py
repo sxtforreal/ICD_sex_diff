@@ -88,9 +88,14 @@ def rf_evaluate(
         importances = best_model.feature_importances_
         idx = np.argsort(importances)[::-1]
 
-        # highlight LVEF and NYHA Class in red
-        highlight = {"LVEF", "NYHA"}
-        colors = ["red" if feat_names[i] in highlight else "lightgray" for i in idx]
+        # highlight specific features by color: red for NYHA>2/NYHA Class, yellow for LGE features
+        try:
+            from new import feature_color_for_importance
+            colors = [feature_color_for_importance(feat_names[i]) for i in idx]
+        except Exception:
+            # Fallback to original behavior if helper unavailable
+            highlight = {"LVEF", "NYHA"}
+            colors = ["red" if feat_names[i] in highlight else "lightgray" for i in idx]
 
         plt.figure(figsize=(8, 4))
         plt.bar(range(len(feat_names)), importances[idx], color=colors)
