@@ -63,15 +63,41 @@ def compute_sensitivity_specificity(y_true, y_pred):
 
 
 def incidence_rate(df, pred_col, label_col):
-    """Compute incidence rate for males and females."""
+    """Compute incidence rate for males and females among predicted positives (pred==1) within each sex."""
     def rate(sub):
-        n_pred = (sub[pred_col] == 1).sum()
-        n_true = (sub[label_col] == 1).sum()
-        return n_true / n_pred if n_pred > 0 else np.nan
+        pred_bin = to_binary(sub[pred_col]).astype(int)
+        label_bin = to_binary(sub[label_col]).astype(int)
+        mask_pred_pos = pred_bin == 1
+        n_pred_pos = int(mask_pred_pos.sum())
+        n_events_in_pred_pos = int(((label_bin == 1) & mask_pred_pos).sum())
+        return n_events_in_pred_pos / n_pred_pos if n_pred_pos > 0 else np.nan
 
     male_rate = rate(df[df["Female"] == 0])
     female_rate = rate(df[df["Female"] == 1])
     return male_rate, female_rate
+
+
+def incidence_by_pred_within_sex(df, pred_col, label_col, female_col="Female"):
+    """Compute incidence within each sex, separately for pred==1 and pred==0.
+
+    Returns a tidy DataFrame with columns: Sex, Pred, N, Events, Rate
+    """
+    data = df.copy()
+    data["_pred"] = to_binary(data[pred_col]).astype(int)
+    data["_label"] = to_binary(data[label_col]).astype(int)
+
+    rows = []
+    for sex_label, sex_code in [("Male", 0), ("Female", 1)]:
+        sub = data[data[female_col] == sex_code]
+        for pred_group in [1, 0]:
+            g = sub[sub["_pred"] == pred_group]
+            n = int(len(g))
+            events = int(g["_label"].sum())
+            rate = events / n if n > 0 else np.nan
+            rows.append({"Sex": sex_label, "Pred": pred_group, "N": n, "Events": events, "Rate": rate})
+
+    out_df = pd.DataFrame(rows)
+    return out_df
 
 
 def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state=None, visualize_importance=False):
@@ -881,6 +907,122 @@ def plot_km_by_sex_for_icd_group(
         plt.tight_layout()
         plt.show()
         return pval
+
+    _plot_one("Primary endpoint", primary_time_col, primary_event_col)
+    _plot_one("Secondary endpoint", secondary_time_col, secondary_event_col)
+
+
+def plot_km_by_pred_within_sex(
+    df_with_pred,
+    survival_df,
+    *,
+    id_col,
+    female_col="Female",
+    pred_col="pred",
+    primary_time_col=None,
+    primary_event_col=None,
+    secondary_time_col=None,
+    secondary_event_col=None,
+    time_unit="days",
+    restrict_to_icd_col=None,
+):
+    """For each sex, plot KM curves comparing predicted positives vs negatives.
+
+    Parameters:
+      - df_with_pred: DataFrame with at least [id_col, female_col, pred_col] (e.g., the merged predictions from inference)
+      - survival_df: DataFrame with time-to-event and event indicator columns
+      - id_col: join key present in both df_with_pred and survival_df
+      - female_col: sex indicator (1=female, 0=male)
+      - pred_col: predicted binary label column (0/1)
+      - primary_time_col / primary_event_col: columns in survival_df for primary endpoint
+      - secondary_time_col / secondary_event_col: columns in survival_df for secondary endpoint
+      - time_unit: label for the x-axis
+      - restrict_to_icd_col: optional column in df_with_pred; if provided, filter to rows with ICD==1
+
+    Notes:
+      - Requires lifelines. If not installed, this function will print a message and skip plotting.
+      - Event columns are binarized with to_binary; time columns coerced to numeric and rows with missing values are dropped.
+    """
+    if KaplanMeierFitter is None or logrank_test is None:
+        print("[KM] lifelines is not installed. Please `pip install lifelines` to enable KM plots.")
+        return
+
+    def _plot_one(name, time_col, event_col):
+        if time_col is None or event_col is None:
+            return
+        if time_col not in survival_df.columns or event_col not in survival_df.columns:
+            print(f"[KM] Columns for {name} not found in survival_df: {time_col}, {event_col}. Skipping.")
+            return
+
+        data = df_with_pred.copy()
+        if restrict_to_icd_col is not None:
+            if restrict_to_icd_col not in data.columns:
+                print(f"[KM] restrict_to_icd_col='{restrict_to_icd_col}' not found in df_with_pred. Skipping restriction.")
+            else:
+                icd_mask = to_binary(data[restrict_to_icd_col]).fillna(0).astype(int).values == 1
+                data = data.loc[icd_mask]
+        needed_cols = [id_col, female_col, pred_col]
+        missing = [c for c in needed_cols if c not in data.columns]
+        if missing:
+            print(f"[KM] Required columns missing from df_with_pred: {missing}. Skipping.")
+            return
+
+        # Use only rows with non-missing id/sex/pred
+        base = data[needed_cols].dropna(subset=[id_col, female_col, pred_col]).copy()
+        if base.empty:
+            print(f"[KM] No data available after filtering for {name}. Skipping.")
+            return
+
+        base["pred_bin"] = to_binary(base[pred_col]).astype(int)
+        merged = base.merge(survival_df[[id_col, time_col, event_col]], on=id_col, how="left")
+
+        durations = pd.to_numeric(merged[time_col], errors="coerce")
+        events = to_binary(merged[event_col])
+        keep = durations.notna() & events.notna()
+        merged = merged.loc[keep].reset_index(drop=True)
+        if merged.empty:
+            print(f"[KM] No valid time/event data for {name}. Skipping.")
+            return
+
+        durations = pd.to_numeric(merged[time_col], errors="coerce").values
+        events = to_binary(merged[event_col]).astype(int).values
+        females = merged[female_col].astype(int).values
+        pred_bin = merged["pred_bin"].astype(int).values
+
+        def plot_for_sex(sex_label, sex_value):
+            sex_mask = females == sex_value
+            if sex_mask.sum() == 0:
+                print(f"[KM] No subjects for {sex_label} in {name}. Skipping.")
+                return
+            group_pos = sex_mask & (pred_bin == 1)
+            group_neg = sex_mask & (pred_bin == 0)
+            if group_pos.sum() == 0 or group_neg.sum() == 0:
+                print(f"[KM] Not enough subjects in one pred group for {sex_label} in {name}. Skipping logrank.")
+
+            kmf_pos = KaplanMeierFitter()
+            kmf_neg = KaplanMeierFitter()
+
+            plt.figure(figsize=(5.5, 4))
+            kmf_pos.fit(durations[group_pos], events[group_pos], label=f"pred=1 (n={group_pos.sum()})")
+            ax = kmf_pos.plot(ci_show=True)
+            kmf_neg.fit(durations[group_neg], events[group_neg], label=f"pred=0 (n={group_neg.sum()})")
+            kmf_neg.plot(ax=ax, ci_show=True)
+            plt.xlabel(f"Time ({time_unit})")
+            plt.ylabel("Survival probability")
+            plt.title(f"KM: {name} - {sex_label}")
+
+            pval = np.nan
+            if group_pos.sum() > 0 and group_neg.sum() > 0:
+                lr = logrank_test(durations[group_pos], durations[group_neg], events[group_pos], events[group_neg])
+                pval = lr.p_value
+                plt.text(0.6, 0.1, f"logrank p={pval:.3g}", transform=ax.transAxes)
+                print(f"[KM] {name} ({sex_label}) logrank p-value: {pval:.3g}")
+            plt.tight_layout()
+            plt.show()
+            return pval
+
+        plot_for_sex("Male", 0)
+        plot_for_sex("Female", 1)
 
     _plot_one("Primary endpoint", primary_time_col, primary_event_col)
     _plot_one("Secondary endpoint", secondary_time_col, secondary_event_col)
