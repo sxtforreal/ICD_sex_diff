@@ -63,15 +63,41 @@ def compute_sensitivity_specificity(y_true, y_pred):
 
 
 def incidence_rate(df, pred_col, label_col):
-    """Compute incidence rate for males and females."""
+    """Compute incidence rate for males and females among predicted positives (pred==1) within each sex."""
     def rate(sub):
-        n_pred = (sub[pred_col] == 1).sum()
-        n_true = (sub[label_col] == 1).sum()
-        return n_true / n_pred if n_pred > 0 else np.nan
+        pred_bin = to_binary(sub[pred_col]).astype(int)
+        label_bin = to_binary(sub[label_col]).astype(int)
+        mask_pred_pos = pred_bin == 1
+        n_pred_pos = int(mask_pred_pos.sum())
+        n_events_in_pred_pos = int(((label_bin == 1) & mask_pred_pos).sum())
+        return n_events_in_pred_pos / n_pred_pos if n_pred_pos > 0 else np.nan
 
     male_rate = rate(df[df["Female"] == 0])
     female_rate = rate(df[df["Female"] == 1])
     return male_rate, female_rate
+
+
+def incidence_by_pred_within_sex(df, pred_col, label_col, female_col="Female"):
+    """Compute incidence within each sex, separately for pred==1 and pred==0.
+
+    Returns a tidy DataFrame with columns: Sex, Pred, N, Events, Rate
+    """
+    data = df.copy()
+    data["_pred"] = to_binary(data[pred_col]).astype(int)
+    data["_label"] = to_binary(data[label_col]).astype(int)
+
+    rows = []
+    for sex_label, sex_code in [("Male", 0), ("Female", 1)]:
+        sub = data[data[female_col] == sex_code]
+        for pred_group in [1, 0]:
+            g = sub[sub["_pred"] == pred_group]
+            n = int(len(g))
+            events = int(g["_label"].sum())
+            rate = events / n if n > 0 else np.nan
+            rows.append({"Sex": sex_label, "Pred": pred_group, "N": n, "Events": events, "Rate": rate})
+
+    out_df = pd.DataFrame(rows)
+    return out_df
 
 
 def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state=None, visualize_importance=False):
