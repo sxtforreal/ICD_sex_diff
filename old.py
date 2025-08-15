@@ -14,7 +14,7 @@ def compute_sensitivity_specificity(y_true, y_pred):
     Compute sensitivity (true positive rate) and specificity (true negative rate)
     from binary predictions.
     """
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
     sensitivity = tp / (tp + fn) if (tp + fn) > 0 else np.nan
     specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
     return sensitivity, specificity
