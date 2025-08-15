@@ -925,6 +925,7 @@ def plot_km_by_pred_within_sex(
     secondary_event_col=None,
     time_unit="days",
     restrict_to_icd_col=None,
+    combine_into_2x2=True,
 ):
     """For each sex, plot KM curves comparing predicted positives vs negatives.
 
@@ -937,6 +938,8 @@ def plot_km_by_pred_within_sex(
       - primary_time_col / secondary_time_col: columns in survival_df for endpoints
       - time_unit: label for the x-axis
       - restrict_to_icd_col: optional column in df_with_pred; if provided, filter to rows with ICD==1
+      - combine_into_2x2: if True and both endpoints are provided, draw a single 2x2 figure with panels:
+          [Primary-Male, Primary-Female; Secondary-Male, Secondary-Female]
 
     Notes:
       - Requires lifelines. If not installed, this function will print a message and skip plotting.
@@ -946,7 +949,25 @@ def plot_km_by_pred_within_sex(
         print("[KM] lifelines is not installed. Please `pip install lifelines` to enable KM plots.")
         return
 
-    def _plot_one(name, time_col, event_col):
+    # decide whether to combine into a 2x2 layout
+    do_combine = bool(
+        combine_into_2x2
+        and primary_time_col is not None
+        and primary_event_col is not None
+        and secondary_time_col is not None
+        and secondary_event_col is not None
+    )
+
+    if do_combine:
+        fig, axs = plt.subplots(2, 2, figsize=(11, 9))
+        axes_map = {
+            "Primary endpoint": (axs[0, 0], axs[0, 1]),
+            "Secondary endpoint": (axs[1, 0], axs[1, 1]),
+        }
+    else:
+        axes_map = {}
+
+    def _plot_one(name, time_col, event_col, male_ax=None, female_ax=None):
         if time_col is None or event_col is None:
             return
         if time_col not in survival_df.columns or event_col not in survival_df.columns:
@@ -960,13 +981,13 @@ def plot_km_by_pred_within_sex(
             else:
                 icd_mask = to_binary(data[restrict_to_icd_col]).fillna(0).astype(int).values == 1
                 data = data.loc[icd_mask]
+
         needed_cols = [id_col, female_col, pred_col]
         missing = [c for c in needed_cols if c not in data.columns]
         if missing:
             print(f"[KM] Required columns missing from df_with_pred: {missing}. Skipping.")
             return
 
-        # Use only rows with non-missing id/sex/pred
         base = data[needed_cols].dropna(subset=[id_col, female_col, pred_col]).copy()
         if base.empty:
             print(f"[KM] No data available after filtering for {name}. Skipping.")
@@ -975,9 +996,9 @@ def plot_km_by_pred_within_sex(
         base["pred_bin"] = to_binary(base[pred_col]).astype(int)
         merged = base.merge(survival_df[[id_col, time_col, event_col]], on=id_col, how="left")
 
-        durations = pd.to_numeric(merged[time_col], errors="coerce")
-        events = to_binary(merged[event_col])
-        keep = durations.notna() & events.notna()
+        durations_s = pd.to_numeric(merged[time_col], errors="coerce")
+        events_s = to_binary(merged[event_col])
+        keep = durations_s.notna() & events_s.notna()
         merged = merged.loc[keep].reset_index(drop=True)
         if merged.empty:
             print(f"[KM] No valid time/event data for {name}. Skipping.")
@@ -988,43 +1009,74 @@ def plot_km_by_pred_within_sex(
         females = merged[female_col].astype(int).values
         pred_bin = merged["pred_bin"].astype(int).values
 
-        def plot_for_sex(sex_label, sex_value):
+        def plot_for_sex(sex_label, sex_value, ax=None):
             sex_mask = females == sex_value
             if sex_mask.sum() == 0:
                 print(f"[KM] No subjects for {sex_label} in {name}. Skipping.")
-                return
+                return np.nan
+
             group_pos = sex_mask & (pred_bin == 1)
             group_neg = sex_mask & (pred_bin == 0)
             if group_pos.sum() == 0 or group_neg.sum() == 0:
                 print(f"[KM] Not enough subjects in one pred group for {sex_label} in {name}. Skipping logrank.")
 
+            if ax is None:
+                fig_local, ax_local = plt.subplots(figsize=(5.5, 4))
+            else:
+                ax_local = ax
+
             kmf_pos = KaplanMeierFitter()
             kmf_neg = KaplanMeierFitter()
 
-            plt.figure(figsize=(5.5, 4))
             kmf_pos.fit(durations[group_pos], events[group_pos], label=f"pred=1 (n={group_pos.sum()})")
-            ax = kmf_pos.plot(ci_show=True)
+            ax_local = kmf_pos.plot(ci_show=True, ax=ax_local)
             kmf_neg.fit(durations[group_neg], events[group_neg], label=f"pred=0 (n={group_neg.sum()})")
-            kmf_neg.plot(ax=ax, ci_show=True)
-            plt.xlabel(f"Time ({time_unit})")
-            plt.ylabel("Survival probability")
-            plt.title(f"KM: {name} - {sex_label}")
+            ax_local = kmf_neg.plot(ax=ax_local, ci_show=True)
+
+            ax_local.set_xlabel(f"Time ({time_unit})")
+            ax_local.set_ylabel("Survival probability")
+            ax_local.set_title(f"KM: {name} - {sex_label}")
 
             pval = np.nan
             if group_pos.sum() > 0 and group_neg.sum() > 0:
                 lr = logrank_test(durations[group_pos], durations[group_neg], events[group_pos], events[group_neg])
                 pval = lr.p_value
-                plt.text(0.6, 0.1, f"logrank p={pval:.3g}", transform=ax.transAxes)
+                ax_local.text(0.6, 0.1, f"logrank p={pval:.3g}", transform=ax_local.transAxes)
                 print(f"[KM] {name} ({sex_label}) logrank p-value: {pval:.3g}")
-            plt.tight_layout()
-            plt.show()
+
+            if ax is None:
+                plt.tight_layout()
+                plt.show()
+
             return pval
 
-        plot_for_sex("Male", 0)
-        plot_for_sex("Female", 1)
+        if male_ax is None or female_ax is None:
+            plot_for_sex("Male", 0, ax=None)
+            plot_for_sex("Female", 1, ax=None)
+        else:
+            plot_for_sex("Male", 0, ax=male_ax)
+            plot_for_sex("Female", 1, ax=female_ax)
 
-    _plot_one("Primary endpoint", primary_time_col, primary_event_col)
-    _plot_one("Secondary endpoint", secondary_time_col, secondary_event_col)
+    if do_combine:
+        _plot_one(
+            "Primary endpoint",
+            primary_time_col,
+            primary_event_col,
+            male_ax=axes_map["Primary endpoint"][0],
+            female_ax=axes_map["Primary endpoint"][1],
+        )
+        _plot_one(
+            "Secondary endpoint",
+            secondary_time_col,
+            secondary_event_col,
+            male_ax=axes_map["Secondary endpoint"][0],
+            female_ax=axes_map["Secondary endpoint"][1],
+        )
+        plt.tight_layout()
+        plt.show()
+    else:
+        _plot_one("Primary endpoint", primary_time_col, primary_event_col)
+        _plot_one("Secondary endpoint", secondary_time_col, secondary_event_col)
 
 
 def compute_group_metrics_by_sex_and_pred(
