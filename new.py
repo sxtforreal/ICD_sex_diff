@@ -35,7 +35,7 @@ def train_sex_specific_model(X_train, y_train, features, seed):
     }
     
     base_clf = RandomForestClassifier(
-        random_state=seed, n_jobs=-1, class_weight="balanced"
+        random_state=seed, n_jobs=1, class_weight="balanced"
     )
     ap_scorer = make_scorer(average_precision_score, needs_proba=True)
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
@@ -47,7 +47,7 @@ def train_sex_specific_model(X_train, y_train, features, seed):
         scoring=ap_scorer,
         cv=cv,
         random_state=seed,
-        n_jobs=-1,
+        n_jobs=1,
         verbose=0,
         error_score="raise",
     )
