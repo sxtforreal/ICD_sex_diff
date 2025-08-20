@@ -829,93 +829,10 @@ def plot_feature_importances(model, features, title, seed):
 
 
 
-def perform_clustering_analysis(X_test, prob_values, gender, seed, max_clusters=10):
-    """Perform clustering analysis for a specific gender and return cluster risk scores."""
-    if X_test.empty:
-        return None, None
-    
-    # Elbow method
-    inertias = []
-    for k in range(1, max_clusters + 1):
-        kmeans = KMeans(n_clusters=k, random_state=seed)
-        kmeans.fit(X_test)
-        inertias.append(kmeans.inertia_)
-    
-    diffs = np.diff(inertias)
-    diff_ratios = diffs / inertias[:-1]
-    best_k = np.argmin(diff_ratios) + 1
-    if best_k < 2:
-        best_k = 2
-    
-    print(f"Selected best number of clusters for {gender} using elbow method: {best_k}")
-    
-    # Final clustering
-    kmeans = KMeans(n_clusters=best_k, random_state=seed)
-    cluster_labels = kmeans.fit_predict(X_test)
-    
-    # Calculate average risk per cluster
-    cluster_risk = pd.Series(prob_values, index=range(len(prob_values))).groupby(cluster_labels).mean().round(3)
-    print(f"Average risk per cluster ({gender}):")
-    print(cluster_risk)
-    
-    return cluster_labels, cluster_risk
 
 
-def bootstrap_evaluation(df, features, labels, male_model, female_model, 
-                        male_threshold, female_threshold, seed, B=100):
-    """Perform bootstrap evaluation for both models."""
-    metrics = {
-        'male': {'accs': [], 'aucs': [], 'f1s': [], 'sens': [], 'spec': []},
-        'female': {'accs': [], 'aucs': [], 'f1s': [], 'sens': [], 'spec': []}
-    }
-    
-    for i in range(B):
-        # Bootstrap the original data (not the predictions)
-        df_boot = resample(df, replace=True, n_samples=len(df), random_state=seed + i)
-        
-        # Male bootstrap
-        m_boot = df_boot[df_boot["Female"] == 0]
-        if not m_boot.empty:
-            X_m_boot = m_boot[features]
-            y_m_boot = m_boot[labels]
-            prob_m_boot = male_model.predict_proba(X_m_boot)[:, 1]
-            pred_m_boot = (prob_m_boot >= male_threshold).astype(int)
-            
-            metrics['male']['accs'].append(accuracy_score(y_m_boot, pred_m_boot))
-            metrics['male']['aucs'].append(roc_auc_score(y_m_boot, prob_m_boot))
-            metrics['male']['f1s'].append(f1_score(y_m_boot, pred_m_boot))
-            metrics['male']['sens'].append(recall_score(y_m_boot, pred_m_boot))
-            metrics['male']['spec'].append(recall_score(y_m_boot, pred_m_boot, pos_label=0))
-        
-        # Female bootstrap
-        f_boot = df_boot[df_boot["Female"] == 1]
-        if not f_boot.empty:
-            X_f_boot = f_boot[features]
-            y_f_boot = f_boot[labels]
-            prob_f_boot = female_model.predict_proba(X_f_boot)[:, 1]
-            pred_f_boot = (prob_f_boot >= female_threshold).astype(int)
-            
-            metrics['female']['accs'].append(accuracy_score(y_f_boot, pred_f_boot))
-            metrics['female']['aucs'].append(roc_auc_score(y_f_boot, prob_f_boot))
-            metrics['female']['f1s'].append(f1_score(y_f_boot, pred_f_boot))
-            metrics['female']['sens'].append(recall_score(y_f_boot, pred_f_boot))
-            metrics['female']['spec'].append(recall_score(y_f_boot, pred_f_boot, pos_label=0))
-    
-    return metrics
 
 
-def print_bootstrap_results(metrics, gender):
-    """Print bootstrap results for a specific gender."""
-    if not metrics[gender]['accs']:
-        return
-    
-    for metric_name in ['accs', 'aucs', 'f1s', 'sens', 'spec']:
-        values = metrics[gender][metric_name]
-        mean_val = np.mean(values)
-        ci_low = np.percentile(values, 2.5)
-        ci_high = np.percentile(values, 97.5)
-        metric_display = metric_name.replace('s', '').title()
-        print(f"{gender.title()} {metric_display}: {mean_val:.4f} [95% CI: {ci_low:.4f} - {ci_high:.4f}]")
 
 
 def plot_km_by_gender_and_risk(merged_df, gender_col, risk_col, time_col, event_col, title_prefix):
@@ -987,21 +904,153 @@ def plot_km_by_gender_and_risk(merged_df, gender_col, risk_col, time_col, event_
         plt.close()
 
 
-def full_model_inference(train_df, test_df, features, labels, survival_df, seed):
-    """Main function with separate male/female models and risk group analysis by ICD status."""
-    import pandas as pd
+def analyze_survival_by_four_groups(merged_df):
+    """Analyze survival outcomes by 4 groups: Male-Pred0, Male-Pred1, Female-Pred0, Female-Pred1."""
+    print("\n=== Survival Analysis by Gender and Predicted Label ===")
     
+    # Define the 4 groups
+    groups = [
+        (0, 0, "Male-Pred0"),
+        (0, 1, "Male-Pred1"), 
+        (1, 0, "Female-Pred0"),
+        (1, 1, "Female-Pred1")
+    ]
+    
+    group_data = {}
+    
+    for gender_val, pred_val, group_name in groups:
+        mask = (merged_df["Female"] == gender_val) & (merged_df["pred_label"] == pred_val)
+        group_df = merged_df[mask]
+        group_data[group_name] = group_df
+        
+        if not group_df.empty:
+            n_samples = len(group_df)
+            
+            # Primary endpoint analysis
+            pe_events = group_df["PE"].sum()
+            pe_rate = pe_events / n_samples if n_samples > 0 else 0
+            
+            # Secondary endpoint analysis  
+            se_events = group_df["SE"].sum()
+            se_rate = se_events / n_samples if n_samples > 0 else 0
+            
+            print(f"\n{group_name} (n={n_samples}):")
+            print(f"  Primary Endpoint: {pe_events} events, Incidence Rate: {pe_rate:.4f}")
+            print(f"  Secondary Endpoint: {se_events} events, Incidence Rate: {se_rate:.4f}")
+        else:
+            print(f"\n{group_name}: No samples")
+    
+    return group_data
+
+
+def plot_km_curves_four_groups(merged_df):
+    """Plot Kaplan-Meier curves for 4 groups: Male-Pred0, Male-Pred1, Female-Pred0, Female-Pred1."""
+    # Define the 4 groups
+    groups = [
+        (0, 0, "Male-Pred0", "blue"),
+        (0, 1, "Male-Pred1", "red"), 
+        (1, 0, "Female-Pred0", "lightblue"),
+        (1, 1, "Female-Pred1", "pink")
+    ]
+    
+    # Create plots for PE and SE
+    fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+    
+    for ax, (ep_name, ep_time_col, ep_event_col) in zip(axes, [
+        ("Primary Endpoint", "PE_Time", "PE"),
+        ("Secondary Endpoint", "SE_Time", "SE")
+    ]):
+        kmf = KaplanMeierFitter()
+        
+        # Plot survival curves for each group
+        for gender_val, pred_val, group_name, color in groups:
+            mask = (merged_df["Female"] == gender_val) & (merged_df["pred_label"] == pred_val)
+            group_data = merged_df[mask]
+            
+            if group_data.empty:
+                continue
+                
+            n_samples = len(group_data)
+            events = group_data[ep_event_col].sum()
+            label = f"{group_name} (n={n_samples}, events={events})"
+            
+            kmf.fit(
+                durations=group_data[ep_time_col],
+                event_observed=group_data[ep_event_col],
+                label=label
+            )
+            kmf.plot(ax=ax, color=color)
+        
+        # Perform pairwise log-rank tests
+        print(f"\n=== {ep_name} Log-rank Tests ===")
+        
+        # Male Pred0 vs Male Pred1
+        male_pred0 = merged_df[(merged_df["Female"] == 0) & (merged_df["pred_label"] == 0)]
+        male_pred1 = merged_df[(merged_df["Female"] == 0) & (merged_df["pred_label"] == 1)]
+        
+        if not male_pred0.empty and not male_pred1.empty:
+            lr_male = logrank_test(
+                male_pred0[ep_time_col], male_pred1[ep_time_col],
+                male_pred0[ep_event_col], male_pred1[ep_event_col]
+            )
+            print(f"Male Pred0 vs Male Pred1: p = {lr_male.p_value:.5f}")
+        
+        # Female Pred0 vs Female Pred1
+        female_pred0 = merged_df[(merged_df["Female"] == 1) & (merged_df["pred_label"] == 0)]
+        female_pred1 = merged_df[(merged_df["Female"] == 1) & (merged_df["pred_label"] == 1)]
+        
+        if not female_pred0.empty and not female_pred1.empty:
+            lr_female = logrank_test(
+                female_pred0[ep_time_col], female_pred1[ep_time_col],
+                female_pred0[ep_event_col], female_pred1[ep_event_col]
+            )
+            print(f"Female Pred0 vs Female Pred1: p = {lr_female.p_value:.5f}")
+        
+        # Cross-gender comparisons (optional)
+        if not male_pred0.empty and not female_pred0.empty:
+            lr_pred0 = logrank_test(
+                male_pred0[ep_time_col], female_pred0[ep_time_col],
+                male_pred0[ep_event_col], female_pred0[ep_event_col]
+            )
+            print(f"Male Pred0 vs Female Pred0: p = {lr_pred0.p_value:.5f}")
+            
+        if not male_pred1.empty and not female_pred1.empty:
+            lr_pred1 = logrank_test(
+                male_pred1[ep_time_col], female_pred1[ep_time_col],
+                male_pred1[ep_event_col], female_pred1[ep_event_col]
+            )
+            print(f"Male Pred1 vs Female Pred1: p = {lr_pred1.p_value:.5f}")
+        
+        ax.set_title(f"{ep_name} - Survival by Gender and Prediction")
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Survival Probability")
+        ax.legend()
+    
+    plt.tight_layout()
+    plt.show()
+    plt.close()
+
+
+def inference_with_features(train_df, test_df, features, labels, survival_df, seed):
+    """
+    Simplified inference function:
+    1. Train separate Random Forest models for male and female using provided features
+    2. Generate predictions for each sample
+    3. Perform survival analysis by gender and predicted label (4 groups total)
+    4. Generate KM plots and logrank tests
+    5. Show feature importance and incidence rates
+    """
     train = train_df.copy()
     test = test_df.copy()
     df = test.copy()
 
-    # Separate data by gender
+    # Separate training data by gender
     train_m = train[train["Female"] == 0].copy()
     train_f = train[train["Female"] == 1].copy()
     test_m = test[test["Female"] == 0].copy()
     test_f = test[test["Female"] == 1].copy()
 
-    # Train models and determine thresholds using cross-validation
+    # Train gender-specific models
     print("Training Male Model...")
     best_male, best_thr_m = train_sex_specific_model(
         train_m[features], train_m[labels], features, seed
@@ -1012,187 +1061,72 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
         train_f[features], train_f[labels], features, seed
     )
 
-    # Make predictions on test set using respective models
+    # Make predictions on test set
     if not test_m.empty:
         prob_m = best_male.predict_proba(test_m[features])[:, 1]
         pred_m = (prob_m >= best_thr_m).astype(int)
-        df.loc[df["Female"] == 0, "pred_sexspecific"] = pred_m
-        df.loc[df["Female"] == 0, "prob_sexspecific"] = prob_m
+        df.loc[df["Female"] == 0, "pred_label"] = pred_m
+        df.loc[df["Female"] == 0, "pred_prob"] = prob_m
     
     if not test_f.empty:
         prob_f = best_female.predict_proba(test_f[features])[:, 1]
         pred_f = (prob_f >= best_thr_f).astype(int)
-        df.loc[df["Female"] == 1, "pred_sexspecific"] = pred_f
-        df.loc[df["Female"] == 1, "prob_sexspecific"] = pred_f
+        df.loc[df["Female"] == 1, "pred_label"] = pred_f
+        df.loc[df["Female"] == 1, "pred_prob"] = prob_f
 
-    # Plot feature importances
+    # Feature importance visualization
     plot_feature_importances(best_male, features, "Male Model Feature Importances", seed)
     plot_feature_importances(best_female, features, "Female Model Feature Importances", seed)
 
-    # Merge with survival data and ICD information for risk group analysis
-    pred_labels = df[["MRN", "pred_sexspecific", "ICD"]].drop_duplicates()
+    # Merge with survival data
+    pred_labels = df[["MRN", "pred_label", "Female"]].drop_duplicates()
     merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
 
-    print("\n=== Risk Group Analysis by ICD Status ===")
-    
-    # Analyze ICD group (ICD=1) - Appropriate ICD Therapy endpoint
-    icd_df = merged_df[merged_df["ICD"] == 1].copy()
-    if not icd_df.empty:
-        print(f"\n--- ICD Group Analysis (n={len(icd_df)}) ---")
-        print("Endpoint: Appropriate ICD Therapy")
-        
-        # High vs Low risk comparison
-        mask_low = icd_df["pred_sexspecific"] == 0
-        mask_high = icd_df["pred_sexspecific"] == 1
-        
-        n_low = mask_low.sum()
-        n_high = mask_high.sum()
-        
-        if n_low > 0 and n_high > 0:
-            events_low = icd_df.loc[mask_low, "Was Primary Endpoint Reached? (Appropriate ICD Therapy)"].sum()
-            events_high = icd_df.loc[mask_high, "Was Primary Endpoint Reached? (Appropriate ICD Therapy)"].sum()
-            
-            # Calculate incidence rates
-            icd_low_rate = events_low / n_low if n_low > 0 else 0
-            icd_high_rate = events_high / n_high if n_high > 0 else 0
-            
-            print(f"Low Risk Group (n={n_low}): {events_low} events, Incidence Rate: {icd_low_rate:.4f}")
-            print(f"High Risk Group (n={n_high}): {events_high} events, Incidence Rate: {icd_high_rate:.4f}")
-            
-            # Statistical test for binary outcome
-            from scipy.stats import chi2_contingency
-            contingency_table = np.array([[events_low, n_low - events_low], 
-                                        [events_high, n_high - events_high]])
-            chi2, p_value, dof, expected = chi2_contingency(contingency_table)
-            print(f"Chi-square test p-value: {p_value:.5f}")
-            
-            # Risk ratio
-            if icd_low_rate > 0:
-                risk_ratio = icd_high_rate / icd_low_rate
-                print(f"Risk Ratio (High/Low): {risk_ratio:.3f}")
-            else:
-                print("Risk Ratio: Cannot calculate (no events in low risk group)")
-        else:
-            print("Cannot perform analysis: insufficient samples in one or both risk groups")
-    
-    # Analyze No-ICD group (ICD=0) - Mortality endpoint
-    no_icd_df = merged_df[merged_df["ICD"] == 0].copy()
-    if not no_icd_df.empty:
-        print(f"\n--- No-ICD Group Analysis (n={len(no_icd_df)}) ---")
-        print("Endpoint: Mortality (Secondary Endpoint)")
-        
-        # High vs Low risk comparison
-        mask_low = no_icd_df["pred_sexspecific"] == 0
-        mask_high = no_icd_df["pred_sexspecific"] == 1
-        
-        n_low = mask_low.sum()
-        n_high = mask_high.sum()
-        
-        if n_low > 0 and n_high > 0:
-            events_low = no_icd_df.loc[mask_low, "Was Secondary Endpoint Reached?"].sum()
-            events_high = no_icd_df.loc[mask_high, "Was Secondary Endpoint Reached?"].sum()
-            
-            # Calculate incidence rates
-            no_icd_low_rate = events_low / n_low if n_low > 0 else 0
-            no_icd_high_rate = events_high / n_high if n_high > 0 else 0
-            
-            print(f"Low Risk Group (n={n_low}): {events_low} events, Incidence Rate: {no_icd_low_rate:.4f}")
-            print(f"High Risk Group (n={n_high}): {events_high} events, Incidence Rate: {no_icd_high_rate:.4f}")
-            
-            # Statistical test for binary outcome
-            from scipy.stats import chi2_contingency
-            contingency_table = np.array([[events_low, n_low - events_low], 
-                                        [events_high, n_high - events_high]])
-            chi2, p_value, dof, expected = chi2_contingency(contingency_table)
-            print(f"Chi-square test p-value: {p_value:.5f}")
-            
-            # Risk ratio
-            if no_icd_low_rate > 0:
-                risk_ratio = no_icd_high_rate / no_icd_low_rate
-                print(f"Risk Ratio (High/Low): {risk_ratio:.3f}")
-            else:
-                print("Risk Ratio: Cannot calculate (no events in low risk group)")
-        else:
-            print("Cannot perform analysis: insufficient samples in one or both risk groups")
-    
-    # Overall summary
-    print(f"\n=== Overall Summary ===")
+    print(f"\n=== Summary ===")
     print(f"Total test samples: {len(df)}")
-    print(f"ICD group: {len(merged_df[merged_df['ICD'] == 1])}")
-    print(f"No-ICD group: {len(merged_df[merged_df['ICD'] == 0])}")
+    print(f"Samples with survival data: {len(merged_df)}")
     
-    # Risk group distribution
-    risk_dist = merged_df["pred_sexspecific"].value_counts().sort_index()
-    print(f"\nRisk Group Distribution:")
-    for risk_level, count in risk_dist.items():
-        risk_label = "Low Risk" if risk_level == 0 else "High Risk"
-        print(f"  {risk_label}: {count}")
-
-    # Clustering analysis (without visualization, only risk score comparison)
-    if not test_m.empty:
-        print("\nMale Clustering Analysis:")
-        cluster_labels_m, cluster_risk_m = perform_clustering_analysis(
-            test_m[features], prob_m, "Male", seed
-        )
-        if cluster_labels_m is not None:
-            df.loc[df["Female"] == 0, "cluster"] = cluster_labels_m
+    # Calculate incidence rates for the 4 groups
+    for gender_val, gender_name in [(0, "Male"), (1, "Female")]:
+        gender_data = merged_df[merged_df["Female"] == gender_val]
+        if not gender_data.empty:
+            for pred_val in [0, 1]:
+                group_data = gender_data[gender_data["pred_label"] == pred_val]
+                if not group_data.empty:
+                    pe_rate = group_data["PE"].sum() / len(group_data)
+                    se_rate = group_data["SE"].sum() / len(group_data)
+                    print(f"{gender_name}-Pred{pred_val}: PE rate = {pe_rate:.4f}, SE rate = {se_rate:.4f}")
     
-    if not test_f.empty:
-        print("\nFemale Clustering Analysis:")
-        cluster_labels_f, cluster_risk_f = perform_clustering_analysis(
-            test_f[features], prob_f, "Female", seed
-        )
-        if cluster_labels_f is not None:
-            df.loc[df["Female"] == 1, "cluster"] = cluster_labels_f
+    # Analyze and plot survival by the 4 groups
+    analyze_survival_by_four_groups(merged_df)
+    plot_km_curves_four_groups(merged_df)
 
-    # Bootstrap evaluation
-    print("\nPerforming Bootstrap Evaluation...")
-    bootstrap_metrics = bootstrap_evaluation(
-        train, features, labels, best_male, best_female, 
-        best_thr_m, best_thr_f, seed
-    )
-    
-    print("\nBootstrap Results:")
-    print_bootstrap_results(bootstrap_metrics, 'male')
-    print_bootstrap_results(bootstrap_metrics, 'female')
+    return merged_df
 
-    return None
-
-features = [
-        "Female",
-        "Age by decade",
-        "BMI",
-        "AF",
-        "Beta Blocker",
-        "CrCl>45",
-        "LVEF",
-        "QTc",
-        "NYHA>2",
-        "CRT",
-        "AAD",
-        "Significant LGE",
-    ]
-
-metrics, rates, merged = run_full_train_sex_specific_inference(
-    train_df, test_df, survival_df,
-    id_col="MRN",
-    icd_indicator_col="ICD",
-    appropriate_icd_shock_col="Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
-    death_col="Was Secondary Endpoint Reached?",
-    features=features,
-    master_df=master_spreadsheet,
-    master_label_col="Composite Outcome",
-    master_id_col="MRN",
-)
-
-grouped, merged = sex_specific_train_and_grouped_eval(
-    train_df, test_df, survival_df,
-    id_col="MRN",
-    icd_indicator_col="ICD",
-    appropriate_icd_shock_col="Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
-    death_col="Death",
-    features=features,
-    master_df=master_spreadsheet,
-    master_label_col="Composite Outcome",
-    master_id_col="MRN",
-)
+# Example usage of the new inference function:
+# 
+# Define your features list
+# features = [
+#     "Female",
+#     "Age by decade", 
+#     "BMI",
+#     "AF",
+#     "Beta Blocker",
+#     "CrCl>45",
+#     "LVEF",
+#     "QTc", 
+#     "NYHA>2",
+#     "CRT",
+#     "AAD",
+#     "Significant LGE",
+# ]
+#
+# Run the inference with your features
+# result_df = inference_with_features(
+#     train_df=train_df,
+#     test_df=test_df, 
+#     features=features,
+#     labels="VT/VF/SCD",  # or your target label
+#     survival_df=survival_df,
+#     seed=42
+# )
