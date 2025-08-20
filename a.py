@@ -855,8 +855,8 @@ def plot_km_by_gender_and_risk(merged_df, gender_col, risk_col, time_col, event_
         fig, axes = plt.subplots(1, 2, figsize=(15, 5), sharey=True)
         
         for ax, (ep_name, ep_time_col, ep_event_col) in zip(axes, [
-            ("Primary Endpoint", "PE_Time", "Was Primary Endpoint Reached? (Appropriate ICD Therapy)"),
-            ("Secondary Endpoint", "SE_Time", "Was Secondary Endpoint Reached?")
+            ("Primary Endpoint", "PE_Time", "PE"),
+            ("Secondary Endpoint", "SE_Time", "SE")
         ]):
             kmf = KaplanMeierFitter()
             
@@ -1085,6 +1085,114 @@ def inference_with_features(train_df, test_df, features, labels, survival_df, se
 
     return merged_df
 
+def full_model_inference(train_df, test_df, features, labels, survival_df, seed):
+    """
+    Full model inference function that handles survival analysis with updated column names.
+    This function performs the complete pipeline including model training, prediction, 
+    and survival analysis using the renamed PE and SE columns.
+    """
+    train = train_df.copy()
+    test = test_df.copy()
+    df = test.copy()
+
+    # Separate training data by gender
+    train_m = train[train["Female"] == 0].copy()
+    train_f = train[train["Female"] == 1].copy()
+    test_m = test[test["Female"] == 0].copy()
+    test_f = test[test["Female"] == 1].copy()
+
+    # Train gender-specific models
+    print("Training Male Model...")
+    best_male, best_thr_m = train_sex_specific_model(
+        train_m[features], train_m[labels], features, seed
+    )
+    
+    print("Training Female Model...")
+    best_female, best_thr_f = train_sex_specific_model(
+        train_f[features], train_f[labels], features, seed
+    )
+
+    # Make predictions on test set
+    if not test_m.empty:
+        prob_m = best_male.predict_proba(test_m[features])[:, 1]
+        pred_m = (prob_m >= best_thr_m).astype(int)
+        df.loc[df["Female"] == 0, "pred_label"] = pred_m
+        df.loc[df["Female"] == 0, "pred_prob"] = prob_m
+    
+    if not test_f.empty:
+        prob_f = best_female.predict_proba(test_f[features])[:, 1]
+        pred_f = (prob_f >= best_thr_f).astype(int)
+        df.loc[df["Female"] == 1, "pred_label"] = pred_f
+        df.loc[df["Female"] == 1, "pred_prob"] = prob_f
+
+    # Feature importance visualization
+    plot_feature_importances(best_male, features, "Male Model Feature Importances", seed)
+    plot_feature_importances(best_female, features, "Female Model Feature Importances", seed)
+
+    # Merge with survival data
+    pred_labels = df[["MRN", "pred_label", "Female"]].drop_duplicates()
+    merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
+
+    print(f"\n=== Summary ===")
+    print(f"Total test samples: {len(df)}")
+    print(f"Samples with survival data: {len(merged_df)}")
+    
+    # Calculate incidence rates for the 4 groups using updated column names
+    for gender_val, gender_name in [(0, "Male"), (1, "Female")]:
+        gender_data = merged_df[merged_df["Female"] == gender_val]
+        if not gender_data.empty:
+            for pred_val in [0, 1]:
+                group_data = gender_data[gender_data["pred_label"] == pred_val]
+                if not group_data.empty:
+                    pe_rate = group_data["PE"].sum() / len(group_data)  # Using PE instead of old column name
+                    se_rate = group_data["SE"].sum() / len(group_data)  # Using SE instead of old column name
+                    print(f"{gender_name}-Pred{pred_val}: PE rate = {pe_rate:.4f}, SE rate = {se_rate:.4f}")
+    
+    # Perform survival analysis by risk groups
+    print("\n=== Survival Analysis by Risk Groups ===")
+    
+    # Analyze low risk vs high risk within each gender
+    for gender_val, gender_name in [(0, "Male"), (1, "Female")]:
+        gender_data = merged_df[merged_df["Female"] == gender_val]
+        if gender_data.empty:
+            continue
+            
+        mask_low = gender_data["pred_label"] == 0
+        mask_high = gender_data["pred_label"] == 1
+        
+        n_low = mask_low.sum()
+        n_high = mask_high.sum()
+        
+        if n_low > 0 and n_high > 0:
+            # Use the updated column names PE and SE
+            events_low = gender_data.loc[mask_low, "PE"].sum()
+            events_high = gender_data.loc[mask_high, "PE"].sum()
+            
+            # Calculate incidence rates
+            rate_low = events_low / n_low if n_low > 0 else 0
+            rate_high = events_high / n_high if n_high > 0 else 0
+            
+            print(f"\n{gender_name} Primary Endpoint Analysis:")
+            print(f"  Low Risk: {events_low}/{n_low} events (rate: {rate_low:.4f})")
+            print(f"  High Risk: {events_high}/{n_high} events (rate: {rate_high:.4f})")
+            
+            # Secondary endpoint analysis
+            se_events_low = gender_data.loc[mask_low, "SE"].sum()
+            se_events_high = gender_data.loc[mask_high, "SE"].sum()
+            
+            se_rate_low = se_events_low / n_low if n_low > 0 else 0
+            se_rate_high = se_events_high / n_high if n_high > 0 else 0
+            
+            print(f"  Secondary Endpoint - Low Risk: {se_events_low}/{n_low} events (rate: {se_rate_low:.4f})")
+            print(f"  Secondary Endpoint - High Risk: {se_events_high}/{n_high} events (rate: {se_rate_high:.4f})")
+
+    # Analyze and plot survival by the 4 groups
+    analyze_survival_by_four_groups(merged_df)
+    plot_km_curves_four_groups(merged_df)
+
+    return merged_df
+
+
 # Example usage of the new inference function:
 # 
 # Define your features list
@@ -1104,7 +1212,7 @@ def inference_with_features(train_df, test_df, features, labels, survival_df, se
 # ]
 #
 # Run the inference with your features
-# result_df = inference_with_features(
+# result_df = full_model_inference(
 #     train_df=train_df,
 #     test_df=test_df, 
 #     features=features,
