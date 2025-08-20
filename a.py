@@ -944,87 +944,69 @@ def analyze_survival_by_four_groups(merged_df):
 
 
 def plot_km_curves_four_groups(merged_df):
-    """Plot Kaplan-Meier curves for 4 groups: Male-Pred0, Male-Pred1, Female-Pred0, Female-Pred1."""
-    # Define the 4 groups
-    groups = [
-        (0, 0, "Male-Pred0", "blue"),
-        (0, 1, "Male-Pred1", "red"), 
-        (1, 0, "Female-Pred0", "lightblue"),
-        (1, 1, "Female-Pred1", "pink")
-    ]
+    """Plot Kaplan-Meier curves in 2x2 layout: PE/SE rows, Male/Female columns."""
     
-    # Create plots for PE and SE
-    fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+    # Create 2x2 subplot layout
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
     
-    for ax, (ep_name, ep_time_col, ep_event_col) in zip(axes, [
+    # Define endpoints and genders
+    endpoints = [
         ("Primary Endpoint", "PE_Time", "PE"),
         ("Secondary Endpoint", "SE_Time", "SE")
-    ]):
-        kmf = KaplanMeierFitter()
-        
-        # Plot survival curves for each group
-        for gender_val, pred_val, group_name, color in groups:
-            mask = (merged_df["Female"] == gender_val) & (merged_df["pred_label"] == pred_val)
-            group_data = merged_df[mask]
+    ]
+    genders = [(0, "Male"), (1, "Female")]
+    
+    # Iterate through each subplot
+    for row_idx, (ep_name, ep_time_col, ep_event_col) in enumerate(endpoints):
+        for col_idx, (gender_val, gender_name) in enumerate(genders):
+            ax = axes[row_idx, col_idx]
+            kmf = KaplanMeierFitter()
             
-            if group_data.empty:
+            # Get data for this gender
+            gender_data = merged_df[merged_df["Female"] == gender_val]
+            
+            if gender_data.empty:
+                ax.set_title(f"{ep_name} - {gender_name}")
+                ax.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax.transAxes)
                 continue
+            
+            # Plot low risk (pred_label = 0) and high risk (pred_label = 1)
+            for pred_val, risk_label, color in [(0, "Low Risk", "blue"), (1, "High Risk", "red")]:
+                risk_data = gender_data[gender_data["pred_label"] == pred_val]
                 
-            n_samples = len(group_data)
-            events = group_data[ep_event_col].sum()
-            label = f"{group_name} (n={n_samples}, events={events})"
+                if risk_data.empty:
+                    continue
+                    
+                n_samples = len(risk_data)
+                events = risk_data[ep_event_col].sum()
+                label = f"{risk_label} (n={n_samples}, events={events})"
+                
+                kmf.fit(
+                    durations=risk_data[ep_time_col],
+                    event_observed=risk_data[ep_event_col],
+                    label=label
+                )
+                kmf.plot(ax=ax, color=color)
             
-            kmf.fit(
-                durations=group_data[ep_time_col],
-                event_observed=group_data[ep_event_col],
-                label=label
-            )
-            kmf.plot(ax=ax, color=color)
-        
-        # Perform pairwise log-rank tests
-        print(f"\n=== {ep_name} Log-rank Tests ===")
-        
-        # Male Pred0 vs Male Pred1
-        male_pred0 = merged_df[(merged_df["Female"] == 0) & (merged_df["pred_label"] == 0)]
-        male_pred1 = merged_df[(merged_df["Female"] == 0) & (merged_df["pred_label"] == 1)]
-        
-        if not male_pred0.empty and not male_pred1.empty:
-            lr_male = logrank_test(
-                male_pred0[ep_time_col], male_pred1[ep_time_col],
-                male_pred0[ep_event_col], male_pred1[ep_event_col]
-            )
-            print(f"Male Pred0 vs Male Pred1: p = {lr_male.p_value:.5f}")
-        
-        # Female Pred0 vs Female Pred1
-        female_pred0 = merged_df[(merged_df["Female"] == 1) & (merged_df["pred_label"] == 0)]
-        female_pred1 = merged_df[(merged_df["Female"] == 1) & (merged_df["pred_label"] == 1)]
-        
-        if not female_pred0.empty and not female_pred1.empty:
-            lr_female = logrank_test(
-                female_pred0[ep_time_col], female_pred1[ep_time_col],
-                female_pred0[ep_event_col], female_pred1[ep_event_col]
-            )
-            print(f"Female Pred0 vs Female Pred1: p = {lr_female.p_value:.5f}")
-        
-        # Cross-gender comparisons (optional)
-        if not male_pred0.empty and not female_pred0.empty:
-            lr_pred0 = logrank_test(
-                male_pred0[ep_time_col], female_pred0[ep_time_col],
-                male_pred0[ep_event_col], female_pred0[ep_event_col]
-            )
-            print(f"Male Pred0 vs Female Pred0: p = {lr_pred0.p_value:.5f}")
+            # Perform log-rank test for this gender and endpoint
+            low_risk_data = gender_data[gender_data["pred_label"] == 0]
+            high_risk_data = gender_data[gender_data["pred_label"] == 1]
             
-        if not male_pred1.empty and not female_pred1.empty:
-            lr_pred1 = logrank_test(
-                male_pred1[ep_time_col], female_pred1[ep_time_col],
-                male_pred1[ep_event_col], female_pred1[ep_event_col]
-            )
-            print(f"Male Pred1 vs Female Pred1: p = {lr_pred1.p_value:.5f}")
-        
-        ax.set_title(f"{ep_name} - Survival by Gender and Prediction")
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Survival Probability")
-        ax.legend()
+            if not low_risk_data.empty and not high_risk_data.empty:
+                lr_test = logrank_test(
+                    low_risk_data[ep_time_col], high_risk_data[ep_time_col],
+                    low_risk_data[ep_event_col], high_risk_data[ep_event_col]
+                )
+                # Add log-rank test result to bottom right corner
+                ax.text(0.95, 0.05, f"Log-rank p = {lr_test.p_value:.4f}", 
+                       transform=ax.transAxes, ha="right", va="bottom",
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+            
+            ax.set_title(f"{ep_name} - {gender_name}")
+            ax.set_xlabel("Time (days)")
+            ax.set_ylabel("Survival Probability")
+            ax.legend(loc='upper right')
+            ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.show()
