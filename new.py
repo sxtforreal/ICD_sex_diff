@@ -90,7 +90,7 @@ no_icd_survival = no_icd_survival[
 )
 
 # MERGED SURVIVAL
-
+survival_df = pd.concat([icd_survival, no_icd_survival], ignore_index=True)
 
 # ICD & NO ICD FEATURES
 with_icd = pd.read_excel(
@@ -718,6 +718,13 @@ def multiple_random_splits_simplified(df, N, label="VT/VF/SCD"):
     summary_table = formatted.unstack(level=1)
     
     return results, summary_table
+
+res, summary = multiple_random_splits_simplified(train_df, 50)
+print(summary)
+summary.to_excel('/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/results.xlsx', index=True, index_label='RowName')
+
+
+
 
 def train_sex_specific_model(X_train, y_train, features, seed):
     """
