@@ -1163,9 +1163,9 @@ def plot_km_curves_four_groups(merged_df):
     plt.close()
 
 
-def inference_with_features(train_df, test_df, features, labels, survival_df, seed, gray_features=None):
+def sex_specific_model_inference(train_df, test_df, features, labels, survival_df, seed, gray_features=None):
     """
-    Simplified inference function:
+    Sex-specific model inference function:
     1. Train separate Random Forest models for male and female using provided features
     2. Generate predictions for each sample
     3. Perform survival analysis by gender and predicted label (4 groups total)
@@ -1239,9 +1239,9 @@ def inference_with_features(train_df, test_df, features, labels, survival_df, se
 
     return merged_df
 
-def full_model_inference(train_df, test_df, features, labels, survival_df, seed, gray_features=None):
+def sex_specific_full_inference(train_df, test_df, features, labels, survival_df, seed, gray_features=None):
     """
-    Full model inference function that handles survival analysis with updated column names.
+    Sex-specific full model inference function that handles survival analysis with updated column names.
     This function performs the complete pipeline including model training, prediction, 
     and survival analysis using the renamed PE and SE columns.
     
@@ -1453,7 +1453,7 @@ def sex_agnostic_model_inference(train_df, test_df, features, label_col, surviva
     return merged_df
 
 
-# Example usage of the new inference function:
+# Example usage of the sex-specific inference functions:
 # 
 # Define your features list
 # features = [
@@ -1471,12 +1471,24 @@ def sex_agnostic_model_inference(train_df, test_df, features, label_col, surviva
 #     "Significant LGE",
 # ]
 #
-# Run the inference with your features
-# result_df = full_model_inference(
+# Run the sex-specific inference with your features
+# result_df = sex_specific_model_inference(
 #     train_df=train_df,
 #     test_df=test_df, 
 #     features=features,
 #     labels="VT/VF/SCD",  # or your target label
 #     survival_df=survival_df,
-#     seed=42
+#     seed=42,
+#     gray_features=["Female", "Age by decade"]  # Optional: specify which features to color gray
+# )
+#
+# Or use the full inference version:
+# result_df = sex_specific_full_inference(
+#     train_df=train_df,
+#     test_df=test_df, 
+#     features=features,
+#     labels="VT/VF/SCD",  # or your target label
+#     survival_df=survival_df,
+#     seed=42,
+#     gray_features=["Female", "Age by decade"]  # Optional: specify which features to color gray
 # )
