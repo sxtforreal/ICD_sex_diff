@@ -330,11 +330,15 @@ def incidence_rate(df, pred_col, label_col):
     return male_rate, female_rate
 
 
-def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state=None, visualize_importance=False):
+def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state=None, visualize_importance=False, gray_features=None):
     """Train RandomForest with randomized search and return predictions.
 
     Uses out-of-fold predictions on the training set to select a robust
     probability threshold (maximizing F1) without leaking test labels.
+    
+    Args:
+        gray_features: List of feature names to be colored gray in importance plot.
+                      Features not in this list will be colored blue.
     """
     y_train = y_train_df["VT/VF/SCD"]
     y_test = y_test_df["VT/VF/SCD"]
@@ -397,8 +401,15 @@ def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state
     if visualize_importance:
         importances = final_model.feature_importances_
         idx = np.argsort(importances)[::-1]
-        highlight = {"LVEF", "NYHA"}
-        colors = ["red" if feat_names[i] in highlight else "lightgray" for i in idx]
+        
+        # Use provided gray_features list or default to highlight certain features
+        if gray_features is not None:
+            gray_features_set = set(gray_features)
+            colors = ["gray" if feat_names[i] in gray_features_set else "blue" for i in idx]
+        else:
+            # Default behavior - highlight specific features
+            highlight = {"LVEF", "NYHA"}
+            colors = ["red" if feat_names[i] in highlight else "lightgray" for i in idx]
         
         plt.figure(figsize=(8, 4))
         plt.bar(range(len(feat_names)), importances[idx], color=colors)
@@ -803,18 +814,96 @@ def train_sex_specific_model(X_train, y_train, features, seed):
     return best_model, best_threshold
 
 
-def plot_feature_importances(model, features, title, seed):
-    """Plot feature importances with consistent styling."""
+def train_sex_agnostic_model(train_df, features, label_col, seed, use_undersampling=True):
+    """
+    Train a sex-agnostic model using undersampling for fair comparison.
+    
+    Args:
+        train_df: Training dataframe
+        features: List of feature names
+        label_col: Name of the target column
+        seed: Random seed
+        use_undersampling: Whether to use undersampling for balanced training
+    
+    Returns:
+        Trained model and optimal threshold
+    """
+    if use_undersampling:
+        # Create undersampled dataset for fair comparison
+        train_data = create_undersampled_dataset(train_df, label_col, seed)
+        print(f"Using undersampled training data: {len(train_data)} samples")
+    else:
+        train_data = train_df.copy()
+        print(f"Using full training data: {len(train_data)} samples")
+    
+    X_train = train_data[features]
+    y_train = train_data[label_col]
+    
+    # RF params
+    param_dist = {
+        "n_estimators": randint(100, 500),
+        "max_depth": [None] + list(range(5, 26, 5)),
+        "min_samples_split": randint(2, 11),
+        "min_samples_leaf": randint(1, 5),
+        "max_features": ["sqrt", "log2", None],
+    }
+    
+    base_clf = RandomForestClassifier(
+        random_state=seed, n_jobs=-1, class_weight="balanced"
+    )
+    ap_scorer = make_scorer(average_precision_score, needs_proba=True)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+    
+    search = RandomizedSearchCV(
+        estimator=base_clf,
+        param_distributions=param_dist,
+        n_iter=50,
+        scoring=ap_scorer,
+        cv=cv,
+        random_state=seed,
+        n_jobs=-1,
+        verbose=0,
+        error_score="raise",
+    )
+    
+    # Train model
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        search.fit(X_train, y_train)
+    
+    best_model = search.best_estimator_
+    print("Best hyperparameters:", search.best_params_)
+    
+    # Use cross-validation to determine threshold
+    cv_probs = cross_val_predict(best_model, X_train, y_train, cv=5, method='predict_proba')[:, 1]
+    best_threshold = find_best_threshold(y_train, cv_probs)
+    
+    return best_model, best_threshold
+
+
+def plot_feature_importances(model, features, title, seed, gray_features=None):
+    """Plot feature importances with consistent styling.
+    
+    Args:
+        gray_features: List of feature names to be colored gray.
+                      Features not in this list will be colored blue.
+    """
     importances = model.feature_importances_
     idx = np.argsort(importances)[::-1]
     sorted_features = [features[i] for i in idx]
     
-    colors = [
-        "red" if f in {"LVEF", "NYHA Class", "NYHA>2"}
-        else "gold" if f in {"Significant LGE", "LGE Burden 5SD"} 
-        else "lightgray"
-        for f in sorted_features
-    ]
+    # Use provided gray_features list or default coloring scheme
+    if gray_features is not None:
+        gray_features_set = set(gray_features)
+        colors = ["gray" if f in gray_features_set else "blue" for f in sorted_features]
+    else:
+        # Default coloring scheme
+        colors = [
+            "red" if f in {"LVEF", "NYHA Class", "NYHA>2"}
+            else "gold" if f in {"Significant LGE", "LGE Burden 5SD"} 
+            else "lightgray"
+            for f in sorted_features
+        ]
     
     plt.figure(figsize=(8, 4))
     plt.bar(range(len(sorted_features)), importances[idx], color=colors)
@@ -1190,6 +1279,108 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
     analyze_survival_by_four_groups(merged_df)
     plot_km_curves_four_groups(merged_df)
 
+    return merged_df
+
+
+def sex_agnostic_model_inference(train_df, test_df, features, label_col, survival_df, seed, gray_features=None, use_undersampling=True):
+    """
+    Sex-agnostic model inference function that trains a single model on all data
+    and performs survival analysis similar to sex-specific models.
+    
+    Args:
+        train_df: Training dataframe
+        test_df: Test dataframe
+        features: List of feature names
+        label_col: Name of the target column
+        survival_df: Survival data
+        seed: Random seed
+        gray_features: List of features to color gray in importance plots
+        use_undersampling: Whether to use undersampling for training
+    
+    Returns:
+        Merged dataframe with predictions and survival data
+    """
+    test = test_df.copy()
+    
+    # Train sex-agnostic model
+    print("Training Sex-Agnostic Model...")
+    best_model, best_threshold = train_sex_agnostic_model(
+        train_df, features, label_col, seed, use_undersampling
+    )
+    
+    # Make predictions on test set
+    test_probs = best_model.predict_proba(test[features])[:, 1]
+    test_preds = (test_probs >= best_threshold).astype(int)
+    
+    # Add predictions to test dataframe
+    test["pred_label"] = test_preds
+    test["pred_prob"] = test_probs
+    
+    # Feature importance visualization
+    plot_feature_importances(
+        best_model, features, 
+        "Sex-Agnostic Model Feature Importances", 
+        seed, gray_features
+    )
+    
+    # Merge with survival data
+    pred_labels = test[["MRN", "pred_label", "Female"]].drop_duplicates()
+    merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
+    
+    print(f"\n=== Sex-Agnostic Model Summary ===")
+    print(f"Total test samples: {len(test)}")
+    print(f"Samples with survival data: {len(merged_df)}")
+    
+    # Calculate overall prediction statistics
+    n_high_risk = (merged_df["pred_label"] == 1).sum()
+    n_low_risk = (merged_df["pred_label"] == 0).sum()
+    print(f"High risk predictions: {n_high_risk}")
+    print(f"Low risk predictions: {n_low_risk}")
+    
+    # Calculate incidence rates for the 4 groups (Male/Female × Low/High Risk)
+    print(f"\n=== Incidence Rates by Gender and Risk ===")
+    for gender_val, gender_name in [(0, "Male"), (1, "Female")]:
+        gender_data = merged_df[merged_df["Female"] == gender_val]
+        if not gender_data.empty:
+            for pred_val, risk_name in [(0, "Low Risk"), (1, "High Risk")]:
+                group_data = gender_data[gender_data["pred_label"] == pred_val]
+                if not group_data.empty:
+                    pe_rate = group_data["PE"].sum() / len(group_data)
+                    se_rate = group_data["SE"].sum() / len(group_data)
+                    print(f"{gender_name}-{risk_name}: PE rate = {pe_rate:.4f}, SE rate = {se_rate:.4f} (n={len(group_data)})")
+    
+    # Perform survival analysis
+    print("\n=== Sex-Agnostic Model Survival Analysis ===")
+    
+    # Overall analysis (Low Risk vs High Risk)
+    low_risk_data = merged_df[merged_df["pred_label"] == 0]
+    high_risk_data = merged_df[merged_df["pred_label"] == 1]
+    
+    if not low_risk_data.empty and not high_risk_data.empty:
+        pe_events_low = low_risk_data["PE"].sum()
+        pe_events_high = high_risk_data["PE"].sum()
+        
+        pe_rate_low = pe_events_low / len(low_risk_data)
+        pe_rate_high = pe_events_high / len(high_risk_data)
+        
+        print(f"\nOverall Primary Endpoint Analysis:")
+        print(f"  Low Risk: {pe_events_low}/{len(low_risk_data)} events (rate: {pe_rate_low:.4f})")
+        print(f"  High Risk: {pe_events_high}/{len(high_risk_data)} events (rate: {pe_rate_high:.4f})")
+        
+        # Secondary endpoint analysis
+        se_events_low = low_risk_data["SE"].sum()
+        se_events_high = high_risk_data["SE"].sum()
+        
+        se_rate_low = se_events_low / len(low_risk_data)
+        se_rate_high = se_events_high / len(high_risk_data)
+        
+        print(f"  Secondary Endpoint - Low Risk: {se_events_low}/{len(low_risk_data)} events (rate: {se_rate_low:.4f})")
+        print(f"  Secondary Endpoint - High Risk: {se_events_high}/{len(high_risk_data)} events (rate: {se_rate_high:.4f})")
+    
+    # Analyze and plot survival by the 4 groups (same as sex-specific models)
+    analyze_survival_by_four_groups(merged_df)
+    plot_km_curves_four_groups(merged_df)
+    
     return merged_df
 
 
