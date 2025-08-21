@@ -330,7 +330,7 @@ def incidence_rate(df, pred_col, label_col):
     return male_rate, female_rate
 
 
-def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state=None, visualize_importance=False, gray_features=None, red_features=None):
+def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state=None, visualize_importance=False, gray_features=None):
     """Train RandomForest with randomized search and return predictions.
 
     Uses out-of-fold predictions on the training set to select a robust
@@ -338,8 +338,7 @@ def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state
     
     Args:
         gray_features: List of feature names to be colored gray in importance plot.
-        red_features: List of feature names to be colored red in importance plot.
-                      Features not in gray_features or red_features will be colored blue.
+                      Features not in this list will be colored blue.
     """
     y_train = y_train_df["VT/VF/SCD"]
     y_test = y_test_df["VT/VF/SCD"]
@@ -403,18 +402,10 @@ def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state
         importances = final_model.feature_importances_
         idx = np.argsort(importances)[::-1]
         
-        # Use provided feature lists or default to highlight certain features
-        if gray_features is not None or red_features is not None:
-            gray_features_set = set(gray_features) if gray_features is not None else set()
-            red_features_set = set(red_features) if red_features is not None else set()
-            colors = []
-            for i in idx:
-                if feat_names[i] in red_features_set:
-                    colors.append("red")
-                elif feat_names[i] in gray_features_set:
-                    colors.append("gray")
-                else:
-                    colors.append("blue")
+        # Use provided gray_features list or default to highlight certain features
+        if gray_features is not None:
+            gray_features_set = set(gray_features)
+            colors = ["gray" if feat_names[i] in gray_features_set else "blue" for i in idx]
         else:
             # Default behavior - highlight specific features
             highlight = {"LVEF", "NYHA"}
@@ -1230,8 +1221,8 @@ def sex_specific_model_inference(train_df, test_df, features, labels, survival_d
         df.loc[df["Female"] == 1, "pred_prob"] = prob_f
 
     # Feature importance visualization
-    plot_feature_importances(best_male, features, "Male Model Feature Importances", seed, gray_features, red_features)
-    plot_feature_importances(best_female, features, "Female Model Feature Importances", seed, gray_features, red_features)
+    plot_feature_importances(best_male, features, "Male Model Feature Importances", seed, gray_features)
+    plot_feature_importances(best_female, features, "Female Model Feature Importances", seed, gray_features)
 
     # Merge with survival data
     pred_labels = df[["MRN", "pred_label", "Female"]].drop_duplicates()
@@ -1258,7 +1249,7 @@ def sex_specific_model_inference(train_df, test_df, features, labels, survival_d
 
     return merged_df
 
-def sex_specific_full_inference(train_df, test_df, features, labels, survival_df, seed, gray_features=None, red_features=None):
+def sex_specific_full_inference(train_df, test_df, features, labels, survival_df, seed, gray_features=None):
     """
     Sex-specific full model inference function that handles survival analysis with updated column names.
     This function performs the complete pipeline including model training, prediction, 
@@ -1266,8 +1257,7 @@ def sex_specific_full_inference(train_df, test_df, features, labels, survival_df
     
     Args:
         gray_features: List of feature names to be colored gray in importance plots.
-        red_features: List of feature names to be colored red in importance plots.
-                     Features not in gray_features or red_features will be colored blue.
+                      Features not in this list will be colored blue.
     """
     train = train_df.copy()
     test = test_df.copy()
@@ -1304,8 +1294,8 @@ def sex_specific_full_inference(train_df, test_df, features, labels, survival_df
         df.loc[df["Female"] == 1, "pred_prob"] = prob_f
 
     # Feature importance visualization
-    plot_feature_importances(best_male, features, "Male Model Feature Importances", seed, gray_features, red_features)
-    plot_feature_importances(best_female, features, "Female Model Feature Importances", seed, gray_features, red_features)
+    plot_feature_importances(best_male, features, "Male Model Feature Importances", seed, gray_features)
+    plot_feature_importances(best_female, features, "Female Model Feature Importances", seed, gray_features)
 
     # Merge with survival data
     pred_labels = df[["MRN", "pred_label", "Female"]].drop_duplicates()
@@ -1371,7 +1361,7 @@ def sex_specific_full_inference(train_df, test_df, features, labels, survival_df
     return merged_df
 
 
-def sex_agnostic_model_inference(train_df, test_df, features, label_col, survival_df, seed, gray_features=None, red_features=None, use_undersampling=True):
+def sex_agnostic_model_inference(train_df, test_df, features, label_col, survival_df, seed, gray_features=None, use_undersampling=True):
     """
     Sex-agnostic model inference function that trains a single model on all data
     and performs survival analysis similar to sex-specific models.
@@ -1384,7 +1374,6 @@ def sex_agnostic_model_inference(train_df, test_df, features, label_col, surviva
         survival_df: Survival data
         seed: Random seed
         gray_features: List of features to color gray in importance plots
-        red_features: List of features to color red in importance plots
         use_undersampling: Whether to use undersampling for training
     
     Returns:
@@ -1410,7 +1399,7 @@ def sex_agnostic_model_inference(train_df, test_df, features, label_col, surviva
     plot_feature_importances(
         best_model, features, 
         "Sex-Agnostic Model Feature Importances", 
-        seed, gray_features, red_features
+        seed, gray_features
     )
     
     # Merge with survival data
