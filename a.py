@@ -1032,6 +1032,67 @@ def analyze_survival_by_four_groups(merged_df):
     return group_data
 
 
+def plot_km_curves_merged(merged_df):
+    """Plot Kaplan-Meier curves with merged survival analysis: Low Risk vs High Risk (all genders combined)."""
+    
+    # Create 1x2 subplot layout for PE and SE
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Define endpoints
+    endpoints = [
+        ("Primary Endpoint", "PE_Time", "PE"),
+        ("Secondary Endpoint", "SE_Time", "SE")
+    ]
+    
+    # Iterate through each endpoint
+    for ax_idx, (ep_name, ep_time_col, ep_event_col) in enumerate(endpoints):
+        ax = axes[ax_idx]
+        kmf = KaplanMeierFitter()
+        
+        # Plot low risk (pred_label = 0) and high risk (pred_label = 1) for all patients
+        for pred_val, risk_label, color in [(0, "Low Risk", "blue"), (1, "High Risk", "red")]:
+            risk_data = merged_df[merged_df["pred_label"] == pred_val]
+            
+            if risk_data.empty:
+                continue
+                
+            n_samples = len(risk_data)
+            events = risk_data[ep_event_col].sum()
+            label = f"{risk_label} (n={n_samples}, events={events})"
+            
+            kmf.fit(
+                durations=risk_data[ep_time_col],
+                event_observed=risk_data[ep_event_col],
+                label=label
+            )
+            kmf.plot(ax=ax, color=color)
+        
+        # Perform log-rank test between low and high risk groups
+        low_risk_data = merged_df[merged_df["pred_label"] == 0]
+        high_risk_data = merged_df[merged_df["pred_label"] == 1]
+        
+        if not low_risk_data.empty and not high_risk_data.empty:
+            lr_test = logrank_test(
+                low_risk_data[ep_time_col], high_risk_data[ep_time_col],
+                low_risk_data[ep_event_col], high_risk_data[ep_event_col]
+            )
+            # Add log-rank test result to bottom right corner
+            ax.text(0.95, 0.05, f"Log-rank p = {lr_test.p_value:.4f}", 
+                   transform=ax.transAxes, ha="right", va="bottom",
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+        
+        ax.set_title(f"{ep_name} - Combined Analysis")
+        ax.set_xlabel("Time (days)")
+        ax.set_ylabel("Survival Probability")
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+    
+    plt.suptitle("Merged Survival Analysis: Low Risk vs High Risk")
+    plt.tight_layout()
+    plt.show()
+    plt.close()
+
+
 def plot_km_curves_four_groups(merged_df):
     """Plot Kaplan-Meier curves in 2x2 layout: PE/SE rows, Male/Female columns."""
     
@@ -1102,7 +1163,7 @@ def plot_km_curves_four_groups(merged_df):
     plt.close()
 
 
-def inference_with_features(train_df, test_df, features, labels, survival_df, seed):
+def inference_with_features(train_df, test_df, features, labels, survival_df, seed, gray_features=None):
     """
     Simplified inference function:
     1. Train separate Random Forest models for male and female using provided features
@@ -1110,6 +1171,10 @@ def inference_with_features(train_df, test_df, features, labels, survival_df, se
     3. Perform survival analysis by gender and predicted label (4 groups total)
     4. Generate KM plots and logrank tests
     5. Show feature importance and incidence rates
+    
+    Args:
+        gray_features: List of feature names to be colored gray in importance plots.
+                      Features not in this list will be colored blue.
     """
     train = train_df.copy()
     test = test_df.copy()
@@ -1146,8 +1211,8 @@ def inference_with_features(train_df, test_df, features, labels, survival_df, se
         df.loc[df["Female"] == 1, "pred_prob"] = prob_f
 
     # Feature importance visualization
-    plot_feature_importances(best_male, features, "Male Model Feature Importances", seed)
-    plot_feature_importances(best_female, features, "Female Model Feature Importances", seed)
+    plot_feature_importances(best_male, features, "Male Model Feature Importances", seed, gray_features)
+    plot_feature_importances(best_female, features, "Female Model Feature Importances", seed, gray_features)
 
     # Merge with survival data
     pred_labels = df[["MRN", "pred_label", "Female"]].drop_duplicates()
@@ -1168,17 +1233,21 @@ def inference_with_features(train_df, test_df, features, labels, survival_df, se
                     se_rate = group_data["SE"].sum() / len(group_data)
                     print(f"{gender_name}-Pred{pred_val}: PE rate = {pe_rate:.4f}, SE rate = {se_rate:.4f}")
     
-    # Analyze and plot survival by the 4 groups
+    # Analyze and plot survival by merged groups (Low Risk vs High Risk)
     analyze_survival_by_four_groups(merged_df)
-    plot_km_curves_four_groups(merged_df)
+    plot_km_curves_merged(merged_df)
 
     return merged_df
 
-def full_model_inference(train_df, test_df, features, labels, survival_df, seed):
+def full_model_inference(train_df, test_df, features, labels, survival_df, seed, gray_features=None):
     """
     Full model inference function that handles survival analysis with updated column names.
     This function performs the complete pipeline including model training, prediction, 
     and survival analysis using the renamed PE and SE columns.
+    
+    Args:
+        gray_features: List of feature names to be colored gray in importance plots.
+                      Features not in this list will be colored blue.
     """
     train = train_df.copy()
     test = test_df.copy()
@@ -1215,8 +1284,8 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
         df.loc[df["Female"] == 1, "pred_prob"] = prob_f
 
     # Feature importance visualization
-    plot_feature_importances(best_male, features, "Male Model Feature Importances", seed)
-    plot_feature_importances(best_female, features, "Female Model Feature Importances", seed)
+    plot_feature_importances(best_male, features, "Male Model Feature Importances", seed, gray_features)
+    plot_feature_importances(best_female, features, "Female Model Feature Importances", seed, gray_features)
 
     # Merge with survival data
     pred_labels = df[["MRN", "pred_label", "Female"]].drop_duplicates()
@@ -1275,9 +1344,9 @@ def full_model_inference(train_df, test_df, features, labels, survival_df, seed)
             print(f"  Secondary Endpoint - Low Risk: {se_events_low}/{n_low} events (rate: {se_rate_low:.4f})")
             print(f"  Secondary Endpoint - High Risk: {se_events_high}/{n_high} events (rate: {se_rate_high:.4f})")
 
-    # Analyze and plot survival by the 4 groups
+    # Analyze and plot survival by merged groups (Low Risk vs High Risk)
     analyze_survival_by_four_groups(merged_df)
-    plot_km_curves_four_groups(merged_df)
+    plot_km_curves_merged(merged_df)
 
     return merged_df
 
@@ -1377,9 +1446,9 @@ def sex_agnostic_model_inference(train_df, test_df, features, label_col, surviva
         print(f"  Secondary Endpoint - Low Risk: {se_events_low}/{len(low_risk_data)} events (rate: {se_rate_low:.4f})")
         print(f"  Secondary Endpoint - High Risk: {se_events_high}/{len(high_risk_data)} events (rate: {se_rate_high:.4f})")
     
-    # Analyze and plot survival by the 4 groups (same as sex-specific models)
+    # Analyze and plot survival by merged groups (Low Risk vs High Risk)
     analyze_survival_by_four_groups(merged_df)
-    plot_km_curves_four_groups(merged_df)
+    plot_km_curves_merged(merged_df)
     
     return merged_df
 
