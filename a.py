@@ -306,11 +306,11 @@ print("Overall VT proportion:", df['ICD'].mean())
 print("Train VT proportion:", train_df['ICD'].mean())
 print("Test VT proportion:", test_df['ICD'].mean())
 
-def find_best_threshold(y_true, y_scores):
-    """Find the probability threshold that maximizes the F1 score."""
+def find_best_threshold(y_true, y_scores, beta=2.0):
+    """Find the probability threshold that maximizes the F-beta score."""
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_scores)
-    f1_scores = 2 * precisions * recalls / (precisions + recalls + 1e-8)
-    best_idx = np.nanargmax(f1_scores[:-1])
+    fbeta_scores = (1 + beta**2) * precisions * recalls / (beta**2 * precisions + recalls + 1e-8)
+    best_idx = np.nanargmax(fbeta_scores[:-1])
     return thresholds[best_idx]
 
 
