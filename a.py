@@ -9,6 +9,115 @@ from sklearn.model_selection import (
     RandomizedSearchCV,
     cross_val_predict
 )
+
+# ============================================================================
+# PyTorch Lightning 重复日志记录修复方案
+# ============================================================================
+
+def fix_duplicate_logging_in_model():
+    """
+    修复PyTorch Lightning模型中的重复日志记录问题
+    
+    错误: You called `self.log(val/focal_loss, ...)` twice in `validation_step` 
+          with different arguments. This is not allowed
+    
+    解决方案: 统一在_step方法中处理日志记录，validation_step只调用_step
+    """
+    
+    # 修复代码模板
+    fix_template = '''
+    def _step(self, batch, stage):
+        """统一处理所有阶段的日志记录"""
+        # 原有计算逻辑
+        logits, recon_loss, kl_loss = self(batch)
+        focal_loss = self.calculate_focal_loss(logits, batch)
+        
+        # 计算指标
+        probs = torch.sigmoid(logits)
+        preds = (probs > 0.5).int()
+        label = batch.get('label', batch.get('labels'))
+        
+        # 更新torchmetrics
+        if stage == "val":
+            if hasattr(self, 'val_auc'):
+                self.val_auc.update(probs, label)
+            if hasattr(self, 'val_auprc'):
+                self.val_auprc.update(probs, label)
+            if hasattr(self, 'val_acc'):
+                self.val_acc.update(preds, label)
+        
+        # 关键修改：统一记录所有指标
+        log_metrics = {
+            f"{stage}/focal_loss": focal_loss,
+            f"{stage}/recon_loss": recon_loss,
+            f"{stage}/kl_loss": kl_loss,
+            f"{stage}/total_loss": focal_loss + recon_loss + kl_loss,
+        }
+        
+        # 根据阶段选择日志参数
+        if stage == "train":
+            self.log_dict(log_metrics, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        else:  # val or test
+            self.log_dict(log_metrics, prog_bar=True, logger=True, on_step=False, on_epoch=True)
+        
+        # 处理splitdata模块冲突
+        if hasattr(self, 'splitdata_module') and stage == "val":
+            split_metrics = self._get_splitdata_metrics(batch)
+            if split_metrics:
+                split_log = {f"{stage}/split_{k}": v for k, v in split_metrics.items()}
+                self.log_dict(split_log, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+        
+        return logits, recon_loss, kl_loss
+
+    def validation_step(self, batch, batch_idx):
+        """简化的validation_step - 只调用_step，不再额外记录"""
+        # 删除所有原有的 self.log() 调用
+        logits, recon_loss, kl_loss = self._step(batch, "val")
+        return {"val_loss": recon_loss + kl_loss}
+    
+    def _get_splitdata_metrics(self, batch):
+        """处理splitdata模块指标，使用不同键名避免冲突"""
+        if not hasattr(self, 'splitdata_module'):
+            return {}
+        
+        metrics = {}
+        try:
+            if hasattr(self.splitdata_module, 'calculate_loss'):
+                metrics['focal_loss'] = self.splitdata_module.calculate_loss(batch)
+            if hasattr(self.splitdata_module, 'calculate_accuracy'):
+                metrics['accuracy'] = self.splitdata_module.calculate_accuracy(batch)
+        except Exception as e:
+            print(f"Warning: splitdata error: {e}")
+        
+        return metrics
+    '''
+    
+    print("PyTorch Lightning 重复日志记录修复模板:")
+    print("=" * 60)
+    print(fix_template)
+    print("\n修复要点:")
+    print("1. 在_step方法中统一处理所有日志记录")
+    print("2. validation_step只调用_step，删除所有self.log()调用")
+    print("3. splitdata模块使用val/split_*键名避免冲突")
+    print("4. 根据stage参数选择合适的日志记录参数")
+    
+    return fix_template
+
+def apply_fix_to_seqsetvae_model(model_file_path):
+    """
+    将修复应用到SeqSetVAE模型文件
+    
+    Args:
+        model_file_path: 模型文件路径，如 '/path/to/SeqSetVAE/main/model.py'
+    """
+    print(f"应用修复到模型文件: {model_file_path}")
+    print("\n需要手动修改的步骤:")
+    print("1. 找到_step方法，按模板重构日志记录逻辑")
+    print("2. 找到validation_step方法，删除所有self.log()调用")
+    print("3. 添加_get_splitdata_metrics方法处理模块冲突")
+    print("4. 测试运行确认不再出现重复日志记录错误")
+    
+    return "修复模板已生成，请手动应用到模型文件"
 from sklearn.utils import resample
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
@@ -52,6 +161,33 @@ import numpy as np
 import pandas as pd
 from math import ceil
 from scipy.stats import randint
+
+# ============================================================================
+# 调用实例和使用说明
+# ============================================================================
+
+def main_fix_example():
+    """
+    主函数：演示如何使用修复方案
+    """
+    print("SeqSetVAE PyTorch Lightning 重复日志记录修复")
+    print("=" * 60)
+    
+    # 1. 显示修复模板
+    fix_template = fix_duplicate_logging_in_model()
+    
+    # 2. 应用修复到具体模型文件
+    model_path = "/home/sunx/data/aiiih/projects/sunx/projects/SeqSetVAE/main/model.py"
+    result = apply_fix_to_seqsetvae_model(model_path)
+    print(f"\n修复结果: {result}")
+    
+    # 3. 验证步骤
+    print("\n验证修复是否成功:")
+    print("1. 运行训练脚本: python main/train.py")
+    print("2. 检查是否还出现重复日志记录错误")
+    print("3. 确认tensorboard中指标正常显示")
+    
+    return "修复完成"
 
 def CG_equation(age, weight, female, serum_creatinine):
     """Cockcroft-Gault Equation."""
