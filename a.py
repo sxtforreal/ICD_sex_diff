@@ -22,6 +22,7 @@ from sklearn.metrics import (
     confusion_matrix,
     recall_score
 )
+from sklearn.calibration import CalibratedClassifierCV
 import sklearn.neighbors._base
 from scipy.stats import randint
 from lifelines import KaplanMeierFitter
@@ -306,11 +307,11 @@ print("Overall VT proportion:", df['ICD'].mean())
 print("Train VT proportion:", train_df['ICD'].mean())
 print("Test VT proportion:", test_df['ICD'].mean())
 
-def find_best_threshold(y_true, y_scores):
-    """Find the probability threshold that maximizes the F1 score."""
+def find_best_threshold(y_true, y_scores, beta=2.0):
+    """Find the probability threshold that maximizes the F-beta score."""
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_scores)
-    f1_scores = 2 * precisions * recalls / (precisions + recalls + 1e-8)
-    best_idx = np.nanargmax(f1_scores[:-1])
+    fbeta_scores = (1 + beta**2) * precisions * recalls / (beta**2 * precisions + recalls + 1e-8)
+    best_idx = np.nanargmax(fbeta_scores[:-1])
     return thresholds[best_idx]
 
 
@@ -490,29 +491,49 @@ def evaluate_model_performance(y_true, y_pred, y_prob, mask_m, mask_f, overall_m
     }
 
 
-def create_undersampled_dataset(train_df, label_col, random_state):
-    """Create balanced dataset using undersampling."""
-    n_male = (train_df["Female"] == 0).sum()
-    n_female = (train_df["Female"] == 1).sum()
-    n_target = ceil((n_male + n_female) / 2)
+def create_undersampled_dataset(train_df, label_col, random_state, pos_to_neg_ratio=1.0):
+    """Create per-sex undersampled dataset with desired positive:negative ratio (default 1:1).
     
+    Only undersamples the majority class within each sex group; does not oversample.
+    Args:
+        train_df: DataFrame containing training data
+        label_col: Target column name
+        random_state: Random seed
+        pos_to_neg_ratio: Desired positive:negative ratio (e.g., 1.0 means 1:1)
+    """
     sampled_parts = []
     for sex_val in (0, 1):
         grp = train_df[train_df["Female"] == sex_val]
+        if grp.empty:
+            continue
         pos = grp[grp[label_col] == 1]
         neg = grp[grp[label_col] == 0]
-        
-        pos_n_target = int(round(len(pos) / len(grp) * n_target))
-        neg_n_target = n_target - pos_n_target
-        
-        replace_pos = pos_n_target > len(pos)
-        replace_neg = neg_n_target > len(neg)
-        
-        samp_pos = pos.sample(n=pos_n_target, replace=replace_pos, random_state=random_state)
-        samp_neg = neg.sample(n=neg_n_target, replace=replace_neg, random_state=random_state)
-        
+        P, N = len(pos), len(neg)
+        if P == 0 or N == 0:
+            # Cannot balance within this group; keep all to avoid losing data
+            sampled_parts.append(grp.copy())
+            continue
+        r = float(pos_to_neg_ratio) if pos_to_neg_ratio > 0 else 1.0
+        if r >= 1.0:
+            # Want pos:neg = r, undersample majority
+            target_pos = min(P, int(np.floor(r * N)))
+            if target_pos <= 0:
+                target_pos = min(P, 1)
+            target_neg = min(N, int(np.floor(target_pos / r)))
+            if target_neg <= 0:
+                target_neg = min(N, 1)
+        else:
+            # r < 1 -> more negatives than positives in target
+            target_neg = min(N, int(np.floor(P / r)))
+            if target_neg <= 0:
+                target_neg = min(N, 1)
+            target_pos = min(P, int(np.floor(r * target_neg)))
+            if target_pos <= 0:
+                target_pos = min(P, 1)
+        # Sample without replacement (pure undersampling)
+        samp_pos = pos.sample(n=target_pos, replace=False, random_state=random_state)
+        samp_neg = neg.sample(n=target_neg, replace=False, random_state=random_state)
         sampled_parts.append(pd.concat([samp_pos, samp_neg]))
-    
     return pd.concat(sampled_parts).sample(frac=1, random_state=random_state).reset_index(drop=True)
 
 
@@ -820,11 +841,15 @@ def train_sex_specific_model(X_train, y_train, features, seed):
     best_model = search.best_estimator_
     print("Best hyperparameters:", search.best_params_)
     
-    # Use cross-validation to determine threshold
-    cv_probs = cross_val_predict(best_model, X_train, y_train, cv=5, method='predict_proba')[:, 1]
+    # Calibrate probabilities with cross-validation on training data
+    calibrated = CalibratedClassifierCV(estimator=best_model, method='isotonic', cv=5)
+    calibrated.fit(X_train, y_train)
+    
+    # Use cross-validation to determine threshold on calibrated probabilities
+    cv_probs = cross_val_predict(calibrated, X_train, y_train, cv=5, method='predict_proba')[:, 1]
     best_threshold = find_best_threshold(y_train, cv_probs)
     
-    return best_model, best_threshold
+    return calibrated, best_threshold
 
 
 def train_sex_agnostic_model(train_df, features, label_col, seed, use_undersampling=True):
@@ -887,11 +912,15 @@ def train_sex_agnostic_model(train_df, features, label_col, seed, use_undersampl
     best_model = search.best_estimator_
     print("Best hyperparameters:", search.best_params_)
     
-    # Use cross-validation to determine threshold
-    cv_probs = cross_val_predict(best_model, X_train, y_train, cv=5, method='predict_proba')[:, 1]
+    # Calibrate probabilities with cross-validation on training data
+    calibrated = CalibratedClassifierCV(estimator=best_model, method='isotonic', cv=5)
+    calibrated.fit(X_train, y_train)
+    
+    # Use cross-validation to determine threshold on calibrated probabilities
+    cv_probs = cross_val_predict(calibrated, X_train, y_train, cv=5, method='predict_proba')[:, 1]
     best_threshold = find_best_threshold(y_train, cv_probs)
     
-    return best_model, best_threshold
+    return calibrated, best_threshold
 
 
 def plot_feature_importances(model, features, title, seed, gray_features=None, red_features=None):
@@ -902,7 +931,26 @@ def plot_feature_importances(model, features, title, seed, gray_features=None, r
         red_features: List of feature names to be colored red.
                      Features not in gray_features or red_features will be colored blue.
     """
-    importances = model.feature_importances_
+    # Obtain importances, supporting calibrated models
+    if hasattr(model, "feature_importances_"):
+        importances = model.feature_importances_
+    elif isinstance(model, CalibratedClassifierCV):
+        importances_list = []
+        for cc in getattr(model, "calibrated_classifiers_", []):
+            base = getattr(cc, "base_estimator", None)
+            if base is not None and hasattr(base, "feature_importances_"):
+                importances_list.append(base.feature_importances_)
+        if len(importances_list) > 0:
+            importances = np.mean(importances_list, axis=0)
+        else:
+            base = getattr(model, "estimator", None)
+            if base is not None and hasattr(base, "feature_importances_"):
+                importances = base.feature_importances_
+            else:
+                importances = np.zeros(len(features))
+    else:
+        importances = np.zeros(len(features))
+    
     idx = np.argsort(importances)[::-1]
     sorted_features = [features[i] for i in idx]
     
@@ -935,10 +983,16 @@ def plot_feature_importances(model, features, title, seed, gray_features=None, r
     plt.title(title)
     # Add legend
     from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor='red', label='guideline features'),
-                      Patch(facecolor='gray', label='standard cmr features'),
-                      Patch(facecolor='blue', label='advanced cmr features')]
-    plt.legend(handles=legend_elements, loc='upper right')
+    present_colors = set(colors)
+    legend_elements = []
+    if 'red' in present_colors:
+        legend_elements.append(Patch(facecolor='red', label='guideline features'))
+    if 'gray' in present_colors:
+        legend_elements.append(Patch(facecolor='gray', label='standard cmr features'))
+    if 'blue' in present_colors:
+        legend_elements.append(Patch(facecolor='blue', label='advanced cmr features'))
+    if len(legend_elements) > 0:
+        plt.legend(handles=legend_elements, loc='upper right')
     plt.tight_layout()
     plt.show()
 
@@ -1402,15 +1456,18 @@ def sex_agnostic_model_inference(train_df, test_df, features, label_col, surviva
     """
     test = test_df.copy()
     
+    # Remove sex indicator for sex-agnostic training/inference
+    used_features = [f for f in features if f != "Female"]
+    
     # Train sex-agnostic model
     print("Training Sex-Agnostic Model...")
     best_model, best_threshold = train_sex_agnostic_model(
-        train_df, features, label_col, seed, use_undersampling
+        train_df, used_features, label_col, seed, use_undersampling
     )
     print(f"Optimal probability threshold determined from training data: {best_threshold:.4f}")
     
     # Make predictions on test set
-    test_probs = best_model.predict_proba(test[features])[:, 1]
+    test_probs = best_model.predict_proba(test[used_features])[:, 1]
     print(f"Test probabilities – min: {test_probs.min():.4f}, max: {test_probs.max():.4f}, mean: {test_probs.mean():.4f}")
     test_preds = (test_probs >= best_threshold).astype(int)
     
@@ -1420,7 +1477,7 @@ def sex_agnostic_model_inference(train_df, test_df, features, label_col, surviva
     
     # Feature importance visualization
     plot_feature_importances(
-        best_model, features, 
+        best_model, used_features, 
         "Sex-Agnostic Model Feature Importances", 
         seed, gray_features, red_features
     )
