@@ -933,6 +933,12 @@ def plot_feature_importances(model, features, title, seed, gray_features=None, r
     plt.xlabel("Feature")
     plt.ylabel("Importance")
     plt.title(title)
+    # Add legend
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor='red', label='guideline features'),
+                      Patch(facecolor='gray', label='standard cmr features'),
+                      Patch(facecolor='blue', label='advanced cmr features')]
+    plt.legend(handles=legend_elements, loc='upper right')
     plt.tight_layout()
     plt.show()
 
@@ -1401,9 +1407,11 @@ def sex_agnostic_model_inference(train_df, test_df, features, label_col, surviva
     best_model, best_threshold = train_sex_agnostic_model(
         train_df, features, label_col, seed, use_undersampling
     )
+    print(f"Optimal probability threshold determined from training data: {best_threshold:.4f}")
     
     # Make predictions on test set
     test_probs = best_model.predict_proba(test[features])[:, 1]
+    print(f"Test probabilities – min: {test_probs.min():.4f}, max: {test_probs.max():.4f}, mean: {test_probs.mean():.4f}")
     test_preds = (test_probs >= best_threshold).astype(int)
     
     # Add predictions to test dataframe
