@@ -419,10 +419,18 @@ def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state
                     colors.append("gray")
                 else:
                     colors.append("blue")
+            # Add legend mapping to categories
+            from matplotlib.patches import Patch
+            legend_handles = [
+                Patch(facecolor="red", edgecolor="red", label="guideline features"),
+                Patch(facecolor="gray", edgecolor="gray", label="standard cmr features"),
+                Patch(facecolor="blue", edgecolor="blue", label="advanced cmr features"),
+            ]
         else:
             # Default behavior - highlight specific features
             highlight = {"LVEF", "NYHA"}
             colors = ["red" if feat_names[i] in highlight else "lightgray" for i in idx]
+            legend_handles = None
         
         plt.figure(figsize=(8, 4))
         plt.bar(range(len(feat_names)), importances[idx], color=colors)
@@ -430,6 +438,8 @@ def rf_evaluate(X_train, y_train_df, X_test, y_test_df, feat_names, random_state
         plt.xlabel("Feature")
         plt.ylabel("Importance")
         plt.title("Feature Importances")
+        if legend_handles is not None:
+            plt.legend(handles=legend_handles, loc="upper right")
         plt.tight_layout()
         plt.show()
     
@@ -890,6 +900,13 @@ def train_sex_agnostic_model(train_df, features, label_col, seed, use_undersampl
     # Use cross-validation to determine threshold
     cv_probs = cross_val_predict(best_model, X_train, y_train, cv=5, method='predict_proba')[:, 1]
     best_threshold = find_best_threshold(y_train, cv_probs)
+    # Diagnostics for threshold/probabilities
+    try:
+        print(f"[Sex-agnostic train] best_threshold={best_threshold:.4f}; cv_probs min/50th/90th/max="
+              f"{cv_probs.min():.4f}/{np.median(cv_probs):.4f}/{np.percentile(cv_probs,90):.4f}/{cv_probs.max():.4f}")
+        print(f"[Sex-agnostic train] pos_rate={y_train.mean():.4f}; frac_above_thr={(cv_probs >= best_threshold).mean():.4f}")
+    except Exception:
+        pass
     
     return best_model, best_threshold
 
@@ -918,6 +935,13 @@ def plot_feature_importances(model, features, title, seed, gray_features=None, r
                 colors.append("gray")
             else:
                 colors.append("blue")
+        # Legend mapping
+        from matplotlib.patches import Patch
+        legend_handles = [
+            Patch(facecolor="red", edgecolor="red", label="guideline features"),
+            Patch(facecolor="gray", edgecolor="gray", label="standard cmr features"),
+            Patch(facecolor="blue", edgecolor="blue", label="advanced cmr features"),
+        ]
     else:
         # Default coloring scheme
         colors = [
@@ -926,6 +950,7 @@ def plot_feature_importances(model, features, title, seed, gray_features=None, r
             else "lightgray"
             for f in sorted_features
         ]
+        legend_handles = None
     
     plt.figure(figsize=(8, 4))
     plt.bar(range(len(sorted_features)), importances[idx], color=colors)
@@ -933,6 +958,8 @@ def plot_feature_importances(model, features, title, seed, gray_features=None, r
     plt.xlabel("Feature")
     plt.ylabel("Importance")
     plt.title(title)
+    if legend_handles is not None:
+        plt.legend(handles=legend_handles, loc="upper right")
     plt.tight_layout()
     plt.show()
 
@@ -1405,6 +1432,14 @@ def sex_agnostic_model_inference(train_df, test_df, features, label_col, surviva
     # Make predictions on test set
     test_probs = best_model.predict_proba(test[features])[:, 1]
     test_preds = (test_probs >= best_threshold).astype(int)
+    # Diagnostics for test probabilities
+    try:
+        print(f"[Sex-agnostic test] using threshold={best_threshold:.4f}; test_probs min/50th/90th/max="
+              f"{test_probs.min():.4f}/{np.median(test_probs):.4f}/{np.percentile(test_probs,90):.4f}/{test_probs.max():.4f}")
+        if (test_preds == 0).all():
+            print("WARNING: All predictions are Low Risk. Check feature scaling, class imbalance, and threshold selection.")
+    except Exception:
+        pass
     
     # Add predictions to test dataframe
     test["pred_label"] = test_preds
