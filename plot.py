@@ -22,6 +22,20 @@ def plot_metrics_with_ci_groups(df):
     if num_rows % 3 != 0:
         raise ValueError("Input table must have rows in multiples of 3: [All, Male, Female] per metric")
 
+    # Filter to keep only AUC, specificity, and sensitivity
+    allowed_keywords = ["auc", "auroc", "specificity", "sensitivity"]
+    keep_metric_indices = []
+    total_metrics = num_rows // 3
+    for metric_index in range(total_metrics):
+        raw_metric_label = str(df.iloc[metric_index * 3, 0])
+        metric_label = re.split(r"\s*[-–—]\s*", raw_metric_label)[0].lower()
+        if any(keyword in metric_label for keyword in allowed_keywords):
+            keep_metric_indices.append(metric_index)
+    if not keep_metric_indices:
+        raise ValueError("No metrics matching AUC, specificity, or sensitivity were found.")
+    df = pd.concat([df.iloc[i * 3 : i * 3 + 3] for i in keep_metric_indices], ignore_index=True)
+    num_rows = len(df)
+
     models = df.columns[1:]
     num_models = len(models)
     group_names = ["all", "male", "female"]
