@@ -983,10 +983,16 @@ def plot_feature_importances(model, features, title, seed, gray_features=None, r
     plt.title(title)
     # Add legend
     from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor='red', label='guideline features'),
-                      Patch(facecolor='gray', label='standard cmr features'),
-                      Patch(facecolor='blue', label='advanced cmr features')]
-    plt.legend(handles=legend_elements, loc='upper right')
+    present_colors = set(colors)
+    legend_elements = []
+    if 'red' in present_colors:
+        legend_elements.append(Patch(facecolor='red', label='guideline features'))
+    if 'gray' in present_colors:
+        legend_elements.append(Patch(facecolor='gray', label='standard cmr features'))
+    if 'blue' in present_colors:
+        legend_elements.append(Patch(facecolor='blue', label='advanced cmr features'))
+    if len(legend_elements) > 0:
+        plt.legend(handles=legend_elements, loc='upper right')
     plt.tight_layout()
     plt.show()
 
