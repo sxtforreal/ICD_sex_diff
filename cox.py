@@ -311,22 +311,56 @@ def generate_tableone_by_sex_icd(
     # Fallback summary if TableOne is not available
     try:
         numeric_cols = [c for c in variables if pd.api.types.is_numeric_dtype(df_local[c])]
-        parts = []
-        for grp_name in group_order:
-            grp = df_local[df_local["Group"] == grp_name]
-            if grp.empty:
-                continue
-            desc = grp[numeric_cols].describe().T
-            desc.insert(0, "group", grp_name)
-            parts.append(desc)
-        if parts:
-            fallback_df = pd.concat(parts, axis=0)
-            print("==== Numeric summary by group (fallback) ====")
-            print(fallback_df.head())
-            if output_excel_path:
-                os.makedirs(os.path.dirname(output_excel_path), exist_ok=True)
-                fallback_df.to_excel(output_excel_path)
-                print(f"Saved fallback summary to: {output_excel_path}")
+
+        if len(numeric_cols) == 0:
+            return
+
+        # Build a wide table with groups as columns to mirror TableOne orientation
+        # Columns order: Missing | Overall | Male-ICD | Male-No ICD | Female-ICD | Female-No ICD
+        col_order = ["Missing", "Overall"] + group_order
+
+        summary_rows: Dict[str, Dict[str, object]] = {}
+        for var in numeric_cols:
+            row: Dict[str, object] = {}
+
+            # Missing count overall
+            row["Missing"] = int(pd.to_numeric(df_local[var], errors="coerce").isna().sum())
+
+            # Overall summary as "mean (sd)"
+            overall_series = pd.to_numeric(df_local[var], errors="coerce")
+            overall_mean = overall_series.mean()
+            overall_std = overall_series.std()
+            if pd.isna(overall_mean):
+                row["Overall"] = ""
+            else:
+                row["Overall"] = f"{overall_mean:.1f} ({overall_std:.1f})"
+
+            # Per-group summaries
+            for grp_name in group_order:
+                grp_series = pd.to_numeric(
+                    df_local.loc[df_local["Group"] == grp_name, var], errors="coerce"
+                )
+                valid = grp_series.dropna()
+                if valid.empty:
+                    row[grp_name] = ""
+                else:
+                    m = valid.mean()
+                    s = valid.std()
+                    row[grp_name] = f"{m:.1f} ({s:.1f})"
+
+            summary_rows[var] = row
+
+        fallback_df = pd.DataFrame.from_dict(summary_rows, orient="index")
+        # Ensure consistent column order
+        fallback_df = fallback_df.reindex(columns=col_order)
+
+        print("==== Numeric summary by group (fallback) ====")
+        print(fallback_df.head())
+
+        if output_excel_path:
+            os.makedirs(os.path.dirname(output_excel_path), exist_ok=True)
+            fallback_df.to_excel(output_excel_path)
+            print(f"Saved fallback summary to: {output_excel_path}")
     except Exception as e:
         warnings.warn(f"[TableOne Fallback] Failed to generate summary: {e}")
 
