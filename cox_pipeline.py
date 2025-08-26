@@ -745,6 +745,13 @@ if __name__ == "__main__":
     print("Saved Excel:", export_path)
     
     # Run inference
-    
-    
-    
+    tr, te = train_test_split(
+        df, test_size=0.3, random_state=0, stratify=df["VT/VF/SCD"]
+    )
+    features = FEATURE_SETS["Benchmark"]
+
+    print("Running sex-agnostic inference (includes Female; undersampling=True)...")
+    _ = sex_agnostic_inference(tr, te, features, use_undersampling=True)
+
+    print("Running sex-specific inference (excludes Female in submodels)...")
+    _ = sex_specific_inference(tr, te, features)
