@@ -397,12 +397,16 @@ def sex_specific_full_inference(
         te_m = out[out["Female"] == 0]
         risk_m = predict_risk(models["male"], te_m, used_features)
         out.loc[out["Female"] == 0, "pred_prob"] = risk_m
-        out.loc[out["Female"] == 0, "pred_label"] = (risk_m >= thresholds["male"]).astype(int)
+        out.loc[out["Female"] == 0, "pred_label"] = (
+            risk_m >= thresholds["male"]
+        ).astype(int)
     if "female" in models and not out[out["Female"] == 1].empty:
         te_f = out[out["Female"] == 1]
         risk_f = predict_risk(models["female"], te_f, used_features)
         out.loc[out["Female"] == 1, "pred_prob"] = risk_f
-        out.loc[out["Female"] == 1, "pred_label"] = (risk_f >= thresholds["female"]).astype(int)
+        out.loc[out["Female"] == 1, "pred_label"] = (
+            risk_f >= thresholds["female"]
+        ).astype(int)
 
     merged_df = (
         out[["MRN", "Female", "pred_label", "PE_Time", "VT/VF/SCD"]]
@@ -474,7 +478,9 @@ def sex_agnostic_full_inference(
     - Dichotomizes risk by overall median
     """
     used_features = features
-    df_base = create_undersampled_dataset(df, label_col, 42) if use_undersampling else df
+    df_base = (
+        create_undersampled_dataset(df, label_col, 42) if use_undersampling else df
+    )
     data = df_base.dropna(subset=["PE_Time", label_col]).copy()
     if data.empty:
         return pd.DataFrame()
@@ -858,6 +864,7 @@ def run_cox_experiments(
                 try:
                     mask_m = te["Female"].values == 0
                     mask_f = te["Female"].values == 1
+
                     # Safety: ensure finite and sufficient variation
                     def _safe_cidx(t, e, r):
                         try:
@@ -995,10 +1002,26 @@ if __name__ == "__main__":
     )
     print("Saved Excel:", export_path)
 
-    # Full-data inference and analysis
+    # Full-data inference and analysis - Guideline
+    features = FEATURE_SETS["Guideline"]
+    print("Running sex-agnostic full-data inference (includes Female)...")
+    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+
+    print("Running sex-specific full-data inference (excludes Female in submodels)...")
+    _ = sex_specific_full_inference(df, features)
+
+    # Full-data inference and analysis - Benchmark
     features = FEATURE_SETS["Benchmark"]
-    print("Running sex-agnostic full-data inference (includes Female; undersampling=True)...")
-    _ = sex_agnostic_full_inference(df, features, use_undersampling=True)
+    print("Running sex-agnostic full-data inference (includes Female)...")
+    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+
+    print("Running sex-specific full-data inference (excludes Female in submodels)...")
+    _ = sex_specific_full_inference(df, features)
+
+    # Full-data inference and analysis - Proposed
+    features = FEATURE_SETS["Proposed"]
+    print("Running sex-agnostic full-data inference (includes Female)...")
+    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
 
     print("Running sex-specific full-data inference (excludes Female in submodels)...")
     _ = sex_specific_full_inference(df, features)
