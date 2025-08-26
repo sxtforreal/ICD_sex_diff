@@ -15,82 +15,87 @@ def parse_value(s):
         return float("nan"), float("nan"), float("nan")
 
 
-# Function to create subplots per metric, x-axis = [all, male, female]; color = model
-def plot_metrics_with_ci_groups(df):
-    # Expect rows repeating by [All, Male, Female] for each metric
-    num_rows = len(df)
-    if num_rows % 3 != 0:
-        raise ValueError("Input table must have rows in multiples of 3: [All, Male, Female] per metric")
+def _standardize_group_columns(columns):
+    """Return group column order matching [all, male, female] if present.
 
-    # Filter to keep only AUC, specificity, and sensitivity
-    allowed_keywords = ["auc", "auroc", "specificity", "sensitivity"]
-    keep_metric_indices = []
-    total_metrics = num_rows // 3
-    for metric_index in range(total_metrics):
-        raw_metric_label = str(df.iloc[metric_index * 3, 0])
-        metric_label = re.split(r"\s*[-–—]\s*", raw_metric_label)[0].lower()
-        if any(keyword in metric_label for keyword in allowed_keywords):
-            keep_metric_indices.append(metric_index)
-    if not keep_metric_indices:
-        raise ValueError("No metrics matching AUC, specificity, or sensitivity were found.")
-    df = pd.concat([df.iloc[i * 3 : i * 3 + 3] for i in keep_metric_indices], ignore_index=True)
-    num_rows = len(df)
+    The incoming DataFrame may have group columns in any case; we will
+    map them case-insensitively and return the exact column names from the
+    DataFrame in the standard order. Missing columns are ignored.
+    """
+    canonical_order = ["all", "male", "female"]
+    lower_to_actual = {str(c).lower(): c for c in columns}
+    ordered = [lower_to_actual[c] for c in canonical_order if c in lower_to_actual]
+    if not ordered:
+        raise ValueError("Expected group columns like 'all', 'male', 'female'.")
+    return ordered
 
-    models = df.columns[1:]
+
+# Create a single subplot for one metric from a table like image1:
+# rows = "<Model> - Sex-agnostic/Specific", columns = groups [all, male, female]
+def plot_single_metric_from_rows_table(
+    df: pd.DataFrame,
+    metric_title: str = "AUC",
+    variant_preference: str = "Sex-specific",
+):
+    # Identify first column as row-name column and following columns as groups
+    row_name_col = df.columns[0]
+    group_cols = _standardize_group_columns(df.columns[1:])
+
+    # Prefer variant rows per user setting; fallback if not present
+    preferred_mask = df[row_name_col].str.contains(variant_preference, case=False, na=False)
+    selected = df[preferred_mask]
+    if selected.empty:
+        alt = "Sex-agnostic" if variant_preference.lower() == "sex-specific" else "Sex-specific"
+        selected = df[df[row_name_col].str.contains(alt, case=False, na=False)]
+    if selected.empty:
+        raise ValueError("Could not find rows containing 'Sex-specific' or 'Sex-agnostic'.")
+
+    # Clean model names and optional mapping to nicer labels
+    def extract_model(label: str) -> str:
+        model = re.split(r"\s*[-–—]\s*", str(label))[0].strip()
+        mapping = {"Guideline": "Guideline", "Benchmark": "Standard CMR", "Proposed": "Advanced CMR"}
+        return mapping.get(model, model)
+
+    selected = selected.copy()
+    selected["__model_label__"] = selected[row_name_col].apply(extract_model)
+
+    models = list(selected["__model_label__"].values)
     num_models = len(models)
-    group_names = ["all", "male", "female"]
-    model_colors = sns.color_palette("Set2", n_colors=num_models)
-
-    num_metrics = num_rows // 3
+    group_names = [str(c).lower() for c in group_cols]
 
     sns.set_theme(style="whitegrid")
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
 
-    fig, axs = plt.subplots(1, num_metrics, figsize=(5 * num_metrics, 6), sharey=True)
-    if num_metrics == 1:
-        axs = [axs]
+    x = np.arange(len(group_cols))
+    width = 0.8 / max(num_models, 1)
+    colors = sns.color_palette("Set2", n_colors=num_models)
 
-    for metric_index in range(num_metrics):
-        # Rows for this metric: All, Male, Female (in order)
-        subset = df.iloc[metric_index * 3 : metric_index * 3 + 3]
+    # Bars: color by model, grouped by groups
+    for model_idx, (_, row) in enumerate(selected.iterrows()):
+        means, lowers, uppers = [], [], []
+        for gc in group_cols:
+            mean, lower, upper = parse_value(row[gc])
+            means.append(mean)
+            lowers.append(mean - lower)
+            uppers.append(upper - mean)
 
-        # Derive a clean metric title from the first column value
-        raw_metric_label = str(subset.iloc[0, 0])
-        metric_label = re.split(r"\s*[-–—]\s*", raw_metric_label)[0]
+        ax.bar(
+            x + model_idx * width - (num_models - 1) / 2.0 * width,
+            means,
+            width,
+            color=colors[model_idx],
+            yerr=[lowers, uppers],
+            capsize=3,
+            label=models[model_idx],
+        )
 
-        # x-axis: groups (all, male, female)
-        x = np.arange(len(group_names))
-        width = 0.8 / max(num_models, 1)
+    ax.set_xticks(x)
+    ax.set_xticklabels(group_names, ha="center", fontsize=9)
+    ax.set_ylabel("Metric Value")
+    ax.set_title(metric_title)
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
 
-        ax = axs[metric_index]
-
-        # For each model, draw bars across groups, color by model
-        for model_idx, model in enumerate(models):
-            means, lowers, uppers = [], [], []
-            for group_idx in range(len(group_names)):
-                val = subset.iloc[group_idx][model]
-                mean, lower, upper = parse_value(val)
-                means.append(mean)
-                lowers.append(mean - lower)
-                uppers.append(upper - mean)
-
-            ax.bar(
-                x + model_idx * width - (num_models - 1) / 2.0 * width,
-                means,
-                width,
-                color=model_colors[model_idx],
-                yerr=[lowers, uppers],
-                capsize=3,
-                label=model,
-            )
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(group_names, ha="center", fontsize=9)
-        ax.set_ylabel("Metric Value")
-        ax.set_title(metric_label)
-        ax.grid(axis="y", linestyle="--", alpha=0.3)
-
-    # Shared legend above plots (models)
-    handles, labels = axs[0].get_legend_handles_labels()
+    handles, labels = ax.get_legend_handles_labels()
     fig.legend(
         handles,
         labels,
@@ -108,4 +113,4 @@ if __name__ == "__main__":
     table = pd.read_excel(
         "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/scmr_table.xlsx"
     )
-    plot_metrics_with_ci_groups(table)
+    plot_single_metric_from_rows_table(table, metric_title="AUC", variant_preference="Sex-specific")
