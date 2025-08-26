@@ -103,9 +103,82 @@ def plot_metrics_with_ci_groups(df):
     plt.show()
 
 
+def plot_single_metric_rows_as_models(df, metric_title="Metric"):
+    """
+    Plot a single metric from a table where:
+    - Column 0 contains row names (treated as model labels)
+    - Remaining columns are groups (e.g., ["all", "male", "female"]) and
+      each cell is a string formatted as "mean (lower, upper)".
+
+    This produces a single subplot with grouped bars by group on the x-axis
+    and different colors per model, including symmetric error bars derived
+    from the provided confidence intervals.
+    """
+
+    if df.shape[1] < 2:
+        raise ValueError("Expected at least two columns: row labels and one group column")
+
+    # Identify names
+    model_labels = [str(v) for v in df.iloc[:, 0].tolist()]
+    group_names = [str(c) for c in df.columns[1:]]
+
+    num_models = len(model_labels)
+    num_groups = len(group_names)
+
+    sns.set_theme(style="whitegrid")
+    fig, ax = plt.subplots(1, 1, figsize=(6.5, 6))
+
+    x = np.arange(num_groups)
+    width = 0.8 / max(num_models, 1)
+    model_colors = sns.color_palette("Set2", n_colors=num_models)
+
+    for model_index, model_label in enumerate(model_labels):
+        row = df.iloc[model_index]
+
+        means_for_groups = []
+        lower_errors_for_groups = []
+        upper_errors_for_groups = []
+
+        for group_name in group_names:
+            mean, lower, upper = parse_value(row[group_name])
+            means_for_groups.append(mean)
+            lower_errors_for_groups.append(mean - lower)
+            upper_errors_for_groups.append(upper - mean)
+
+        ax.bar(
+            x + model_index * width - (num_models - 1) / 2.0 * width,
+            means_for_groups,
+            width,
+            color=model_colors[model_index],
+            yerr=[lower_errors_for_groups, upper_errors_for_groups],
+            capsize=3,
+            label=model_label,
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(group_names, ha="center", fontsize=9)
+    ax.set_ylabel("Metric Value")
+    ax.set_title(metric_title)
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=min(len(labels), 4),
+        bbox_to_anchor=(0.5, 1.05),
+    )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.show()
+
+
 if __name__ == "__main__":
     # Load the table
     table = pd.read_excel(
         "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/scmr_table.xlsx"
     )
-    plot_metrics_with_ci_groups(table)
+    # For DataFrames shaped like image1 (rows=models, columns=[all, male, female])
+    # produce a single-subplot grouped bar chart.
+    plot_single_metric_rows_as_models(table, metric_title="AUC")
