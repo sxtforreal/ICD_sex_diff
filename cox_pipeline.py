@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 from lifelines import CoxPHFitter, KaplanMeierFitter
 from lifelines.statistics import logrank_test
 from lifelines.utils import concordance_index
+from lifelines.exceptions import ConvergenceError
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -150,6 +151,41 @@ def plot_km_curves_four_groups(merged_df: pd.DataFrame) -> None:
     plt.show()
 
 
+# Drop constant/duplicate/highly correlated columns to mitigate singular matrices
+def _sanitize_cox_features_matrix(
+    df: pd.DataFrame, feature_cols: List[str], corr_threshold: float = 0.995
+) -> Tuple[pd.DataFrame, List[str]]:
+    X = df[feature_cols].copy()
+    for c in X.columns:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
+
+    # Drop columns with all missing or only one unique non-nan value
+    nunique = X.nunique(dropna=True)
+    constant_cols = nunique[nunique <= 1].index.tolist()
+    X = X.drop(columns=constant_cols, errors="ignore")
+
+    if X.shape[1] == 0:
+        return X, []
+
+    # Remove exactly duplicated columns
+    X_filled = X.fillna(0.0)
+    duplicated_mask = X_filled.T.duplicated(keep="first")
+    if duplicated_mask.any():
+        X = X.loc[:, ~duplicated_mask.values]
+
+    if X.shape[1] <= 1:
+        return X, list(X.columns)
+
+    # Remove highly correlated columns (keep the first in order)
+    corr = X.fillna(0.0).corr().abs()
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+    to_drop = [col for col in upper.columns if (upper[col] >= corr_threshold).any()]
+    X = X.drop(columns=to_drop, errors="ignore")
+
+    kept = list(X.columns)
+    return X, kept
+
+
 # ==========================================
 # CoxPH training/inference blocks
 # ==========================================
@@ -158,18 +194,60 @@ def plot_km_curves_four_groups(merged_df: pd.DataFrame) -> None:
 def fit_cox_model(
     train_df: pd.DataFrame, feature_cols: List[str], time_col: str, event_col: str
 ) -> CoxPHFitter:
-    df_fit = train_df[[time_col, event_col] + feature_cols].copy()
-    cph = CoxPHFitter()
+    X_sanitized, kept_features = _sanitize_cox_features_matrix(
+        train_df, feature_cols, corr_threshold=0.995
+    )
+    if len(kept_features) == 0:
+        candidates = [
+            c for c in feature_cols if train_df[c].nunique(dropna=False) > 1
+        ]
+        if not candidates:
+            raise ValueError(
+                "No usable features for CoxPH model after sanitization."
+            )
+        X_sanitized = train_df[[candidates[0]]].copy()
+        kept_features = [candidates[0]]
+
+    df_fit = pd.concat(
+        [
+            train_df[[time_col, event_col]].reset_index(drop=True),
+            X_sanitized.reset_index(drop=True),
+        ],
+        axis=1,
+    )
+
+    cph = CoxPHFitter(penalizer=0.1, l1_ratio=0.0)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        cph.fit(df_fit, duration_col=time_col, event_col=event_col, robust=True)
+        try:
+            cph.fit(df_fit, duration_col=time_col, event_col=event_col, robust=True)
+        except ConvergenceError:
+            # Fallback: stronger regularization and stricter collinearity removal
+            X_sanitized2, _ = _sanitize_cox_features_matrix(
+                train_df, kept_features, corr_threshold=0.95
+            )
+            df_fit2 = pd.concat(
+                [
+                    train_df[[time_col, event_col]].reset_index(drop=True),
+                    X_sanitized2.reset_index(drop=True),
+                ],
+                axis=1,
+            )
+            cph = CoxPHFitter(penalizer=1.0, l1_ratio=0.0)
+            cph.fit(df_fit2, duration_col=time_col, event_col=event_col, robust=True)
     return cph
 
 
 def predict_risk(
     model: CoxPHFitter, df: pd.DataFrame, feature_cols: List[str]
 ) -> np.ndarray:
-    X = df[feature_cols].copy()
+    # Use the model's trained features to avoid mismatch/singularity issues
+    model_features = list(model.params_.index)
+    X = df.copy()
+    missing = [c for c in model_features if c not in X.columns]
+    for c in missing:
+        X[c] = 0.0
+    X = X[model_features]
     risk = model.predict_partial_hazard(X).values.reshape(-1)
     return risk
 
