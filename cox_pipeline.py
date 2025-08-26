@@ -63,14 +63,27 @@ def plot_cox_coefficients(
 ) -> None:
     coef_series = model.params_.sort_values(ascending=False)
     feats = coef_series.index.tolist()
+
+    # Build category sets from FEATURE_SETS
+    try:
+        guideline_set = set(FEATURE_SETS.get("Guideline", [])) | {"NYHA>2"}
+        benchmark_set = set(FEATURE_SETS.get("Benchmark", []))
+        proposed_set = set(FEATURE_SETS.get("Proposed", []))
+    except Exception:
+        guideline_set, benchmark_set, proposed_set = set(), set(), set()
+
+    benchmark_only = benchmark_set - guideline_set
+    proposed_only = proposed_set - (benchmark_set | guideline_set)
+
+    # Map features to colors by category
     colors = []
-    gray_set = set(gray_features) if gray_features is not None else set()
-    red_set = set(red_features) if red_features is not None else set()
     for f in feats:
-        if f in red_set:
-            colors.append("red")
-        elif f in gray_set:
+        if f in guideline_set:
             colors.append("gray")
+        elif f in benchmark_only:
+            colors.append("green")
+        elif f in proposed_only:
+            colors.append("orange")
         else:
             colors.append("blue")
     plt.figure(figsize=(9, 4))
