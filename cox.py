@@ -206,6 +206,13 @@ def generate_tableone_by_sex_icd(
     df_local["Group"] = np.select(conditions, choices, default=np.nan)
 
     group_order = ["Male-ICD", "Male-No ICD", "Female-ICD", "Female-No ICD"]
+    # Ensure ordered categorical for predictable column order in TableOne
+    try:
+        df_local["Group"] = pd.Categorical(
+            df_local["Group"], categories=group_order, ordered=True
+        )
+    except Exception:
+        pass
 
     # Use all columns except identifiers and helper columns
     exclude_cols = {"MRN", "Group"}
@@ -242,6 +249,9 @@ def generate_tableone_by_sex_icd(
                 groupby="Group",
                 groupby_order=group_order,
                 pval=True,
+                overall=True,
+                missing=True,
+                label_suffix=True,
             )
             print("==== TableOne (Sex x ICD) ====")
             print(tab1)
