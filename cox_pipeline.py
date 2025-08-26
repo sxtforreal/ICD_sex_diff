@@ -82,11 +82,14 @@ def plot_cox_coefficients(
 
 
 def plot_km_curves_four_groups(merged_df: pd.DataFrame) -> None:
-    """Plot KM curves for 4 groups: Male-Pred0, Male-Pred1, Female-Pred0, Female-Pred1, with log-rank tests.
-    Robust to availability of endpoints (PE, optional SE).
+    """Plot KM curves for 4 groups using Primary Endpoint (PE):
+    Male-Pred0, Male-Pred1, Female-Pred0, Female-Pred1, with within-sex log-rank tests.
     """
     if merged_df.empty:
         return
+    if not {"PE_Time", "PE"}.issubset(merged_df.columns):
+        return
+
     kmf = KaplanMeierFitter()
     groups = [
         (0, 0, "Male-Pred0", "blue"),
@@ -95,73 +98,54 @@ def plot_km_curves_four_groups(merged_df: pd.DataFrame) -> None:
         (1, 1, "Female-Pred1", "pink"),
     ]
 
-    endpoints = []
-    if {"PE_Time", "PE"}.issubset(merged_df.columns):
-        endpoints.append(("Primary Endpoint", "PE_Time", "PE"))
-    if {"SE_Time", "SE"}.issubset(merged_df.columns):
-        endpoints.append(("Secondary Endpoint", "SE_Time", "SE"))
-    if not endpoints:
-        return
+    fig, ax = plt.subplots(1, 1, figsize=(9, 6))
+    ep_time_col, ep_event_col = "PE_Time", "PE"
 
-    n_axes = len(endpoints)
-    fig, axes = plt.subplots(1, n_axes, figsize=(9 * n_axes, 6))
-    if n_axes == 1:
-        axes = [axes]
+    for gender_val, pred_val, group_name, color in groups:
+        mask = (merged_df["Female"] == gender_val) & (
+            merged_df["pred_label"] == pred_val
+        )
+        group_data = merged_df[mask]
+        if group_data.empty:
+            continue
+        n_samples = len(group_data)
+        events = group_data[ep_event_col].sum()
+        label = f"{group_name} (n={n_samples}, events={events})"
+        kmf.fit(
+            durations=group_data[ep_time_col],
+            event_observed=group_data[ep_event_col],
+            label=label,
+        )
+        kmf.plot(ax=ax, color=color)
 
-    for ax, (ep_name, ep_time_col, ep_event_col) in zip(axes, endpoints):
-        for gender_val, pred_val, group_name, color in groups:
-            mask = (merged_df["Female"] == gender_val) & (
-                merged_df["pred_label"] == pred_val
-            )
-            group_data = merged_df[mask]
-            if group_data.empty:
-                continue
-            n_samples = len(group_data)
-            events = group_data[ep_event_col].sum()
-            label = f"{group_name} (n={n_samples}, events={events})"
-            kmf.fit(
-                durations=group_data[ep_time_col],
-                event_observed=group_data[ep_event_col],
-                label=label,
-            )
-            kmf.plot(ax=ax, color=color)
+    # Pairwise within-sex logrank
+    male_pred0 = merged_df[(merged_df["Female"] == 0) & (merged_df["pred_label"] == 0)]
+    male_pred1 = merged_df[(merged_df["Female"] == 0) & (merged_df["pred_label"] == 1)]
+    female_pred0 = merged_df[(merged_df["Female"] == 1) & (merged_df["pred_label"] == 0)]
+    female_pred1 = merged_df[(merged_df["Female"] == 1) & (merged_df["pred_label"] == 1)]
 
-        # Pairwise within-sex logrank
-        male_pred0 = merged_df[
-            (merged_df["Female"] == 0) & (merged_df["pred_label"] == 0)
-        ]
-        male_pred1 = merged_df[
-            (merged_df["Female"] == 0) & (merged_df["pred_label"] == 1)
-        ]
-        female_pred0 = merged_df[
-            (merged_df["Female"] == 1) & (merged_df["pred_label"] == 0)
-        ]
-        female_pred1 = merged_df[
-            (merged_df["Female"] == 1) & (merged_df["pred_label"] == 1)
-        ]
-        if not male_pred0.empty and not male_pred1.empty:
-            lr_male = logrank_test(
-                male_pred0[ep_time_col],
-                male_pred1[ep_time_col],
-                male_pred0[ep_event_col],
-                male_pred1[ep_event_col],
-            )
-            ax.text(0.02, 0.02, f"Male p={lr_male.p_value:.4f}", transform=ax.transAxes)
-        if not female_pred0.empty and not female_pred1.empty:
-            lr_female = logrank_test(
-                female_pred0[ep_time_col],
-                female_pred1[ep_time_col],
-                female_pred0[ep_event_col],
-                female_pred1[ep_event_col],
-            )
-            ax.text(
-                0.02, 0.08, f"Female p={lr_female.p_value:.4f}", transform=ax.transAxes
-            )
-        ax.set_title(f"{ep_name} - Survival by Gender and Prediction")
-        ax.set_xlabel("Time (days)")
-        ax.set_ylabel("Survival Probability")
-        ax.legend()
-        ax.grid(alpha=0.3)
+    if not male_pred0.empty and not male_pred1.empty:
+        lr_male = logrank_test(
+            male_pred0[ep_time_col],
+            male_pred1[ep_time_col],
+            male_pred0[ep_event_col],
+            male_pred1[ep_event_col],
+        )
+        ax.text(0.02, 0.02, f"Male p={lr_male.p_value:.4f}", transform=ax.transAxes)
+    if not female_pred0.empty and not female_pred1.empty:
+        lr_female = logrank_test(
+            female_pred0[ep_time_col],
+            female_pred1[ep_time_col],
+            female_pred0[ep_event_col],
+            female_pred1[ep_event_col],
+        )
+        ax.text(0.02, 0.08, f"Female p={lr_female.p_value:.4f}", transform=ax.transAxes)
+
+    ax.set_title("Primary Endpoint - Survival by Gender and Prediction")
+    ax.set_xlabel("Time (days)")
+    ax.set_ylabel("Survival Probability")
+    ax.legend()
+    ax.grid(alpha=0.3)
     plt.tight_layout()
     plt.show()
 
