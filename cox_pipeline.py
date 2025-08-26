@@ -10,7 +10,13 @@ from lifelines.statistics import logrank_test
 from lifelines.utils import concordance_index
 
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+
+try:
+    from missingpy import MissForest
+    _HAS_MISSFOREST = True
+except Exception:
+    _HAS_MISSFOREST = False
 
 
 # ==========================================
@@ -123,8 +129,6 @@ def evaluate_split(
     mode in {"sex_agnostic", "male_only", "female_only", "sex_specific"}.
     Sex-agnostic removes Female from features if present.
     """
-    rng = np.random.RandomState(seed)
-
     if mode == "sex_agnostic":
         used_features = [f for f in feature_cols if f != "Female"]
         tr = create_undersampled_dataset(train_df, label_col, seed) if use_undersampling else train_df
@@ -205,6 +209,167 @@ def evaluate_split(
 
 
 # ==========================================
+# Data preparation (mirroring a.py)
+# ==========================================
+
+def CG_equation(age: float, weight: float, female: int, serum_creatinine: float) -> float:
+    constant = 0.85 if female else 1.0
+    return ((140 - age) * weight * constant) / (72 * serum_creatinine)
+
+
+def impute_misforest(X: pd.DataFrame, random_seed: int) -> pd.DataFrame:
+    scaler = StandardScaler()
+    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns)
+    if not _HAS_MISSFOREST:
+        # Fallback: simple mean imputation to keep script runnable
+        X_imputed_scaled = X_scaled.fillna(X_scaled.mean())
+    else:
+        imputer = MissForest(random_state=random_seed)
+        X_imputed_scaled = pd.DataFrame(
+            imputer.fit_transform(X_scaled), columns=X.columns, index=X.index
+        )
+    X_imputed_unscaled = pd.DataFrame(
+        scaler.inverse_transform(X_imputed_scaled), columns=X.columns, index=X.index
+    )
+    return X_imputed_unscaled
+
+
+def conversion_and_imputation(df: pd.DataFrame, features: List[str], labels: List[str]) -> pd.DataFrame:
+    df = df.copy()
+    df = df[features + labels]
+
+    # Encode ordinal NYHA Class if present
+    ordinal = "NYHA Class"
+    if ordinal in df.columns:
+        le = LabelEncoder()
+        df[ordinal] = le.fit_transform(df[ordinal].astype(str))
+
+    # Convert binary columns to numeric
+    binary_cols = [
+        "Female", "DM", "HTN", "HLP", "AF", "Beta Blocker", "ACEi/ARB/ARNi",
+        "Aldosterone Antagonist", "VT/VF/SCD", "AAD", "CRT", "ICD",
+    ]
+    exist_bin = [c for c in binary_cols if c in df.columns]
+    for c in exist_bin:
+        if df[c].dtype == "object":
+            df[c] = df[c].replace({
+                "Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0
+            })
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Imputation on feature matrix
+    X = df[features].copy()
+    imputed_X = impute_misforest(X, 0)
+    imputed_X.index = df.index
+    # Bring back key columns
+    for col in ["MRN", "Female", "VT/VF/SCD", "ICD"]:
+        if col in df.columns:
+            imputed_X[col] = df[col].values
+
+    # Map to 0/1 by 0.5 threshold for binary cols
+    for c in exist_bin:
+        if c in imputed_X.columns:
+            imputed_X[c] = (imputed_X[c] >= 0.5).astype(float)
+
+    return imputed_X
+
+
+def load_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    base = "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff"
+
+    # Survival: ICD
+    icd_survival = pd.read_excel(os.path.join(base, "icd_survival.xlsx"))
+    icd_survival["PE_Time"] = icd_survival.apply(
+        lambda row: (
+            row["Time from ICD Implant to Primary Endpoint (in days)"]
+            if row["Was Primary Endpoint Reached? (Appropriate ICD Therapy)"] == 1
+            else row["Time from ICD Implant to Last Cardiology Encounter (in days)"]
+        ), axis=1,
+    )
+    icd_survival["SE_Time"] = icd_survival.apply(
+        lambda row: (
+            row["Time from ICD Implant to Secondary Endpoint (in days)"]
+            if row["Was Secondary Endpoint Reached?"] == 1
+            else row["Time from ICD Implant to Last Cardiology Encounter (in days)"]
+        ), axis=1,
+    )
+    icd_survival = icd_survival[[
+        "MRN",
+        "Was Primary Endpoint Reached? (Appropriate ICD Therapy)",
+        "PE_Time",
+        "Was Secondary Endpoint Reached?",
+        "SE_Time",
+    ]].rename(columns={
+        "Was Primary Endpoint Reached? (Appropriate ICD Therapy)": "PE",
+        "Was Secondary Endpoint Reached?": "SE",
+    })
+
+    # Survival: No ICD
+    no_icd_survival = pd.read_csv(os.path.join(base, "no_icd_survival.csv"))
+    no_icd_survival["PE_Time"] = no_icd_survival.apply(
+        lambda row: (
+            row["days_MRI_to_VTVFSCD"] if row["VT/VF/SCD"] == 1 else row["days_MRI_to_followup"]
+        ), axis=1,
+    )
+    no_icd_survival["SE_Time"] = no_icd_survival.apply(
+        lambda row: (
+            row["days_MRI_to_death"] if row["Death"] == 1 else row["days_MRI_to_followup"]
+        ), axis=1,
+    )
+    no_icd_survival = no_icd_survival[[
+        "MRN", "VT/VF/SCD", "PE_Time", "Death", "SE_Time"
+    ]].rename(columns={"VT/VF/SCD": "PE", "Death": "SE"})
+
+    survival_df = pd.concat([icd_survival, no_icd_survival], ignore_index=True)
+
+    # Features: ICD and No ICD sheets
+    nicm_path = os.path.join(base, "NICM.xlsx")
+    with_icd = pd.read_excel(nicm_path, sheet_name="ICD")
+    with_icd["ICD"] = 1
+    without_icd = pd.read_excel(nicm_path, sheet_name="No_ICD")
+    without_icd["ICD"] = 0
+    # Cockcroft-Gault for no ICD
+    without_icd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = without_icd.apply(
+        lambda row: CG_equation(
+            row["Age at CMR"], row["Weight (Kg)"], row["Female"],
+            row["Serum creatinine (within 3 months of MRI)"]
+        ), axis=1,
+    )
+
+    common_cols = with_icd.columns.intersection(without_icd.columns)
+    df = pd.concat([with_icd[common_cols], without_icd[common_cols]], ignore_index=True)
+    df.drop([
+        "Date VT/VF/SCD", "End follow-up date", "CRT Date", "QRS"
+    ], axis=1, inplace=True, errors="ignore")
+
+    # Variables
+    var = df.columns.tolist()
+    categorical = [
+        "Female", "DM", "HTN", "HLP", "AF", "NYHA Class", "Beta Blocker",
+        "ACEi/ARB/ARNi", "Aldosterone Antagonist", "VT/VF/SCD", "AAD", "CRT", "ICD",
+    ]
+    numerical = list(set(var) - set(categorical))
+    df[categorical] = df[categorical].astype("object")
+
+    labels = ["MRN", "Female", "VT/VF/SCD", "ICD"]
+    features = [c for c in var if c not in labels]
+
+    clean_df = conversion_and_imputation(df, features, labels)
+
+    # Additional engineered features
+    if "Age at CMR" in df.columns:
+        clean_df["Age by decade"] = (df["Age at CMR"] // 10).values
+    if "Cockcroft-Gault Creatinine Clearance (mL/min)" in clean_df.columns:
+        clean_df["CrCl>45"] = (clean_df["Cockcroft-Gault Creatinine Clearance (mL/min)"] > 45).astype(int)
+    if "NYHA Class" in clean_df.columns:
+        clean_df["NYHA>2"] = (clean_df["NYHA Class"] > 2).astype(int)
+    if "LGE Burden 5SD" in clean_df.columns:
+        clean_df["Significant LGE"] = (clean_df["LGE Burden 5SD"] > 2).astype(int)
+
+    return clean_df, survival_df
+
+
+# ==========================================
 # Main multi-split runner
 # ==========================================
 
@@ -228,10 +393,10 @@ def run_cox_experiments(
       - female-only
     """
     model_configs = [
-        {"name": "Benchmark Sex-agnostic (Cox, undersampled)", "mode": "sex_agnostic"},
-        {"name": "Benchmark Sex-specific (Cox)", "mode": "sex_specific"},
-        {"name": "Benchmark Male (Cox)", "mode": "male_only"},
-        {"name": "Benchmark Female (Cox)", "mode": "female_only"},
+        {"name": "Sex-agnostic (Cox, undersampled)", "mode": "sex_agnostic"},
+        {"name": "Sex-specific (Cox)", "mode": "sex_specific"},
+        {"name": "Male (Cox)", "mode": "male_only"},
+        {"name": "Female (Cox)", "mode": "female_only"},
     ]
 
     metrics = [
@@ -302,24 +467,44 @@ def run_cox_experiments(
     return results, summary_table
 
 
-# Example feature sets (replace with real ones from a.py as needed)
-FEATURE_SETS_EXAMPLE = {
-    "benchmark": [
+# Feature sets (mirroring a.py)
+FEATURE_SETS = {
+    'guideline': ["NYHA Class", "LVEF"],
+    'benchmark': [
         "Female", "Age by decade", "BMI", "AF", "Beta Blocker", "CrCl>45",
         "LVEF", "QTc", "NYHA>2", "CRT", "AAD", "Significant LGE",
     ],
-    "proposed": [
+    'proposed': [
         "Female", "Age by decade", "BMI", "AF", "Beta Blocker", "CrCl>45",
         "LVEF", "QTc", "NYHA>2", "CRT", "AAD", "Significant LGE", "DM", "HTN",
         "HLP", "LVEDVi", "LV Mass Index", "RVEDVi", "RVEF", "LA EF", "LAVi",
         "MRF (%)", "Sphericity Index", "Relative Wall Thickness",
         "MV Annular Diameter", "ACEi/ARB/ARNi", "Aldosterone Antagonist",
     ],
+    'real_proposed': [
+        "Female", "Age by decade", "BMI", "AF", "Beta Blocker", "CrCl>45",
+        "LVEF", "QTc", "CRT", "AAD", "LGE Burden 5SD", "DM", "HTN",
+        "HLP", "LVEDVi", "LV Mass Index", "RVEDVi", "RVEF", "LA EF", "LAVi",
+        "MRF (%)", "Sphericity Index", "Relative Wall Thickness",
+        "MV Annular Diameter", "ACEi/ARB/ARNi", "Aldosterone Antagonist", "NYHA Class"
+    ],
 }
 
 
 if __name__ == "__main__":
-    # NOTE: Load your prepared dataframes `df` and `survival_df` before running.
-    # This script expects columns: MRN, Female, label (e.g., VT/VF/SCD), and the features.
-    # Survival df must contain MRN, PE_Time, PE (or change args accordingly).
-    raise SystemExit("Import and call run_cox_experiments() from a driver script/notebook.")
+    # Load and prepare data
+    df, survival_df = load_dataframes()
+
+    # Run experiments (50 random splits; PE as event; PE_Time as duration)
+    export_path = "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/results_cox.xlsx"
+    _, summary = run_cox_experiments(
+        df=df,
+        survival_df=survival_df,
+        feature_sets=FEATURE_SETS,
+        N=50,
+        label="VT/VF/SCD",
+        time_col="PE_Time",
+        event_col="PE",
+        export_excel_path=export_path,
+    )
+    print("Saved Excel:", export_path)
