@@ -13,6 +13,8 @@ from lifelines.exceptions import ConvergenceError
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 
+from scipy import stats
+
 try:
     from missingpy import MissForest
 
@@ -264,13 +266,22 @@ def generate_tableone_by_sex_icd(
                     table_df = None
             # Keep only the requested columns in order: Overall + 4 groups
             if table_df is not None and isinstance(table_df.columns, pd.MultiIndex):
-                keep_tops = ["Overall"] + group_order
-                # Only keep desired sub-metrics
+                keep_tops = ["Missing", "Overall"] + group_order + [
+                    "p-value",
+                    "P-Value",
+                    "pval",
+                ]
+                # Only keep desired sub-metrics for data columns; keep all for Missing/p-value
                 keep_subs = {"mean (SD)", "n (%)"}
                 new_cols = []
-                for top in keep_tops:
-                    for col in table_df.columns:
-                        if col[0] == top and (col[1] in keep_subs or col[1] == ""):
+                for col in table_df.columns:
+                    top = col[0]
+                    if top not in keep_tops:
+                        continue
+                    if top in ("Missing", "p-value", "P-Value", "pval"):
+                        new_cols.append(col)
+                    else:
+                        if col[1] in keep_subs or col[1] == "":
                             new_cols.append(col)
                 # If none matched (unexpected), keep original
                 if new_cols:
@@ -317,16 +328,32 @@ def generate_tableone_by_sex_icd(
 
         out_rows = []
 
-        # Continuous: one row per variable with mean (SD)
+        # Continuous: one row per variable with mean (SD) and p-value (Kruskal-Wallis)
         for var in cont_cols:
             row = {"rowname": var}
+            # Missing overall (% of all rows)
+            miss_pct = float(df_local[var].isna().mean() * 100.0)
+            row["Missing"] = f"{miss_pct:.1f}%"
             row["Overall"] = format_mean_sd(df_local[var])
             for grp_name in group_order:
                 grp_series = df_local.loc[df_local["Group"] == grp_name, var]
                 row[grp_name] = format_mean_sd(grp_series)
+            # P-value via Kruskal-Wallis across groups with data
+            samples = [
+                pd.to_numeric(
+                    df_local.loc[df_local["Group"] == g, var], errors="coerce"
+                ).dropna().values
+                for g in group_order
+            ]
+            samples = [s for s in samples if len(s) > 0]
+            try:
+                pval = stats.kruskal(*samples).pvalue if len(samples) >= 2 else np.nan
+            except Exception:
+                pval = np.nan
+            row["P-Value"] = (f"{pval:.3f}" if pd.notna(pval) else "")
             out_rows.append(row)
 
-        # Categorical: expand levels, each level as one row showing n (%)
+        # Categorical: expand levels, each level as one row showing n (%); p-value via Chi-square
         for var in cat_cols:
             series_all = df_local[var]
             levels = [lv for lv in pd.unique(series_all.dropna())]
@@ -343,19 +370,33 @@ def generate_tableone_by_sex_icd(
                 for g in group_order
             }
 
+            # Compute p-value using chi-square on contingency table (levels x groups)
+            try:
+                contingency = pd.crosstab(series_all, df_local["Group"], dropna=True)
+                # Keep only requested group columns
+                contingency = contingency[[g for g in group_order if g in contingency.columns]]
+                chi2, p_c, _, _ = stats.chi2_contingency(contingency) if contingency.shape[0] >= 2 and contingency.shape[1] >= 2 else (np.nan, np.nan, None, None)
+            except Exception:
+                p_c = np.nan
+
             for idx, lv in enumerate(levels):
                 rowname = f"{var}: {lv}" if len(levels) > 1 else var
                 row = {"rowname": rowname}
+                if idx == 0:
+                    miss_pct = float(series_all.isna().mean() * 100.0)
+                    row["Missing"] = f"{miss_pct:.1f}%"
                 overall_n = int((series_all == lv).sum())
                 row["Overall"] = format_n_pct_from_total(overall_n, overall_den)
                 for g in group_order:
                     s_grp = df_local.loc[df_local["Group"] == g, var]
                     n_g = int((s_grp == lv).sum())
                     row[g] = format_n_pct_from_total(n_g, group_den[g])
+                if idx == 0:
+                    row["P-Value"] = (f"{p_c:.3f}" if pd.notna(p_c) else "")
                 out_rows.append(row)
 
         if out_rows:
-            cols = ["Overall"] + group_order
+            cols = ["Missing", "Overall"] + group_order + ["P-Value"]
             fallback_df = pd.DataFrame(out_rows).set_index("rowname")[cols]
             print("==== Summary (fallback) ====")
             print(fallback_df.head())
