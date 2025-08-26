@@ -25,12 +25,6 @@ except Exception:
 # ==========================================
 
 
-def standardize_features(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
-    scaler = StandardScaler()
-    X = df[feature_cols].astype(float).copy()
-    X.loc[:, feature_cols] = scaler.fit_transform(X[feature_cols])
-    return X
-
 
 def create_undersampled_dataset(
     train_df: pd.DataFrame, label_col: str, random_state: int
@@ -89,7 +83,9 @@ def plot_cox_coefficients(
 
 
 def plot_km_curves_four_groups(merged_df: pd.DataFrame) -> None:
-    """Plot KM curves for 4 groups: Male-Pred0, Male-Pred1, Female-Pred0, Female-Pred1, with log-rank tests."""
+    """Plot KM curves for 4 groups: Male-Pred0, Male-Pred1, Female-Pred0, Female-Pred1, with log-rank tests.
+    Handles optional secondary endpoint columns if absent.
+    """
     if merged_df.empty:
         return
     kmf = KaplanMeierFitter()
@@ -99,14 +95,15 @@ def plot_km_curves_four_groups(merged_df: pd.DataFrame) -> None:
         (1, 0, "Female-Pred0", "lightblue"),
         (1, 1, "Female-Pred1", "pink"),
     ]
-    fig, axes = plt.subplots(1, 2, figsize=(18, 6))
-    for ax, (ep_name, ep_time_col, ep_event_col) in zip(
-        axes,
-        [
-            ("Primary Endpoint", "PE_Time", "PE"),
-            ("Secondary Endpoint", "SE_Time", "SE"),
-        ],
-    ):
+    endpoints = [("Primary Endpoint", "PE_Time", "PE")]
+    if {"SE_Time", "SE"}.issubset(set(merged_df.columns)):
+        endpoints.append(("Secondary Endpoint", "SE_Time", "SE"))
+    if len(endpoints) == 1:
+        fig, ax = plt.subplots(1, 1, figsize=(9, 6))
+        axes = [ax]
+    else:
+        fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+    for ax, (ep_name, ep_time_col, ep_event_col) in zip(axes, endpoints):
         for gender_val, pred_val, group_name, color in groups:
             mask = (merged_df["Female"] == gender_val) & (
                 merged_df["pred_label"] == pred_val
@@ -172,17 +169,47 @@ def fit_cox_model(
     train_df: pd.DataFrame, feature_cols: List[str], time_col: str, event_col: str
 ) -> CoxPHFitter:
     df_fit = train_df[[time_col, event_col] + feature_cols].copy()
-    cph = CoxPHFitter()
+    X = df_fit[feature_cols].apply(pd.to_numeric, errors="coerce")
+    # Drop columns with all-NaN or zero variance (constants)
+    nunique = X.nunique(dropna=True)
+    keep_cols = [c for c in X.columns if nunique.get(c, 0) > 1 and not X[c].isna().all()]
+    X = X[keep_cols].copy()
+    # Replace inf with NaN and drop columns that are then all-NaN
+    X = X.replace([np.inf, -np.inf], np.nan)
+    all_nan_cols = [c for c in X.columns if X[c].isna().all()]
+    if all_nan_cols:
+        X = X.drop(columns=all_nan_cols)
+    used_cols = X.columns.tolist()
+    if len(used_cols) == 0:
+        # Fallback: ensure at least one column; create a small-noise column to avoid failure
+        X = pd.DataFrame({"_const_noise": np.ones(len(df_fit))}, index=df_fit.index)
+        used_cols = X.columns.tolist()
+    df_fit_final = pd.concat([df_fit[[time_col, event_col]], X], axis=1)
+    # Penalizer helps convergence in high collinearity
+    cph = CoxPHFitter(penalizer=0.01)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        cph.fit(df_fit, duration_col=time_col, event_col=event_col, robust=True)
+        try:
+            cph.fit(df_fit_final, duration_col=time_col, event_col=event_col, robust=True)
+        except Exception:
+            # Retry with stronger penalization
+            cph = CoxPHFitter(penalizer=0.1)
+            cph.fit(df_fit_final, duration_col=time_col, event_col=event_col, robust=True)
+    # Record used columns for prediction alignment
+    setattr(cph, "_trained_columns", used_cols)
     return cph
 
 
 def predict_risk(
     model: CoxPHFitter, df: pd.DataFrame, feature_cols: List[str]
 ) -> np.ndarray:
-    X = df[feature_cols].copy()
+    trained_cols = getattr(model, "_trained_columns", feature_cols)
+    X = df.reindex(columns=trained_cols).copy()
+    # If some columns are missing, create them as zeros
+    for col in trained_cols:
+        if col not in X.columns:
+            X[col] = 0.0
+    X = X[trained_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     risk = model.predict_partial_hazard(X).values.reshape(-1)
     return risk
 
@@ -204,10 +231,13 @@ def sex_specific_inference(
     dichotomizes by median training risk within sex, plots KM and Cox coefficients, and returns merged_df.
     """
     used_features = [f for f in features if f != "Female"]
+    surv_cols = ["MRN", "PE_Time", "PE"]
+    if {"SE_Time", "SE"}.issubset(set(survival_df.columns)):
+        surv_cols += ["SE_Time", "SE"]
     train_m = (
         train_df[train_df["Female"] == 0]
         .merge(
-            survival_df[["MRN", "PE_Time", "PE", "SE_Time", "SE"]],
+            survival_df[surv_cols],
             on="MRN",
             how="inner",
         )
@@ -216,7 +246,7 @@ def sex_specific_inference(
     train_f = (
         train_df[train_df["Female"] == 1]
         .merge(
-            survival_df[["MRN", "PE_Time", "PE", "SE_Time", "SE"]],
+            survival_df[surv_cols],
             on="MRN",
             how="inner",
         )
@@ -286,8 +316,11 @@ def sex_agnostic_inference(
         if use_undersampling
         else train_df
     )
+    surv_cols = ["MRN", "PE_Time", "PE"]
+    if {"SE_Time", "SE"}.issubset(set(survival_df.columns)):
+        surv_cols += ["SE_Time", "SE"]
     tr = tr_base.merge(
-        survival_df[["MRN", "PE_Time", "PE", "SE_Time", "SE"]], on="MRN", how="inner"
+        survival_df[surv_cols], on="MRN", how="inner"
     ).dropna(subset=["PE_Time", "PE"])
     if tr.empty:
         return test_df.copy()
@@ -347,7 +380,7 @@ def evaluate_split(
         return pred, risk_scores, {"c_index": cidx}
 
     if mode == "male_only":
-        used_features = feature_cols
+        used_features = [f for f in feature_cols if f != "Female"]
         tr_m = train_df[train_df["Female"] == 0]
         te_m = test_df[test_df["Female"] == 0]
         if tr_m.empty or te_m.empty:
@@ -369,7 +402,7 @@ def evaluate_split(
         return pred, risk_scores, {"c_index": cidx}
 
     if mode == "female_only":
-        used_features = feature_cols
+        used_features = [f for f in feature_cols if f != "Female"]
         tr_f = train_df[train_df["Female"] == 1]
         te_f = test_df[test_df["Female"] == 1]
         if tr_f.empty or te_f.empty:
@@ -391,7 +424,7 @@ def evaluate_split(
         return pred, risk_scores, {"c_index": cidx}
 
     if mode == "sex_specific":
-        used_features = feature_cols
+        used_features = [f for f in feature_cols if f != "Female"]
         # male branch
         tr_m = train_df[train_df["Female"] == 0]
         te_m = test_df[test_df["Female"] == 0]
@@ -607,6 +640,9 @@ def load_dataframes() -> pd.DataFrame:
     if "LGE Burden 5SD" in clean_df.columns:
         clean_df["Significant LGE"] = (clean_df["LGE Burden 5SD"] > 2).astype(int)
 
+    # Ensure a primary endpoint alias exists for inference utilities
+    if "VT/VF/SCD" in clean_df.columns and "PE" not in clean_df.columns:
+        clean_df["PE"] = clean_df["VT/VF/SCD"].astype(int)
     return clean_df
 
 
@@ -767,6 +803,31 @@ if __name__ == "__main__":
     print("Saved Excel:", export_path)
     
     # Run inference
-    
-    
-    
+    try:
+        # Choose a feature set and a deterministic split for demonstration
+        chosen_features = FEATURE_SETS["Proposed"]
+        tr_inf, te_inf = train_test_split(
+            df, test_size=0.3, random_state=0, stratify=df["VT/VF/SCD"]
+        )
+        tr_inf = tr_inf.dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
+        te_inf = te_inf.dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
+
+        # Sex-specific inference (plots KM and coefficients)
+        _ = sex_specific_inference(
+            train_df=tr_inf,
+            test_df=te_inf,
+            features=chosen_features,
+            survival_df=df,
+        )
+
+        # Sex-agnostic inference (with undersampling)
+        _ = sex_agnostic_inference(
+            train_df=tr_inf,
+            test_df=te_inf,
+            features=chosen_features,
+            survival_df=df,
+            label_col="VT/VF/SCD",
+            use_undersampling=True,
+        )
+    except Exception as e:
+        print("Inference step failed:", repr(e))
