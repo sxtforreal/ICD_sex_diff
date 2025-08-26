@@ -25,11 +25,7 @@ except Exception:
 # ==========================================
 
 
-def standardize_features(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
-    scaler = StandardScaler()
-    X = df[feature_cols].astype(float).copy()
-    X.loc[:, feature_cols] = scaler.fit_transform(X[feature_cols])
-    return X
+
 
 
 def create_undersampled_dataset(
@@ -172,18 +168,92 @@ def fit_cox_model(
     train_df: pd.DataFrame, feature_cols: List[str], time_col: str, event_col: str
 ) -> CoxPHFitter:
     df_fit = train_df[[time_col, event_col] + feature_cols].copy()
-    cph = CoxPHFitter()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        cph.fit(df_fit, duration_col=time_col, event_col=event_col, robust=True)
-    return cph
+    
+    # Check for minimum sample size and events
+    if len(df_fit) < 10 or df_fit[event_col].sum() < 5:
+        raise ValueError(f"Insufficient data: {len(df_fit)} samples, {df_fit[event_col].sum()} events")
+    
+    # Remove features with no variance or all missing
+    valid_features = []
+    for col in feature_cols:
+        if col in df_fit.columns:
+            if df_fit[col].var() > 1e-8 and not df_fit[col].isna().all():
+                valid_features.append(col)
+    
+    if not valid_features:
+        raise ValueError("No valid features for Cox model")
+    
+    # Standardize features to improve convergence
+    scaler = StandardScaler()
+    df_fit_scaled = df_fit.copy()
+    df_fit_scaled[valid_features] = scaler.fit_transform(df_fit[valid_features].fillna(0))
+    
+    # Use penalization to improve stability
+    cph = CoxPHFitter(penalizer=0.01)
+    
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cph.fit(
+                df_fit_scaled[[time_col, event_col] + valid_features], 
+                duration_col=time_col, 
+                event_col=event_col, 
+                robust=True,
+                step_size=0.5  # Smaller step size for better convergence
+            )
+        # Store scaler and valid features for prediction
+        cph._scaler = scaler
+        cph._valid_features = valid_features
+        return cph
+        
+    except Exception as e:
+        # Fallback with higher penalization
+        print(f"Cox model failed with error: {e}")
+        print("Trying with higher penalization...")
+        try:
+            cph_backup = CoxPHFitter(penalizer=0.1)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                cph_backup.fit(
+                    df_fit_scaled[[time_col, event_col] + valid_features], 
+                    duration_col=time_col, 
+                    event_col=event_col, 
+                    robust=True,
+                    step_size=0.1
+                )
+            cph_backup._scaler = scaler
+            cph_backup._valid_features = valid_features
+            return cph_backup
+        except Exception as e2:
+            print(f"Backup Cox model also failed: {e2}")
+            raise e2
 
 
 def predict_risk(
     model: CoxPHFitter, df: pd.DataFrame, feature_cols: List[str]
 ) -> np.ndarray:
-    X = df[feature_cols].copy()
-    risk = model.predict_partial_hazard(X).values.reshape(-1)
+    # Use the valid features that were used in training
+    if hasattr(model, '_valid_features'):
+        valid_features = model._valid_features
+        scaler = model._scaler
+    else:
+        # Fallback for models without stored features
+        valid_features = feature_cols
+        scaler = None
+    
+    X = df[valid_features].copy().fillna(0)
+    
+    # Apply the same scaling as training
+    if scaler is not None:
+        X_scaled = pd.DataFrame(
+            scaler.transform(X), 
+            columns=valid_features, 
+            index=X.index
+        )
+        risk = model.predict_partial_hazard(X_scaled).values.reshape(-1)
+    else:
+        risk = model.predict_partial_hazard(X).values.reshape(-1)
+    
     return risk
 
 
@@ -607,6 +677,42 @@ def load_dataframes() -> pd.DataFrame:
     if "LGE Burden 5SD" in clean_df.columns:
         clean_df["Significant LGE"] = (clean_df["LGE Burden 5SD"] > 2).astype(int)
 
+    # Data validation and cleaning
+    print(f"Dataset shape before validation: {clean_df.shape}")
+    
+    # Remove rows with missing critical survival data
+    critical_cols = ["PE_Time", "VT/VF/SCD"]
+    initial_rows = len(clean_df)
+    clean_df = clean_df.dropna(subset=critical_cols)
+    dropped_survival = initial_rows - len(clean_df)
+    if dropped_survival > 0:
+        print(f"Dropped {dropped_survival} rows with missing survival data")
+    
+    # Remove rows with invalid survival times
+    clean_df = clean_df[clean_df["PE_Time"] > 0]
+    dropped_time = len(clean_df) - (initial_rows - dropped_survival)
+    if dropped_time < 0:  # means we dropped more
+        print(f"Dropped {abs(dropped_time)} rows with invalid survival times")
+    
+    # Check for minimum events
+    n_events = clean_df["VT/VF/SCD"].sum()
+    print(f"Total events: {n_events} out of {len(clean_df)} samples ({n_events/len(clean_df)*100:.1f}%)")
+    
+    if n_events < 10:
+        print("WARNING: Very few events (<10) may cause convergence issues")
+    
+    # Check for extreme outliers in continuous features and cap them
+    numeric_cols = clean_df.select_dtypes(include=[np.number]).columns
+    for col in numeric_cols:
+        if col not in ["MRN", "Female", "VT/VF/SCD", "ICD", "PE_Time"] and col in clean_df.columns:
+            Q1 = clean_df[col].quantile(0.01)
+            Q99 = clean_df[col].quantile(0.99)
+            outliers = ((clean_df[col] < Q1) | (clean_df[col] > Q99)).sum()
+            if outliers > 0:
+                clean_df[col] = clean_df[col].clip(Q1, Q99)
+                print(f"Capped {outliers} outliers in {col}")
+    
+    print(f"Final dataset shape: {clean_df.shape}")
     return clean_df
 
 
@@ -766,7 +872,55 @@ if __name__ == "__main__":
     )
     print("Saved Excel:", export_path)
     
-    # Run inference
+    # Run inference using the loaded data
+    print("\n" + "="*50)
+    print("Running Inference Examples")
+    print("="*50)
     
+    # Split data for inference demonstration
+    train_df, test_df = train_test_split(
+        df, test_size=0.3, random_state=42, stratify=df["VT/VF/SCD"]
+    )
     
+    # Create a survival dataframe for inference functions
+    survival_df = df[["MRN", "PE_Time", "VT/VF/SCD", "Female"]].copy()
+    survival_df = survival_df.rename(columns={"VT/VF/SCD": "PE"})
+    # Add secondary endpoint (using same as primary for demo)
+    survival_df["SE_Time"] = survival_df["PE_Time"]
+    survival_df["SE"] = survival_df["PE"]
     
+    # Example 1: Sex-specific inference
+    print("\n1. Sex-specific inference with Benchmark features:")
+    try:
+        benchmark_features = FEATURE_SETS["Benchmark"]
+        merged_df_sex_specific = sex_specific_inference(
+            train_df=train_df,
+            test_df=test_df, 
+            features=benchmark_features,
+            survival_df=survival_df,
+            gray_features=["Female", "Age by decade"],
+            red_features=["LVEF", "QTc"]
+        )
+        print(f"Sex-specific inference completed. Merged dataframe shape: {merged_df_sex_specific.shape}")
+    except Exception as e:
+        print(f"Sex-specific inference failed: {e}")
+    
+    # Example 2: Sex-agnostic inference  
+    print("\n2. Sex-agnostic inference with Proposed features:")
+    try:
+        proposed_features = FEATURE_SETS["Proposed"] 
+        merged_df_sex_agnostic = sex_agnostic_inference(
+            train_df=train_df,
+            test_df=test_df,
+            features=proposed_features,
+            survival_df=survival_df,
+            label_col="VT/VF/SCD",
+            use_undersampling=True,
+            gray_features=["Female", "Age by decade", "BMI"],
+            red_features=["LVEF", "QTc", "LGE Burden 5SD"]
+        )
+        print(f"Sex-agnostic inference completed. Merged dataframe shape: {merged_df_sex_agnostic.shape}")
+    except Exception as e:
+        print(f"Sex-agnostic inference failed: {e}")
+        
+    print("\nInference examples completed!")
