@@ -310,23 +310,102 @@ def generate_tableone_by_sex_icd(
 
     # Fallback summary if TableOne is not available
     try:
-        numeric_cols = [c for c in variables if pd.api.types.is_numeric_dtype(df_local[c])]
-        parts = []
-        for grp_name in group_order:
-            grp = df_local[df_local["Group"] == grp_name]
-            if grp.empty:
+        # Identify numeric vs categorical
+        numeric_cols = [c for c in variables if pd.api.types.is_numeric_dtype(df_local[c]) and c not in categorical_cols]
+        cat_cols = [c for c in categorical_cols if c in variables]
+
+        # Build a wide table with groups as columns to mirror TableOne orientation
+        # Columns order: Missing | Overall | Male-ICD | Male-No ICD | Female-ICD | Female-No ICD
+        col_order = ["Missing", "Overall"] + group_order
+
+        # Collect rows as a dict keyed by a two-level index: (variable, sublabel)
+        summary_rows: Dict[Tuple[str, str], Dict[str, object]] = {}
+
+        # Numeric variables: mean (SD)
+        for var in numeric_cols:
+            row: Dict[str, object] = {}
+            # Missing count overall
+            row["Missing"] = int(pd.to_numeric(df_local[var], errors="coerce").isna().sum())
+            # Overall summary as "mean (sd)"
+            overall_series = pd.to_numeric(df_local[var], errors="coerce")
+            overall_mean = overall_series.mean()
+            overall_std = overall_series.std()
+            row["Overall"] = "" if pd.isna(overall_mean) else f"{overall_mean:.1f} ({overall_std:.1f})"
+            # Per-group summaries
+            for grp_name in group_order:
+                grp_series = pd.to_numeric(
+                    df_local.loc[df_local["Group"] == grp_name, var], errors="coerce"
+                )
+                grp_series = grp_series.dropna()
+                if grp_series.empty:
+                    row[grp_name] = ""
+                else:
+                    m = grp_series.mean()
+                    s = grp_series.std()
+                    row[grp_name] = f"{m:.1f} ({s:.1f})"
+
+            summary_rows[(var, "mean (SD)")] = row
+
+        # Categorical variables: n (%) per level
+        for var in cat_cols:
+            series = df_local[var]
+            # Determine level order: prefer categorical order if available, else sorted unique
+            try:
+                levels = [lvl for lvl in pd.Categorical(series).categories if pd.notna(lvl)]
+            except Exception:
+                levels = [lvl for lvl in series.dropna().unique().tolist()]
+                try:
+                    levels = sorted(levels)
+                except Exception:
+                    pass
+
+            if len(levels) == 0:
                 continue
-            desc = grp[numeric_cols].describe().T
-            desc.insert(0, "group", grp_name)
-            parts.append(desc)
-        if parts:
-            fallback_df = pd.concat(parts, axis=0)
-            print("==== Numeric summary by group (fallback) ====")
-            print(fallback_df.head())
-            if output_excel_path:
-                os.makedirs(os.path.dirname(output_excel_path), exist_ok=True)
-                fallback_df.to_excel(output_excel_path)
-                print(f"Saved fallback summary to: {output_excel_path}")
+
+            overall_non_missing = series.notna().sum()
+            overall_missing = int(series.isna().sum())
+
+            for level_index, level_value in enumerate(levels):
+                level_label = str(level_value)
+                row: Dict[str, object] = {}
+                # Missing shown only on the first level row for the variable
+                row["Missing"] = overall_missing if level_index == 0 else ""
+
+                # Overall n (%)
+                if overall_non_missing > 0:
+                    overall_count = int((series == level_value).sum())
+                    overall_pct = overall_count / overall_non_missing * 100.0
+                    row["Overall"] = f"{overall_count} ({overall_pct:.1f}%)"
+                else:
+                    row["Overall"] = ""
+
+                # Group n (%)
+                for grp_name in group_order:
+                    grp_series = df_local.loc[df_local["Group"] == grp_name, var]
+                    non_missing = grp_series.notna().sum()
+                    if non_missing == 0:
+                        row[grp_name] = ""
+                    else:
+                        count = int((grp_series == level_value).sum())
+                        pct = count / non_missing * 100.0
+                        row[grp_name] = f"{count} ({pct:.1f}%)"
+
+                summary_rows[(f"{var}, n (%)", level_label)] = row
+
+        if not summary_rows:
+            return
+
+        fallback_df = pd.DataFrame.from_dict(summary_rows, orient="index")
+        # Ensure consistent column order
+        fallback_df = fallback_df.reindex(columns=col_order)
+
+        print("==== Summary by group (fallback) ====")
+        print(fallback_df.head())
+
+        if output_excel_path:
+            os.makedirs(os.path.dirname(output_excel_path), exist_ok=True)
+            fallback_df.to_excel(output_excel_path)
+            print(f"Saved fallback summary to: {output_excel_path}")
     except Exception as e:
         warnings.warn(f"[TableOne Fallback] Failed to generate summary: {e}")
 
