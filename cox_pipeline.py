@@ -8,6 +8,8 @@ from typing import Dict, List, Tuple
 from lifelines import CoxPHFitter, KaplanMeierFitter
 from lifelines.statistics import logrank_test
 from lifelines.utils import concordance_index
+from lifelines.exceptions import ConvergenceError
+from numpy.linalg import LinAlgError
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -52,6 +54,75 @@ def create_undersampled_dataset(
         .sample(frac=1.0, random_state=random_state)
         .reset_index(drop=True)
     )
+
+
+def _select_numerical_feature_columns(df: pd.DataFrame, feature_cols: List[str]) -> List[str]:
+    """Return the subset of feature_cols that are numeric in df."""
+    numeric_cols = df[feature_cols].select_dtypes(include=[np.number]).columns.tolist()
+    return numeric_cols
+
+
+def _drop_constant_and_duplicate_columns(
+    df: pd.DataFrame, feature_cols: List[str]
+) -> Tuple[List[str], Dict[str, str]]:
+    """Remove constant-variance and duplicate columns. Returns (kept_columns, drop_reasons)."""
+    drop_reasons: Dict[str, str] = {}
+    X = df[feature_cols].copy()
+
+    # Drop constant columns (including all-NaN or single-unique)
+    nunique = X.nunique(dropna=False)
+    constant_cols = nunique[nunique <= 1].index.tolist()
+    for c in constant_cols:
+        drop_reasons[c] = "constant_or_single_unique"
+    X = X.drop(columns=constant_cols, errors="ignore")
+
+    # Drop exact duplicate columns
+    # Identify duplicates by comparing serialized values
+    # Transpose drop_duplicates keeps first occurrence
+    if not X.empty:
+        deduped_T = X.T.drop_duplicates()
+        kept_cols = deduped_T.T.columns.tolist()
+        dup_cols = [c for c in X.columns if c not in kept_cols]
+        for c in dup_cols:
+            drop_reasons[c] = "duplicate_column"
+        X = X[kept_cols]
+
+    return X.columns.tolist(), drop_reasons
+
+
+def _drop_highly_correlated_columns(
+    df: pd.DataFrame, feature_cols: List[str], correlation_threshold: float = 0.999
+) -> Tuple[List[str], Dict[str, str]]:
+    """Greedily drop columns to remove |corr| >= threshold. Returns (kept_columns, drop_reasons)."""
+    drop_reasons: Dict[str, str] = {}
+    if len(feature_cols) <= 1:
+        return feature_cols, drop_reasons
+
+    X = df[feature_cols].copy()
+    # Only compute on columns with at least 2 distinct values
+    valid_cols = [c for c in X.columns if X[c].nunique(dropna=True) > 1]
+    if len(valid_cols) <= 1:
+        return valid_cols, drop_reasons
+
+    corr = X[valid_cols].corr().abs()
+    # Upper triangle without diagonal
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+
+    to_drop: List[str] = []
+    for col in upper.columns:
+        if col in to_drop:
+            continue
+        highly_corr = upper.index[upper[col] >= correlation_threshold].tolist()
+        # If any found, drop the current column (keep the first/earlier ones)
+        for hc in highly_corr:
+            if hc not in to_drop:
+                to_drop.append(col)
+                break
+    for c in to_drop:
+        drop_reasons[c] = f"high_correlation_>={correlation_threshold}"
+
+    kept_cols = [c for c in X.columns if c not in to_drop]
+    return kept_cols, drop_reasons
 
 
 def plot_cox_coefficients(
@@ -158,18 +229,80 @@ def plot_km_curves_four_groups(merged_df: pd.DataFrame) -> None:
 def fit_cox_model(
     train_df: pd.DataFrame, feature_cols: List[str], time_col: str, event_col: str
 ) -> CoxPHFitter:
-    df_fit = train_df[[time_col, event_col] + feature_cols].copy()
-    cph = CoxPHFitter()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        cph.fit(df_fit, duration_col=time_col, event_col=event_col, robust=True)
-    return cph
+    # Keep only numeric feature columns
+    numeric_features = _select_numerical_feature_columns(train_df, feature_cols)
+    if len(numeric_features) == 0:
+        raise ValueError("No numeric features available for CoxPH fitting.")
+
+    # Drop rows with missing survival info
+    df_fit = train_df[[time_col, event_col] + numeric_features].dropna(
+        subset=[time_col, event_col]
+    ).copy()
+
+    # Drop constant and duplicate columns
+    kept_after_basic, _ = _drop_constant_and_duplicate_columns(df_fit, numeric_features)
+
+    # Drop highly correlated columns (almost identical)
+    kept_after_corr, _ = _drop_highly_correlated_columns(
+        df_fit, kept_after_basic, correlation_threshold=0.999
+    )
+
+    final_features = kept_after_corr
+    if len(final_features) == 0:
+        raise ValueError("All features were filtered out before fitting CoxPH.")
+
+    df_fit_final = df_fit[[time_col, event_col] + final_features].copy()
+
+    # Try increasingly strong L2 penalization to handle collinearity
+    penalizer_grid = [0.0, 0.01, 0.1, 1.0]
+    last_err: Exception = None
+    for pen in penalizer_grid:
+        cph = CoxPHFitter(penalizer=pen, l1_ratio=0.0)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                cph.fit(
+                    df_fit_final,
+                    duration_col=time_col,
+                    event_col=event_col,
+                    robust=True,
+                )
+            return cph
+        except (ConvergenceError, LinAlgError, ValueError) as e:
+            last_err = e
+            continue
+
+    # As a last resort, lower the correlation threshold and retry with moderate penalization
+    kept_after_corr_loose, _ = _drop_highly_correlated_columns(
+        df_fit, kept_after_basic, correlation_threshold=0.99
+    )
+    if len(kept_after_corr_loose) >= 1:
+        df_fit_final2 = df_fit[[time_col, event_col] + kept_after_corr_loose].copy()
+        try:
+            cph = CoxPHFitter(penalizer=0.1, l1_ratio=0.0)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                cph.fit(
+                    df_fit_final2,
+                    duration_col=time_col,
+                    event_col=event_col,
+                    robust=True,
+                )
+            return cph
+        except (ConvergenceError, LinAlgError, ValueError) as e:
+            last_err = e
+
+    raise ConvergenceError(
+        f"CoxPH failed to converge due to collinearity after preprocessing. Last error: {last_err}"
+    )
 
 
 def predict_risk(
     model: CoxPHFitter, df: pd.DataFrame, feature_cols: List[str]
 ) -> np.ndarray:
-    X = df[feature_cols].copy()
+    # Use the model's trained columns to avoid mismatches if features were filtered
+    trained_cols = model.params_.index.tolist()
+    X = df[trained_cols].copy()
     risk = model.predict_partial_hazard(X).values.reshape(-1)
     return risk
 
