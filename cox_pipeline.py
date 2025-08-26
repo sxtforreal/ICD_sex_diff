@@ -63,14 +63,27 @@ def plot_cox_coefficients(
 ) -> None:
     coef_series = model.params_.sort_values(ascending=False)
     feats = coef_series.index.tolist()
+
+    # Build category sets from FEATURE_SETS
+    try:
+        guideline_set = set(FEATURE_SETS.get("Guideline", [])) | {"NYHA>2"}
+        benchmark_set = set(FEATURE_SETS.get("Benchmark", []))
+        proposed_set = set(FEATURE_SETS.get("Proposed", []))
+    except Exception:
+        guideline_set, benchmark_set, proposed_set = set(), set(), set()
+
+    benchmark_only = benchmark_set - guideline_set
+    proposed_only = proposed_set - (benchmark_set | guideline_set)
+
+    # Map features to colors by category
     colors = []
-    gray_set = set(gray_features) if gray_features is not None else set()
-    red_set = set(red_features) if red_features is not None else set()
     for f in feats:
-        if f in red_set:
-            colors.append("red")
-        elif f in gray_set:
+        if f in guideline_set:
             colors.append("gray")
+        elif f in benchmark_only:
+            colors.append("green")
+        elif f in proposed_only:
+            colors.append("orange")
         else:
             colors.append("blue")
     plt.figure(figsize=(9, 4))
@@ -82,75 +95,73 @@ def plot_cox_coefficients(
     plt.show()
 
 
-def plot_km_curves_four_groups(merged_df: pd.DataFrame) -> None:
-    """Plot KM curves for 4 groups using Primary Endpoint (PE):
-    Male-Pred0, Male-Pred1, Female-Pred0, Female-Pred1, with within-sex log-rank tests.
+def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame) -> None:
+    """Plot KM curves in two subplots (Male left, Female right) using Primary Endpoint (PE).
+    Each subplot contains two curves: Low risk (pred0) and High risk (pred1), with within-sex log-rank test.
     """
     if merged_df.empty:
         return
     if not {"PE_Time", "PE"}.issubset(merged_df.columns):
         return
 
-    kmf = KaplanMeierFitter()
-    groups = [
-        (0, 0, "Male-Pred0", "blue"),
-        (0, 1, "Male-Pred1", "red"),
-        (1, 0, "Female-Pred0", "lightblue"),
-        (1, 1, "Female-Pred1", "pink"),
-    ]
-
-    fig, ax = plt.subplots(1, 1, figsize=(9, 6))
     ep_time_col, ep_event_col = "PE_Time", "PE"
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
 
-    for gender_val, pred_val, group_name, color in groups:
-        mask = (merged_df["Female"] == gender_val) & (
-            merged_df["pred_label"] == pred_val
-        )
-        group_data = merged_df[mask]
-        if group_data.empty:
+    for ax_idx, (sex_val, sex_name) in enumerate([(0, "Male"), (1, "Female")]):
+        ax = axes[ax_idx]
+        subset = merged_df[merged_df["Female"] == sex_val]
+        if subset.empty:
+            ax.set_title(f"{sex_name} (no data)")
+            ax.axis("off")
             continue
-        n_samples = len(group_data)
-        events = group_data[ep_event_col].sum()
-        label = f"{group_name} (n={n_samples}, events={events})"
-        kmf.fit(
-            durations=group_data[ep_time_col],
-            event_observed=group_data[ep_event_col],
-            label=label,
-        )
-        kmf.plot(ax=ax, color=color)
 
-    # Pairwise within-sex logrank
-    male_pred0 = merged_df[(merged_df["Female"] == 0) & (merged_df["pred_label"] == 0)]
-    male_pred1 = merged_df[(merged_df["Female"] == 0) & (merged_df["pred_label"] == 1)]
-    female_pred0 = merged_df[
-        (merged_df["Female"] == 1) & (merged_df["pred_label"] == 0)
-    ]
-    female_pred1 = merged_df[
-        (merged_df["Female"] == 1) & (merged_df["pred_label"] == 1)
-    ]
+        kmf = KaplanMeierFitter()
+        curves = [
+            (0, "Low risk", "blue"),
+            (1, "High risk", "red"),
+        ]
+        for pred_val, label_base, color in curves:
+            grp = subset[subset["pred_label"] == pred_val]
+            if grp.empty:
+                continue
+            n_samples = len(grp)
+            events = grp[ep_event_col].sum()
+            label = f"{label_base} (n={n_samples}, events={events})"
+            kmf.fit(
+                durations=grp[ep_time_col],
+                event_observed=grp[ep_event_col],
+                label=label,
+            )
+            kmf.plot(ax=ax, color=color)
 
-    if not male_pred0.empty and not male_pred1.empty:
-        lr_male = logrank_test(
-            male_pred0[ep_time_col],
-            male_pred1[ep_time_col],
-            male_pred0[ep_event_col],
-            male_pred1[ep_event_col],
-        )
-        ax.text(0.02, 0.02, f"Male p={lr_male.p_value:.4f}", transform=ax.transAxes)
-    if not female_pred0.empty and not female_pred1.empty:
-        lr_female = logrank_test(
-            female_pred0[ep_time_col],
-            female_pred1[ep_time_col],
-            female_pred0[ep_event_col],
-            female_pred1[ep_event_col],
-        )
-        ax.text(0.02, 0.08, f"Female p={lr_female.p_value:.4f}", transform=ax.transAxes)
+        # Log-rank test between low/high risk within sex
+        low = subset[subset["pred_label"] == 0]
+        high = subset[subset["pred_label"] == 1]
+        if not low.empty and not high.empty:
+            lr = logrank_test(
+                low[ep_time_col],
+                high[ep_time_col],
+                low[ep_event_col],
+                high[ep_event_col],
+            )
+            ax.text(
+                0.95,
+                0.05,
+                f"Log-rank p = {lr.p_value:.4f}",
+                transform=ax.transAxes,
+                ha="right",
+                va="bottom",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+            )
 
-    ax.set_title("Primary Endpoint - Survival by Gender and Prediction")
-    ax.set_xlabel("Time (days)")
-    ax.set_ylabel("Survival Probability")
-    ax.legend()
-    ax.grid(alpha=0.3)
+        ax.set_title(sex_name)
+        ax.set_xlabel("Time (days)")
+        if ax_idx == 0:
+            ax.set_ylabel("Survival Probability")
+        ax.grid(alpha=0.3)
+
+    axes[0].legend(loc="best")
+    plt.suptitle("Primary Endpoint - Survival by Gender and Risk Group", y=1.02)
     plt.tight_layout()
     plt.show()
 
@@ -340,7 +351,66 @@ def sex_specific_inference(
         .drop_duplicates(subset=["MRN"])
         .rename(columns={"VT/VF/SCD": "PE"})
     )
-    plot_km_curves_four_groups(merged_df)
+    plot_km_two_subplots_by_gender(merged_df)
+    return merged_df
+
+
+def sex_specific_full_inference(
+    df: pd.DataFrame,
+    features: List[str],
+    gray_features: List[str] = None,
+    red_features: List[str] = None,
+) -> pd.DataFrame:
+    """Train sex-specific CoxPH models on all data (per sex) and analyze on all data.
+
+    - Uses PE_Time and VT/VF/SCD
+    - Excludes Female from submodel features
+    - Dichotomizes by sex-specific median risks
+    """
+    used_features = [f for f in features if f != "Female"]
+
+    data_m = df[df["Female"] == 0].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
+    data_f = df[df["Female"] == 1].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
+
+    models = {}
+    thresholds = {}
+
+    if not data_m.empty:
+        cph_m = fit_cox_model(data_m, used_features, "PE_Time", "VT/VF/SCD")
+        r_m = predict_risk(cph_m, data_m, used_features)
+        thresholds["male"] = float(np.nanmedian(r_m))
+        models["male"] = cph_m
+        plot_cox_coefficients(
+            cph_m, "Male Cox Coefficients (log HR)", gray_features, red_features
+        )
+    if not data_f.empty:
+        cph_f = fit_cox_model(data_f, used_features, "PE_Time", "VT/VF/SCD")
+        r_f = predict_risk(cph_f, data_f, used_features)
+        thresholds["female"] = float(np.nanmedian(r_f))
+        models["female"] = cph_f
+        plot_cox_coefficients(
+            cph_f, "Female Cox Coefficients (log HR)", gray_features, red_features
+        )
+
+    out = df.copy()
+    if "male" in models and not out[out["Female"] == 0].empty:
+        te_m = out[out["Female"] == 0]
+        risk_m = predict_risk(models["male"], te_m, used_features)
+        out.loc[out["Female"] == 0, "pred_prob"] = risk_m
+        out.loc[out["Female"] == 0, "pred_label"] = (risk_m >= thresholds["male"]).astype(int)
+    if "female" in models and not out[out["Female"] == 1].empty:
+        te_f = out[out["Female"] == 1]
+        risk_f = predict_risk(models["female"], te_f, used_features)
+        out.loc[out["Female"] == 1, "pred_prob"] = risk_f
+        out.loc[out["Female"] == 1, "pred_label"] = (risk_f >= thresholds["female"]).astype(int)
+
+    merged_df = (
+        out[["MRN", "Female", "pred_label", "PE_Time", "VT/VF/SCD"]]
+        .dropna(subset=["PE_Time", "VT/VF/SCD"])
+        .drop_duplicates(subset=["MRN"])
+        .rename(columns={"VT/VF/SCD": "PE"})
+    )
+    plot_km_two_subplots_by_gender(merged_df)
     return merged_df
 
 
@@ -385,7 +455,47 @@ def sex_agnostic_inference(
         .drop_duplicates(subset=["MRN"])
         .rename(columns={label_col: "PE"})
     )
-    plot_km_curves_four_groups(merged_df)
+    plot_km_two_subplots_by_gender(merged_df)
+    return merged_df
+
+
+def sex_agnostic_full_inference(
+    df: pd.DataFrame,
+    features: List[str],
+    label_col: str = "VT/VF/SCD",
+    use_undersampling: bool = True,
+    gray_features: List[str] = None,
+    red_features: List[str] = None,
+) -> pd.DataFrame:
+    """Train a sex-agnostic CoxPH model on all data and analyze on all data.
+
+    - Uses PE_Time and label_col in the provided dataframe
+    - Includes Female in features
+    - Dichotomizes risk by overall median
+    """
+    used_features = features
+    df_base = create_undersampled_dataset(df, label_col, 42) if use_undersampling else df
+    data = df_base.dropna(subset=["PE_Time", label_col]).copy()
+    if data.empty:
+        return pd.DataFrame()
+
+    cph = fit_cox_model(data, used_features, "PE_Time", label_col)
+    plot_cox_coefficients(
+        cph, "Sex-Agnostic Cox Coefficients (log HR)", gray_features, red_features
+    )
+    risk_all = predict_risk(cph, data, used_features)
+    thr = float(np.nanmedian(risk_all))
+
+    data["pred_prob"] = risk_all
+    data["pred_label"] = (risk_all >= thr).astype(int)
+
+    merged_df = (
+        data[["MRN", "Female", "pred_label", "PE_Time", label_col]]
+        .dropna(subset=["PE_Time", label_col])
+        .drop_duplicates(subset=["MRN"])
+        .rename(columns={label_col: "PE"})
+    )
+    plot_km_two_subplots_by_gender(merged_df)
     return merged_df
 
 
@@ -714,7 +824,7 @@ def run_cox_experiments(
         {"name": "Sex-agnostic (Cox, undersampled)", "mode": "sex_agnostic"},
         {"name": "Sex-specific (Cox)", "mode": "sex_specific"},
     ]
-    metrics = ["c_index"]
+    metrics = ["c_index_all", "c_index_male", "c_index_female"]
 
     results: Dict[str, Dict[str, List[float]]] = {}
     for featset_name in feature_sets:
@@ -743,9 +853,38 @@ def run_cox_experiments(
                     seed=seed,
                     use_undersampling=use_undersampling,
                 )
-                eval_df = te[[event_col, "Female"]].reset_index(drop=True).copy()
-                eval_df["pred"] = pred
-                results[name]["c_index"].append(met["c_index"])
+                # overall, male, female C-index based on risk
+                cidx_all = met.get("c_index", np.nan)
+                try:
+                    mask_m = te["Female"].values == 0
+                    mask_f = te["Female"].values == 1
+                    # Safety: ensure finite and sufficient variation
+                    def _safe_cidx(t, e, r):
+                        try:
+                            if len(t) < 2:
+                                return np.nan
+                            if np.all(~np.isfinite(r)) or np.allclose(r, r[0]):
+                                return np.nan
+                            return concordance_index(t, -r, e)
+                        except Exception:
+                            return np.nan
+
+                    cidx_m = _safe_cidx(
+                        te.loc[mask_m, time_col].values,
+                        te.loc[mask_m, event_col].values,
+                        np.asarray(risk)[mask_m],
+                    )
+                    cidx_f = _safe_cidx(
+                        te.loc[mask_f, time_col].values,
+                        te.loc[mask_f, event_col].values,
+                        np.asarray(risk)[mask_f],
+                    )
+                except Exception:
+                    cidx_m, cidx_f = np.nan, np.nan
+
+                results[name]["c_index_all"].append(cidx_all)
+                results[name]["c_index_male"].append(cidx_m)
+                results[name]["c_index_female"].append(cidx_f)
 
     # Summarize
     summary = {}
@@ -773,6 +912,14 @@ def run_cox_experiments(
         axis=1,
     )
     summary_table = formatted.unstack(level=1)
+    # Rename columns to desired group names
+    summary_table = summary_table.rename(
+        columns={
+            "c_index_all": "all",
+            "c_index_male": "male",
+            "c_index_female": "female",
+        }
+    )
 
     if export_excel_path is not None:
         os.makedirs(os.path.dirname(export_excel_path), exist_ok=True)
@@ -848,14 +995,10 @@ if __name__ == "__main__":
     )
     print("Saved Excel:", export_path)
 
-    # Run inference
-    tr, te = train_test_split(
-        df, test_size=0.3, random_state=0, stratify=df["VT/VF/SCD"]
-    )
+    # Full-data inference and analysis
     features = FEATURE_SETS["Benchmark"]
+    print("Running sex-agnostic full-data inference (includes Female; undersampling=True)...")
+    _ = sex_agnostic_full_inference(df, features, use_undersampling=True)
 
-    print("Running sex-agnostic inference (includes Female; undersampling=True)...")
-    _ = sex_agnostic_inference(tr, te, features, use_undersampling=True)
-
-    print("Running sex-specific inference (excludes Female in submodels)...")
-    _ = sex_specific_inference(tr, te, features)
+    print("Running sex-specific full-data inference (excludes Female in submodels)...")
+    _ = sex_specific_full_inference(df, features)
