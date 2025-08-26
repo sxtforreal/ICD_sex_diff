@@ -20,6 +20,13 @@ try:
 except Exception:
     _HAS_MISSFOREST = False
 
+try:
+    from tableone import TableOne
+
+    _HAS_TABLEONE = True
+except Exception:
+    _HAS_TABLEONE = False
+
 
 # ==========================================
 # Utilities
@@ -165,6 +172,115 @@ def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame) -> None:
     plt.tight_layout()
     plt.show()
 
+
+# ==========================================
+# TableOne generation (Sex x ICD -> 4 groups)
+# ==========================================
+
+def generate_tableone_by_sex_icd(
+    df: pd.DataFrame, output_excel_path: str = None
+) -> None:
+    """Generate a TableOne after loading df, splitting into 4 groups by sex and ICD.
+
+    Groups: Male-ICD, Male-No ICD, Female-ICD, Female-No ICD.
+    Compares all available features and labels (exclude MRN and the group column itself).
+    """
+    if df is None or df.empty:
+        return
+    if not {"Female", "ICD"}.issubset(df.columns):
+        return
+
+    df_local = df.copy()
+
+    # Ensure numeric coding for conditions
+    female_num = pd.to_numeric(df_local["Female"], errors="coerce")
+    icd_num = pd.to_numeric(df_local["ICD"], errors="coerce")
+
+    conditions = [
+        (female_num == 0) & (icd_num == 1),
+        (female_num == 0) & (icd_num == 0),
+        (female_num == 1) & (icd_num == 1),
+        (female_num == 1) & (icd_num == 0),
+    ]
+    choices = ["Male-ICD", "Male-No ICD", "Female-ICD", "Female-No ICD"]
+    df_local["Group"] = np.select(conditions, choices, default=np.nan)
+
+    group_order = ["Male-ICD", "Male-No ICD", "Female-ICD", "Female-No ICD"]
+
+    # Use all columns except identifiers and helper columns
+    exclude_cols = {"MRN", "Group"}
+    variables = [c for c in df_local.columns if c not in exclude_cols]
+
+    # Known categorical candidates; keep only those present
+    known_cats = [
+        "Female",
+        "DM",
+        "HTN",
+        "HLP",
+        "AF",
+        "NYHA Class",
+        "NYHA>2",
+        "Beta Blocker",
+        "ACEi/ARB/ARNi",
+        "Aldosterone Antagonist",
+        "VT/VF/SCD",
+        "AAD",
+        "CRT",
+        "ICD",
+        "CrCl>45",
+        "Significant LGE",
+    ]
+    categorical_cols = [c for c in known_cats if c in variables]
+
+    # Prefer TableOne if available
+    if _HAS_TABLEONE:
+        try:
+            tab1 = TableOne(
+                df_local,
+                columns=variables,
+                categorical=categorical_cols,
+                groupby="Group",
+                groupby_order=group_order,
+                pval=True,
+            )
+            print("==== TableOne (Sex x ICD) ====")
+            print(tab1)
+
+            table_df = getattr(tab1, "tableone", None)
+            if table_df is None:
+                try:
+                    table_df = tab1.to_dataframe()  # type: ignore[attr-defined]
+                except Exception:
+                    table_df = None
+            if output_excel_path and table_df is not None:
+                os.makedirs(os.path.dirname(output_excel_path), exist_ok=True)
+                table_df.to_excel(output_excel_path)
+                print(f"Saved TableOne to: {output_excel_path}")
+            return
+        except Exception as e:
+            warnings.warn(f"[TableOne] Failed to generate TableOne: {e}")
+
+    # Fallback summary if TableOne is not available
+    try:
+        numeric_cols = [c for c in variables if pd.api.types.is_numeric_dtype(df_local[c])]
+        parts = []
+        for grp_name in group_order:
+            grp = df_local[df_local["Group"] == grp_name]
+            if grp.empty:
+                continue
+            desc = grp[numeric_cols].describe().T
+            desc.insert(0, "group", grp_name)
+            parts.append(desc)
+        if parts:
+            fallback_df = pd.concat(parts, axis=0)
+            print("==== Numeric summary by group (fallback) ====")
+            print(fallback_df.head())
+            if output_excel_path:
+                os.makedirs(os.path.dirname(output_excel_path), exist_ok=True)
+                fallback_df.to_excel(output_excel_path)
+                print(f"Saved fallback summary to: {output_excel_path}")
+    except Exception as e:
+        warnings.warn(f"[TableOne Fallback] Failed to generate summary: {e}")
 
 # Drop constant/duplicate/highly correlated columns to mitigate singular matrices
 def _sanitize_cox_features_matrix(
@@ -987,6 +1103,15 @@ FEATURE_SETS = {
 if __name__ == "__main__":
     # Load and prepare data
     df = load_dataframes()
+
+    # Generate TableOne grouped by Sex x ICD (four groups)
+    try:
+        generate_tableone_by_sex_icd(
+            df,
+            output_excel_path="/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/results_tableone_sex_icd.xlsx",
+        )
+    except Exception as e:
+        warnings.warn(f"[Main] TableOne generation skipped due to error: {e}")
 
     # Run experiments (50 random splits; PE as event; PE_Time as duration)
     export_path = (
