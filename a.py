@@ -1464,65 +1464,92 @@ def plot_km_curves_four_groups(merged_df):
 
 def sex_specific_model_inference(train_df, test_df, features, labels, survival_df, seed, gray_features=None, red_features=None):
     """
-    Sex-specific model inference function:
-    1. Train separate Random Forest models for male and female using provided features
-    2. Generate predictions for each sample
-    3. Perform survival analysis by gender and predicted label (4 groups total)
-    4. Generate KM plots and logrank tests
-    5. Show feature importance and incidence rates
-    
-    Args:
-        gray_features: List of feature names to be colored gray in importance plots.
-        red_features: List of feature names to be colored red in importance plots.
-                     Features not in gray_features or red_features will be colored blue.
+    Sex-specific model inference function using Cox Proportional Hazards:
+    1. Fit separate Cox models for male and female on training survival data (PE as event)
+    2. Predict partial hazards on test
+    3. Dichotomize by median training risk within each sex (High vs Low)
+    4. Perform survival analysis by gender and predicted label (4 groups total)
+    5. Plot Cox coefficients as feature importance
     """
     train = train_df.copy()
     test = test_df.copy()
     df = test.copy()
 
-    # Separate training data by gender
-    train_m = train[train["Female"] == 0].copy()
-    train_f = train[train["Female"] == 1].copy()
+    # Use features excluding the constant sex indicator within each sex subgroup
+    used_features = [f for f in features if f != "Female"]
+
+    # Prepare survival-joined training subsets
+    train_m = train[train["Female"] == 0].merge(survival_df[["MRN", "PE_Time", "PE"]], on="MRN", how="inner").dropna(subset=["PE_Time", "PE"])
+    train_f = train[train["Female"] == 1].merge(survival_df[["MRN", "PE_Time", "PE"]], on="MRN", how="inner").dropna(subset=["PE_Time", "PE"])
     test_m = test[test["Female"] == 0].copy()
     test_f = test[test["Female"] == 1].copy()
 
-    # Train gender-specific models
-    print("Training Male Model...")
-    best_male, best_thr_m = train_sex_specific_model(
-        train_m[features], train_m[labels], features, seed
-    )
-    
-    print("Training Female Model...")
-    best_female, best_thr_f = train_sex_specific_model(
-        train_f[features], train_f[labels], features, seed
-    )
+    models = {}
+    thresholds = {}
 
-    # Make predictions on test set
-    if not test_m.empty:
-        prob_m = best_male.predict_proba(test_m[features])[:, 1]
-        pred_m = (prob_m >= best_thr_m).astype(int)
+    # Male Cox model
+    if not train_m.empty:
+        cph_m = CoxPHFitter()
+        cph_m.fit(train_m[["PE_Time", "PE"] + used_features], duration_col="PE_Time", event_col="PE", robust=True)
+        risk_m_tr = cph_m.predict_partial_hazard(train_m[used_features]).values.reshape(-1)
+        thr_m = float(np.nanmedian(risk_m_tr))
+        models["male"] = cph_m
+        thresholds["male"] = thr_m
+
+    # Female Cox model
+    if not train_f.empty:
+        cph_f = CoxPHFitter()
+        cph_f.fit(train_f[["PE_Time", "PE"] + used_features], duration_col="PE_Time", event_col="PE", robust=True)
+        risk_f_tr = cph_f.predict_partial_hazard(train_f[used_features]).values.reshape(-1)
+        thr_f = float(np.nanmedian(risk_f_tr))
+        models["female"] = cph_f
+        thresholds["female"] = thr_f
+
+    # Predict on test and assign risk groups
+    if "male" in models and not test_m.empty:
+        risk_m = models["male"].predict_partial_hazard(test_m[used_features]).values.reshape(-1)
+        pred_m = (risk_m >= thresholds["male"]).astype(int)
         df.loc[df["Female"] == 0, "pred_label"] = pred_m
-        df.loc[df["Female"] == 0, "pred_prob"] = prob_m
-    
-    if not test_f.empty:
-        prob_f = best_female.predict_proba(test_f[features])[:, 1]
-        pred_f = (prob_f >= best_thr_f).astype(int)
+        df.loc[df["Female"] == 0, "pred_prob"] = risk_m
+
+    if "female" in models and not test_f.empty:
+        risk_f = models["female"].predict_partial_hazard(test_f[used_features]).values.reshape(-1)
+        pred_f = (risk_f >= thresholds["female"]).astype(int)
         df.loc[df["Female"] == 1, "pred_label"] = pred_f
-        df.loc[df["Female"] == 1, "pred_prob"] = prob_f
+        df.loc[df["Female"] == 1, "pred_prob"] = risk_f
 
-    # Feature importance visualization
-    plot_feature_importances(best_male, features, "Male Model Feature Importances", seed, gray_features, red_features)
-    plot_feature_importances(best_female, features, "Female Model Feature Importances", seed, gray_features, red_features)
+    # Plot Cox coefficients as feature importance
+    def _plot_coefs(coefs, title):
+        gray_set = set(gray_features) if gray_features is not None else set()
+        red_set = set(red_features) if red_features is not None else set()
+        colors = [
+            "red" if f in red_set else ("gray" if f in gray_set else "blue")
+            for f in coefs.index
+        ]
+        plt.figure(figsize=(8, 4))
+        plt.bar(range(len(coefs)), coefs.values, color=colors)
+        plt.xticks(range(len(coefs)), list(coefs.index), rotation=90)
+        plt.xlabel("Feature")
+        plt.ylabel("Cox coefficient (log HR)")
+        plt.title(title)
+        plt.tight_layout()
+        plt.show()
 
-    # Merge with survival data
+    if "male" in models:
+        coefs_m = models["male"].params_.reindex(used_features)
+        _plot_coefs(coefs_m, "Male Cox Coefficients (log HR)")
+    if "female" in models:
+        coefs_f = models["female"].params_.reindex(used_features)
+        _plot_coefs(coefs_f, "Female Cox Coefficients (log HR)")
+
+    # Merge predictions with survival and analyze
     pred_labels = df[["MRN", "pred_label", "Female"]].drop_duplicates()
     merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
 
     print(f"\n=== Summary ===")
     print(f"Total test samples: {len(df)}")
     print(f"Samples with survival data: {len(merged_df)}")
-    
-    # Calculate incidence rates for the 4 groups
+
     for gender_val, gender_name in [(0, "Male"), (1, "Female")]:
         gender_data = merged_df[merged_df["Female"] == gender_val]
         if not gender_data.empty:
@@ -1532,8 +1559,7 @@ def sex_specific_model_inference(train_df, test_df, features, labels, survival_d
                     pe_rate = group_data["PE"].sum() / len(group_data)
                     se_rate = group_data["SE"].sum() / len(group_data)
                     print(f"{gender_name}-Pred{pred_val}: PE rate = {pe_rate:.4f}, SE rate = {se_rate:.4f}")
-    
-    # Analyze and plot survival by merged groups (Low Risk vs High Risk)
+
     analyze_survival_by_four_groups(merged_df)
     plot_km_curves_merged(merged_df)
 
@@ -1541,179 +1567,72 @@ def sex_specific_model_inference(train_df, test_df, features, labels, survival_d
 
 def sex_specific_full_inference(train_df, test_df, features, labels, survival_df, seed, gray_features=None, red_features=None):
     """
-    Sex-specific full model inference function that handles survival analysis with updated column names.
-    This function performs the complete pipeline including model training, prediction, 
-    and survival analysis using the renamed PE and SE columns.
-    
-    Args:
-        gray_features: List of feature names to be colored gray in importance plots.
-        red_features: List of feature names to be colored red in importance plots.
-                     Features not in gray_features or red_features will be colored blue.
+    Sex-specific full model inference (CoxPH) that mirrors sex_specific_model_inference
+    and uses PE/PE_Time for model fitting and survival analysis.
     """
-    train = train_df.copy()
-    test = test_df.copy()
-    df = test.copy()
-
-    # Separate training data by gender
-    train_m = train[train["Female"] == 0].copy()
-    train_f = train[train["Female"] == 1].copy()
-    test_m = test[test["Female"] == 0].copy()
-    test_f = test[test["Female"] == 1].copy()
-
-    # Train gender-specific models
-    print("Training Male Model...")
-    best_male, best_thr_m = train_sex_specific_model(
-        train_m[features], train_m[labels], features, seed
-    )
-    
-    print("Training Female Model...")
-    best_female, best_thr_f = train_sex_specific_model(
-        train_f[features], train_f[labels], features, seed
-    )
-
-    # Make predictions on test set
-    if not test_m.empty:
-        prob_m = best_male.predict_proba(test_m[features])[:, 1]
-        pred_m = (prob_m >= best_thr_m).astype(int)
-        df.loc[df["Female"] == 0, "pred_label"] = pred_m
-        df.loc[df["Female"] == 0, "pred_prob"] = prob_m
-    
-    if not test_f.empty:
-        prob_f = best_female.predict_proba(test_f[features])[:, 1]
-        pred_f = (prob_f >= best_thr_f).astype(int)
-        df.loc[df["Female"] == 1, "pred_label"] = pred_f
-        df.loc[df["Female"] == 1, "pred_prob"] = prob_f
-
-    # Feature importance visualization
-    plot_feature_importances(best_male, features, "Male Model Feature Importances", seed, gray_features, red_features)
-    plot_feature_importances(best_female, features, "Female Model Feature Importances", seed, gray_features, red_features)
-
-    # Merge with survival data
-    pred_labels = df[["MRN", "pred_label", "Female"]].drop_duplicates()
-    merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
-
-    print(f"\n=== Summary ===")
-    print(f"Total test samples: {len(df)}")
-    print(f"Samples with survival data: {len(merged_df)}")
-    
-    # Calculate incidence rates for the 4 groups using updated column names
-    for gender_val, gender_name in [(0, "Male"), (1, "Female")]:
-        gender_data = merged_df[merged_df["Female"] == gender_val]
-        if not gender_data.empty:
-            for pred_val in [0, 1]:
-                group_data = gender_data[gender_data["pred_label"] == pred_val]
-                if not group_data.empty:
-                    pe_rate = group_data["PE"].sum() / len(group_data)  # Using PE instead of old column name
-                    se_rate = group_data["SE"].sum() / len(group_data)  # Using SE instead of old column name
-                    print(f"{gender_name}-Pred{pred_val}: PE rate = {pe_rate:.4f}, SE rate = {se_rate:.4f}")
-    
-    # Perform survival analysis by risk groups
-    print("\n=== Survival Analysis by Risk Groups ===")
-    
-    # Analyze low risk vs high risk within each gender
-    for gender_val, gender_name in [(0, "Male"), (1, "Female")]:
-        gender_data = merged_df[merged_df["Female"] == gender_val]
-        if gender_data.empty:
-            continue
-            
-        mask_low = gender_data["pred_label"] == 0
-        mask_high = gender_data["pred_label"] == 1
-        
-        n_low = mask_low.sum()
-        n_high = mask_high.sum()
-        
-        if n_low > 0 and n_high > 0:
-            # Use the updated column names PE and SE
-            events_low = gender_data.loc[mask_low, "PE"].sum()
-            events_high = gender_data.loc[mask_high, "PE"].sum()
-            
-            # Calculate incidence rates
-            rate_low = events_low / n_low if n_low > 0 else 0
-            rate_high = events_high / n_high if n_high > 0 else 0
-            
-            print(f"\n{gender_name} Primary Endpoint Analysis:")
-            print(f"  Low Risk: {events_low}/{n_low} events (rate: {rate_low:.4f})")
-            print(f"  High Risk: {events_high}/{n_high} events (rate: {rate_high:.4f})")
-            
-            # Secondary endpoint analysis
-            se_events_low = gender_data.loc[mask_low, "SE"].sum()
-            se_events_high = gender_data.loc[mask_high, "SE"].sum()
-            
-            se_rate_low = se_events_low / n_low if n_low > 0 else 0
-            se_rate_high = se_events_high / n_high if n_high > 0 else 0
-            
-            print(f"  Secondary Endpoint - Low Risk: {se_events_low}/{n_low} events (rate: {se_rate_low:.4f})")
-            print(f"  Secondary Endpoint - High Risk: {se_events_high}/{n_high} events (rate: {se_rate_high:.4f})")
-
-    # Analyze and plot survival by merged groups (Low Risk vs High Risk)
-    analyze_survival_by_four_groups(merged_df)
-    plot_km_curves_merged(merged_df)
-
-    return merged_df
-
+    return sex_specific_model_inference(train_df, test_df, features, labels, survival_df, seed, gray_features, red_features)
 
 def sex_agnostic_model_inference(train_df, test_df, features, label_col, survival_df, seed, gray_features=None, red_features=None, use_undersampling=True):
     """
-    Sex-agnostic model inference function that trains a single model on all data
-    and performs survival analysis similar to sex-specific models.
-    
-    Args:
-        train_df: Training dataframe
-        test_df: Test dataframe
-        features: List of feature names
-        label_col: Name of the target column
-        survival_df: Survival data
-        seed: Random seed
-        gray_features: List of features to color gray in importance plots
-        red_features: List of features to color red in importance plots
-        use_undersampling: Whether to use undersampling for training
-    
-    Returns:
-        Merged dataframe with predictions and survival data
+    Sex-agnostic model inference using Cox Proportional Hazards.
+    - Trains a single Cox model on all training data (Female excluded from features)
+      with optional undersampling for fairness against sex-specific models.
+    - Uses median training risk to dichotomize test into Low/High risk.
+    - Performs KM/log-rank and plots Cox coefficients.
     """
     test = test_df.copy()
-    
-    # Remove sex indicator for sex-agnostic training/inference
     used_features = [f for f in features if f != "Female"]
-    
-    # Train sex-agnostic model
-    print("Training Sex-Agnostic Model...")
-    best_model, best_threshold = train_sex_agnostic_model(
-        train_df, used_features, label_col, seed, use_undersampling
-    )
-    print(f"Optimal probability threshold determined from training data: {best_threshold:.4f}")
-    
-    # Make predictions on test set
-    test_probs = best_model.predict_proba(test[used_features])[:, 1]
-    print(f"Test probabilities – min: {test_probs.min():.4f}, max: {test_probs.max():.4f}, mean: {test_probs.mean():.4f}")
+
+    # Undersample for fair comparison if requested
+    if use_undersampling:
+        train_data = create_undersampled_dataset(train_df, label_col, seed)
+        print(f"Using undersampled training data: {len(train_data)} samples")
+    else:
+        train_data = train_df.copy()
+        print(f"Using full training data: {len(train_data)} samples")
+
+    # Merge survival and fit Cox model on training
+    tr = train_data.merge(survival_df[["MRN", "PE_Time", "PE"]], on="MRN", how="inner").dropna(subset=["PE_Time", "PE"])
+    if tr.empty:
+        print("Warning: No training samples with survival information for Cox fitting.")
+        return test
+
+    cph = CoxPHFitter()
+    cph.fit(tr[["PE_Time", "PE"] + used_features], duration_col="PE_Time", event_col="PE", robust=True)
+    train_risk = cph.predict_partial_hazard(tr[used_features]).values.reshape(-1)
+    best_threshold = float(np.nanmedian(train_risk))
+    print(f"Optimal risk threshold (training median): {best_threshold:.6f}")
+
+    # Predict on test set
+    test_probs = cph.predict_partial_hazard(test[used_features]).values.reshape(-1)
     test_preds = (test_probs >= best_threshold).astype(int)
-    
-    # Add predictions to test dataframe
+
     test["pred_label"] = test_preds
     test["pred_prob"] = test_probs
-    
-    # Feature importance visualization
-    plot_feature_importances(
-        best_model, used_features, 
-        "Sex-Agnostic Model Feature Importances", 
-        seed, gray_features, red_features
-    )
-    
+
+    # Plot Cox coefficients as feature importance
+    gray_set = set(gray_features) if gray_features is not None else set()
+    red_set = set(red_features) if red_features is not None else set()
+    coefs = cph.params_.reindex(used_features)
+    colors = ["red" if f in red_set else ("gray" if f in gray_set else "blue") for f in coefs.index]
+    plt.figure(figsize=(8, 4))
+    plt.bar(range(len(coefs)), coefs.values, color=colors)
+    plt.xticks(range(len(coefs)), list(coefs.index), rotation=90)
+    plt.xlabel("Feature")
+    plt.ylabel("Cox coefficient (log HR)")
+    plt.title("Sex-Agnostic Cox Coefficients (log HR)")
+    plt.tight_layout()
+    plt.show()
+
     # Merge with survival data
     pred_labels = test[["MRN", "pred_label", "Female"]].drop_duplicates()
     merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
-    
-    print(f"\n=== Sex-Agnostic Model Summary ===")
+
+    print(f"\n=== Sex-Agnostic Model Summary (CoxPH) ===")
     print(f"Total test samples: {len(test)}")
     print(f"Samples with survival data: {len(merged_df)}")
-    
-    # Calculate overall prediction statistics
-    n_high_risk = (merged_df["pred_label"] == 1).sum()
-    n_low_risk = (merged_df["pred_label"] == 0).sum()
-    print(f"High risk predictions: {n_high_risk}")
-    print(f"Low risk predictions: {n_low_risk}")
-    
-    # Calculate incidence rates for the 4 groups (Male/Female × Low/High Risk)
+
+    # Incidence rates by gender and risk
     print(f"\n=== Incidence Rates by Gender and Risk ===")
     for gender_val, gender_name in [(0, "Male"), (1, "Female")]:
         gender_data = merged_df[merged_df["Female"] == gender_val]
@@ -1724,39 +1643,11 @@ def sex_agnostic_model_inference(train_df, test_df, features, label_col, surviva
                     pe_rate = group_data["PE"].sum() / len(group_data)
                     se_rate = group_data["SE"].sum() / len(group_data)
                     print(f"{gender_name}-{risk_name}: PE rate = {pe_rate:.4f}, SE rate = {se_rate:.4f} (n={len(group_data)})")
-    
-    # Perform survival analysis
-    print("\n=== Sex-Agnostic Model Survival Analysis ===")
-    
-    # Overall analysis (Low Risk vs High Risk)
-    low_risk_data = merged_df[merged_df["pred_label"] == 0]
-    high_risk_data = merged_df[merged_df["pred_label"] == 1]
-    
-    if not low_risk_data.empty and not high_risk_data.empty:
-        pe_events_low = low_risk_data["PE"].sum()
-        pe_events_high = high_risk_data["PE"].sum()
-        
-        pe_rate_low = pe_events_low / len(low_risk_data)
-        pe_rate_high = pe_events_high / len(high_risk_data)
-        
-        print(f"\nOverall Primary Endpoint Analysis:")
-        print(f"  Low Risk: {pe_events_low}/{len(low_risk_data)} events (rate: {pe_rate_low:.4f})")
-        print(f"  High Risk: {pe_events_high}/{len(high_risk_data)} events (rate: {pe_rate_high:.4f})")
-        
-        # Secondary endpoint analysis
-        se_events_low = low_risk_data["SE"].sum()
-        se_events_high = high_risk_data["SE"].sum()
-        
-        se_rate_low = se_events_low / len(low_risk_data)
-        se_rate_high = se_events_high / len(high_risk_data)
-        
-        print(f"  Secondary Endpoint - Low Risk: {se_events_low}/{len(low_risk_data)} events (rate: {se_rate_low:.4f})")
-        print(f"  Secondary Endpoint - High Risk: {se_events_high}/{len(high_risk_data)} events (rate: {se_rate_high:.4f})")
-    
-    # Analyze and plot survival by merged groups (Low Risk vs High Risk)
+
+    # Survival analysis and plots
     analyze_survival_by_four_groups(merged_df)
     plot_km_curves_merged(merged_df)
-    
+
     return merged_df
 
 
