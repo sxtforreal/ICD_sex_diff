@@ -242,6 +242,9 @@ def generate_tableone_by_sex_icd(
                 groupby="Group",
                 groupby_order=group_order,
                 pval=True,
+                overall=True,
+                missing=True,
+                label_suffix=True,
             )
             print("==== TableOne (Sex x ICD) ====")
             print(tab1)
@@ -252,9 +255,47 @@ def generate_tableone_by_sex_icd(
                     table_df = tab1.to_dataframe()  # type: ignore[attr-defined]
                 except Exception:
                     table_df = None
+            # Reorder columns to: Missing | Overall | [groups...] | P-Value (if present)
+            if table_df is not None and isinstance(table_df.columns, pd.MultiIndex):
+                cols_level0 = list(table_df.columns.get_level_values(0))
+                cols_unique = []
+                for c in cols_level0:
+                    if c not in cols_unique:
+                        cols_unique.append(c)
+                ordered_first = [c for c in ["Missing", "Overall"] if c in cols_unique]
+                ordered_groups = [c for c in group_order if c in cols_unique]
+                ordered_tail = [c for c in ["p-value", "P-Value", "pval"] if c in cols_unique]
+                desired_order = ordered_first + ordered_groups + ordered_tail
+                # Only reorder if we computed a non-empty desired order
+                if desired_order:
+                    # Build new column MultiIndex order
+                    new_cols = []
+                    for top in desired_order:
+                        matches = [c for c in table_df.columns if c[0] == top]
+                        new_cols.extend(matches)
+                    # Append any remaining columns in their existing order
+                    remaining = [c for c in table_df.columns if c not in new_cols]
+                    new_cols.extend(remaining)
+                    table_df = table_df[new_cols]
+
             if output_excel_path and table_df is not None:
                 os.makedirs(os.path.dirname(output_excel_path), exist_ok=True)
-                table_df.to_excel(output_excel_path)
+                # Write a more Excel-friendly sheet
+                try:
+                    table_df.to_excel(output_excel_path)
+                except Exception:
+                    # If writing MultiIndex fails due to engine quirks, flatten columns
+                    if isinstance(table_df.columns, pd.MultiIndex):
+                        flat_cols = [
+                            (str(a) if a is not None else "")
+                            + (f" | {b}" if b not in (None, "") else "")
+                            for a, b in table_df.columns
+                        ]
+                        tmp_df = table_df.copy()
+                        tmp_df.columns = flat_cols
+                        tmp_df.to_excel(output_excel_path)
+                    else:
+                        table_df.to_excel(output_excel_path)
                 print(f"Saved TableOne to: {output_excel_path}")
             return
         except Exception as e:
