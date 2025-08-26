@@ -153,8 +153,9 @@ def plot_km_curves_four_groups(merged_df: pd.DataFrame) -> None:
 
 # Drop constant/duplicate/highly correlated columns to mitigate singular matrices
 def _sanitize_cox_features_matrix(
-    df: pd.DataFrame, feature_cols: List[str], corr_threshold: float = 0.995
+    df: pd.DataFrame, feature_cols: List[str], corr_threshold: float = 0.995, verbose: bool = True
 ) -> Tuple[pd.DataFrame, List[str]]:
+    original_features = list(feature_cols)
     X = df[feature_cols].copy()
     for c in X.columns:
         X[c] = pd.to_numeric(X[c], errors="coerce")
@@ -162,6 +163,8 @@ def _sanitize_cox_features_matrix(
     # Drop columns with all missing or only one unique non-nan value
     nunique = X.nunique(dropna=True)
     constant_cols = nunique[nunique <= 1].index.tolist()
+    if constant_cols and verbose:
+        print(f"[Cox] 删除常量/无信息列: {constant_cols}")
     X = X.drop(columns=constant_cols, errors="ignore")
 
     if X.shape[1] == 0:
@@ -171,18 +174,33 @@ def _sanitize_cox_features_matrix(
     X_filled = X.fillna(0.0)
     duplicated_mask = X_filled.T.duplicated(keep="first")
     if duplicated_mask.any():
+        dup_cols = X.columns[duplicated_mask.values].tolist()
+        if verbose:
+            print(f"[Cox] 删除重复列: {dup_cols}")
         X = X.loc[:, ~duplicated_mask.values]
 
     if X.shape[1] <= 1:
-        return X, list(X.columns)
+        kept = list(X.columns)
+        if verbose:
+            removed = [c for c in original_features if c not in kept]
+            if removed:
+                print(f"[Cox] 净化后仅保留 {kept}，删除: {removed}")
+        return X, kept
 
     # Remove highly correlated columns (keep the first in order)
     corr = X.fillna(0.0).corr().abs()
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
     to_drop = [col for col in upper.columns if (upper[col] >= corr_threshold).any()]
+    if to_drop and verbose:
+        print(f"[Cox] 删除高相关列(|r|>={corr_threshold}): {to_drop}")
     X = X.drop(columns=to_drop, errors="ignore")
 
     kept = list(X.columns)
+    if verbose:
+        removed = [c for c in original_features if c not in kept]
+        if removed:
+            print(f"[Cox] 特征保留 {len(kept)}/{len(original_features)}: {kept}")
+            print(f"[Cox] 总计删除: {removed}")
     return X, kept
 
 
