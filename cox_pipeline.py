@@ -122,8 +122,12 @@ def plot_km_curves_four_groups(merged_df: pd.DataFrame) -> None:
     # Pairwise within-sex logrank
     male_pred0 = merged_df[(merged_df["Female"] == 0) & (merged_df["pred_label"] == 0)]
     male_pred1 = merged_df[(merged_df["Female"] == 0) & (merged_df["pred_label"] == 1)]
-    female_pred0 = merged_df[(merged_df["Female"] == 1) & (merged_df["pred_label"] == 0)]
-    female_pred1 = merged_df[(merged_df["Female"] == 1) & (merged_df["pred_label"] == 1)]
+    female_pred0 = merged_df[
+        (merged_df["Female"] == 1) & (merged_df["pred_label"] == 0)
+    ]
+    female_pred1 = merged_df[
+        (merged_df["Female"] == 1) & (merged_df["pred_label"] == 1)
+    ]
 
     if not male_pred0.empty and not male_pred1.empty:
         lr_male = logrank_test(
@@ -153,7 +157,10 @@ def plot_km_curves_four_groups(merged_df: pd.DataFrame) -> None:
 
 # Drop constant/duplicate/highly correlated columns to mitigate singular matrices
 def _sanitize_cox_features_matrix(
-    df: pd.DataFrame, feature_cols: List[str], corr_threshold: float = 0.995, verbose: bool = True
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    corr_threshold: float = 0.995,
+    verbose: bool = True,
 ) -> Tuple[pd.DataFrame, List[str]]:
     original_features = list(feature_cols)
     X = df[feature_cols].copy()
@@ -216,13 +223,9 @@ def fit_cox_model(
         train_df, feature_cols, corr_threshold=0.995
     )
     if len(kept_features) == 0:
-        candidates = [
-            c for c in feature_cols if train_df[c].nunique(dropna=False) > 1
-        ]
+        candidates = [c for c in feature_cols if train_df[c].nunique(dropna=False) > 1]
         if not candidates:
-            raise ValueError(
-                "No usable features for CoxPH model after sanitization."
-            )
+            raise ValueError("No usable features for CoxPH model after sanitization.")
         X_sanitized = train_df[[candidates[0]]].copy()
         kept_features = [candidates[0]]
 
@@ -288,8 +291,12 @@ def sex_specific_inference(
     """
     used_features = [f for f in features if f != "Female"]
 
-    train_m = train_df[train_df["Female"] == 0].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
-    train_f = train_df[train_df["Female"] == 1].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
+    train_m = (
+        train_df[train_df["Female"] == 0].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
+    )
+    train_f = (
+        train_df[train_df["Female"] == 1].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
+    )
     test_m = test_df[test_df["Female"] == 0].copy()
     test_f = test_df[test_df["Female"] == 1].copy()
 
@@ -715,6 +722,7 @@ def run_cox_experiments(
             results[f"{featset_name} - {cfg['name']}"] = {m: [] for m in metrics}
 
     for seed in range(N):
+        print(seed)
         tr, te = train_test_split(
             df, test_size=0.3, random_state=seed, stratify=df[event_col]
         )
@@ -833,13 +841,13 @@ if __name__ == "__main__":
     _, summary = run_cox_experiments(
         df=df,
         feature_sets=FEATURE_SETS,
-        N=2,
+        N=100,
         time_col="PE_Time",
         event_col="VT/VF/SCD",
         export_excel_path=export_path,
     )
     print("Saved Excel:", export_path)
-    
+
     # Run inference
     tr, te = train_test_split(
         df, test_size=0.3, random_state=0, stratify=df["VT/VF/SCD"]
