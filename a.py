@@ -52,6 +52,8 @@ import numpy as np
 import pandas as pd
 from math import ceil
 from scipy.stats import randint
+from lifelines import CoxPHFitter
+from lifelines.utils import concordance_index
 
 def CG_equation(age, weight, female, serum_creatinine):
     """Cockcroft-Gault Equation."""
@@ -1017,8 +1019,11 @@ def multiple_random_splits_optimized(df, N, label="VT/VF/SCD"):
     
     return results, summary_table
 
-res, summary = multiple_random_splits_optimized(train_df, 50)
-summary.to_excel('/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/results.xlsx', index=True, index_label='RowName')
+results_pe, summary_pe = cox_multiple_random_splits(df, 50, endpoint="PE")
+results_se, summary_se = cox_multiple_random_splits(df, 50, endpoint="SE")
+with pd.ExcelWriter('/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/results_cox.xlsx') as writer:
+    summary_pe.to_excel(writer, sheet_name='PE', index=True, index_label='RowName')
+    summary_se.to_excel(writer, sheet_name='SE', index=True, index_label='RowName')
 
 def train_sex_specific_model(X_train, y_train, features, seed):
     """
@@ -1462,12 +1467,12 @@ def plot_km_curves_four_groups(merged_df):
 
 def sex_specific_model_inference(train_df, test_df, features, labels, survival_df, seed, gray_features=None, red_features=None):
     """
-    Sex-specific model inference function:
-    1. Train separate Random Forest models for male and female using provided features
+    Sex-specific model inference function using CoxPH:
+    1. Train separate Cox models for male and female (endpoint PE)
     2. Generate predictions for each sample
     3. Perform survival analysis by gender and predicted label (4 groups total)
     4. Generate KM plots and logrank tests
-    5. Show feature importance and incidence rates
+    5. Show Cox coefficient-based feature importance and incidence rates
     
     Args:
         gray_features: List of feature names to be colored gray in importance plots.
@@ -1476,61 +1481,38 @@ def sex_specific_model_inference(train_df, test_df, features, labels, survival_d
     """
     train = train_df.copy()
     test = test_df.copy()
-    df = test.copy()
+    df_pred = test.copy()
 
-    # Separate training data by gender
-    train_m = train[train["Female"] == 0].copy()
-    train_f = train[train["Female"] == 1].copy()
-    test_m = test[test["Female"] == 0].copy()
-    test_f = test[test["Female"] == 1].copy()
-
-    # Train gender-specific models
-    print("Training Male Model...")
-    best_male, best_thr_m = train_sex_specific_model(
-        train_m[features], train_m[labels], features, seed
-    )
-    
-    print("Training Female Model...")
-    best_female, best_thr_f = train_sex_specific_model(
-        train_f[features], train_f[labels], features, seed
-    )
+    (model_male, thr_m), (model_female, thr_f) = train_cox_sex_specific_model(train, features, survival_df, endpoint="PE")
 
     # Make predictions on test set
-    if not test_m.empty:
-        prob_m = best_male.predict_proba(test_m[features])[:, 1]
-        pred_m = (prob_m >= best_thr_m).astype(int)
-        df.loc[df["Female"] == 0, "pred_label"] = pred_m
-        df.loc[df["Female"] == 0, "pred_prob"] = prob_m
-    
-    if not test_f.empty:
-        prob_f = best_female.predict_proba(test_f[features])[:, 1]
-        pred_f = (prob_f >= best_thr_f).astype(int)
-        df.loc[df["Female"] == 1, "pred_label"] = pred_f
-        df.loc[df["Female"] == 1, "pred_prob"] = prob_f
+    test_m = test[test["Female"] == 0].copy()
+    test_f = test[test["Female"] == 1].copy()
+    if model_male is not None and not test_m.empty:
+        risk_m = model_male.predict_partial_hazard(test_m[features]).values.reshape(-1)
+        pred_m = (risk_m >= thr_m).astype(int)
+        df_pred.loc[df_pred["Female"] == 0, "pred_label"] = pred_m
+        df_pred.loc[df_pred["Female"] == 0, "pred_prob"] = risk_m
+    if model_female is not None and not test_f.empty:
+        risk_f = model_female.predict_partial_hazard(test_f[features]).values.reshape(-1)
+        pred_f = (risk_f >= thr_f).astype(int)
+        df_pred.loc[df_pred["Female"] == 1, "pred_label"] = pred_f
+        df_pred.loc[df_pred["Female"] == 1, "pred_prob"] = risk_f
 
-    # Feature importance visualization
-    plot_feature_importances(best_male, features, "Male Model Feature Importances", seed, gray_features, red_features)
-    plot_feature_importances(best_female, features, "Female Model Feature Importances", seed, gray_features, red_features)
+    # Feature importance visualization (Cox coefficients)
+    if model_male is not None:
+        plot_cox_coefficients(model_male, features, "Male Cox Model Coefficients", seed, gray_features, red_features)
+    if model_female is not None:
+        plot_cox_coefficients(model_female, features, "Female Cox Model Coefficients", seed, gray_features, red_features)
 
     # Merge with survival data
-    pred_labels = df[["MRN", "pred_label", "Female"]].drop_duplicates()
+    pred_labels = df_pred[["MRN", "pred_label", "Female"]].drop_duplicates()
     merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
 
     print(f"\n=== Summary ===")
-    print(f"Total test samples: {len(df)}")
+    print(f"Total test samples: {len(df_pred)}")
     print(f"Samples with survival data: {len(merged_df)}")
-    
-    # Calculate incidence rates for the 4 groups
-    for gender_val, gender_name in [(0, "Male"), (1, "Female")]:
-        gender_data = merged_df[merged_df["Female"] == gender_val]
-        if not gender_data.empty:
-            for pred_val in [0, 1]:
-                group_data = gender_data[gender_data["pred_label"] == pred_val]
-                if not group_data.empty:
-                    pe_rate = group_data["PE"].sum() / len(group_data)
-                    se_rate = group_data["SE"].sum() / len(group_data)
-                    print(f"{gender_name}-Pred{pred_val}: PE rate = {pe_rate:.4f}, SE rate = {se_rate:.4f}")
-    
+
     # Analyze and plot survival by merged groups (Low Risk vs High Risk)
     analyze_survival_by_four_groups(merged_df)
     plot_km_curves_merged(merged_df)
@@ -1652,80 +1634,33 @@ def sex_specific_full_inference(train_df, test_df, features, labels, survival_df
 
 def sex_agnostic_model_inference(train_df, test_df, features, label_col, survival_df, seed, gray_features=None, red_features=None, use_undersampling=True):
     """
-    Sex-agnostic model inference function that trains a single model on all data
-    and performs survival analysis similar to sex-specific models.
-    
-    Args:
-        train_df: Training dataframe
-        test_df: Test dataframe
-        features: List of feature names
-        label_col: Name of the target column
-        survival_df: Survival data
-        seed: Random seed
-        gray_features: List of features to color gray in importance plots
-        red_features: List of features to color red in importance plots
-        use_undersampling: Whether to use undersampling for training
-    
-    Returns:
-        Merged dataframe with predictions and survival data
+    Sex-agnostic model inference function using CoxPH and sex-balancing undersampling for fairness.
+    Trains a single model on all data and performs survival analysis similar to sex-specific models.
     """
     test = test_df.copy()
-    
-    # Remove sex indicator for sex-agnostic training/inference
     used_features = [f for f in features if f != "Female"]
-    
-    # Train sex-agnostic model
-    print("Training Sex-Agnostic Model...")
-    best_model, best_threshold = train_sex_agnostic_model(
-        train_df, used_features, label_col, seed, use_undersampling
-    )
-    print(f"Optimal probability threshold determined from training data: {best_threshold:.4f}")
-    
-    # Make predictions on test set
-    test_probs = best_model.predict_proba(test[used_features])[:, 1]
-    print(f"Test probabilities – min: {test_probs.min():.4f}, max: {test_probs.max():.4f}, mean: {test_probs.mean():.4f}")
-    test_preds = (test_probs >= best_threshold).astype(int)
-    
-    # Add predictions to test dataframe
-    test["pred_label"] = test_preds
-    test["pred_prob"] = test_probs
-    
-    # Feature importance visualization
-    plot_feature_importances(
-        best_model, used_features, 
-        "Sex-Agnostic Model Feature Importances", 
-        seed, gray_features, red_features
-    )
-    
+
+    # Train model
+    print("Training Sex-Agnostic Cox Model...")
+    cph, best_threshold = train_cox_agnostic_model(train_df, used_features, survival_df, seed, endpoint="PE", use_undersampling=use_undersampling)
+    print(f"Optimal risk threshold determined from training data (median): {best_threshold:.4f}")
+
+    # Predict on test
+    risks = cph.predict_partial_hazard(test[used_features]).values.reshape(-1)
+    test["pred_prob"] = risks
+    test["pred_label"] = (risks >= best_threshold).astype(int)
+
+    # Plot coefficients
+    plot_cox_coefficients(cph, used_features, "Sex-Agnostic Cox Model Coefficients", seed, gray_features, red_features)
+
     # Merge with survival data
     pred_labels = test[["MRN", "pred_label", "Female"]].drop_duplicates()
     merged_df = survival_df.merge(pred_labels, on="MRN", how="inner").drop_duplicates(subset=["MRN"])
-    
-    print(f"\n=== Sex-Agnostic Model Summary ===")
+
+    print(f"\n=== Sex-Agnostic Cox Model Summary ===")
     print(f"Total test samples: {len(test)}")
     print(f"Samples with survival data: {len(merged_df)}")
-    
-    # Calculate overall prediction statistics
-    n_high_risk = (merged_df["pred_label"] == 1).sum()
-    n_low_risk = (merged_df["pred_label"] == 0).sum()
-    print(f"High risk predictions: {n_high_risk}")
-    print(f"Low risk predictions: {n_low_risk}")
-    
-    # Calculate incidence rates for the 4 groups (Male/Female × Low/High Risk)
-    print(f"\n=== Incidence Rates by Gender and Risk ===")
-    for gender_val, gender_name in [(0, "Male"), (1, "Female")]:
-        gender_data = merged_df[merged_df["Female"] == gender_val]
-        if not gender_data.empty:
-            for pred_val, risk_name in [(0, "Low Risk"), (1, "High Risk")]:
-                group_data = gender_data[gender_data["pred_label"] == pred_val]
-                if not group_data.empty:
-                    pe_rate = group_data["PE"].sum() / len(group_data)
-                    se_rate = group_data["SE"].sum() / len(group_data)
-                    print(f"{gender_name}-{risk_name}: PE rate = {pe_rate:.4f}, SE rate = {se_rate:.4f} (n={len(group_data)})")
-    
-    # Perform survival analysis
-    print("\n=== Sex-Agnostic Model Survival Analysis ===")
-    
+
     # Overall analysis (Low Risk vs High Risk)
     low_risk_data = merged_df[merged_df["pred_label"] == 0]
     high_risk_data = merged_df[merged_df["pred_label"] == 1]
@@ -1852,3 +1787,226 @@ test_results, test_summary = test_simplified_function_performance()
 # For production runs, you can now use the simplified function safely:
 # res, summary = multiple_random_splits_simplified(train_df, 50)
 # summary.to_excel('/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/results_optimized.xlsx', index=True, index_label='RowName')
+
+def balance_sex_undersample(train_df: pd.DataFrame, random_state: int) -> pd.DataFrame:
+    """Undersample the majority sex to match the minority sex count for fair sex-agnostic training."""
+    grp_male = train_df[train_df["Female"] == 0]
+    grp_female = train_df[train_df["Female"] == 1]
+    n_target = min(len(grp_male), len(grp_female))
+    if n_target == 0:
+        return train_df.copy()
+    grp_male_s = grp_male.sample(n=n_target, random_state=random_state, replace=False)
+    grp_female_s = grp_female.sample(n=n_target, random_state=random_state, replace=False)
+    return pd.concat([grp_male_s, grp_female_s], axis=0).sample(frac=1.0, random_state=random_state).reset_index(drop=True)
+
+
+def prepare_cox_dataset(features_df: pd.DataFrame, survival_df: pd.DataFrame, features: list, endpoint: str = "PE") -> pd.DataFrame:
+    """Merge features with survival data and build Cox modeling dataframe for a specific endpoint.
+    endpoint: "PE" or "SE"
+    Returns dataframe with columns: features + ["duration", "event", "Female", "MRN"]."""
+    assert endpoint in ("PE", "SE")
+    merged = features_df.merge(survival_df[["MRN", endpoint, f"{endpoint}_Time"]], on="MRN", how="inner")
+    model_df = merged[features + ["Female", "MRN", endpoint, f"{endpoint}_Time"]].dropna()
+    # Ensure numeric features for Cox
+    for col in features:
+        if not np.issubdtype(model_df[col].dtype, np.number):
+            model_df[col] = pd.Categorical(model_df[col]).codes
+    model_df = model_df.rename(columns={endpoint: "event", f"{endpoint}_Time": "duration"})
+    return model_df.reset_index(drop=True)
+
+
+def fit_cox_and_predict(train_model_df: pd.DataFrame, val_model_df: pd.DataFrame, features: list, penalizer: float = 0.1):
+    """Fit CoxPH on train, predict risk (partial hazard) on val. Returns (cph, val_risk, thr)."""
+    cph = CoxPHFitter(penalizer=penalizer)
+    cph.fit(train_model_df[features + ["duration", "event"]], duration_col="duration", event_col="event")
+    train_risk = cph.predict_partial_hazard(train_model_df[features]).values.reshape(-1)
+    val_risk = cph.predict_partial_hazard(val_model_df[features]).values.reshape(-1)
+    thr = float(np.median(train_risk))
+    return cph, val_risk, thr
+
+
+def plot_cox_coefficients(cph: CoxPHFitter, features: list, title: str, seed: int, gray_features=None, red_features=None):
+    """Plot Cox coefficients (hazard ratios) as feature importance."""
+    coef = cph.params_.reindex(features)
+    hr = np.exp(coef)
+    order = hr.abs().sort_values(ascending=False).index
+    hr_sorted = hr.loc[order]
+    colors = []
+    for f in order:
+        if gray_features is not None and f in gray_features:
+            colors.append("gray")
+        elif red_features is not None and f in red_features:
+            colors.append("red")
+        else:
+            colors.append("steelblue")
+    plt.figure(figsize=(8, max(4, len(features) * 0.25)))
+    plt.barh(range(len(order)), hr_sorted.values, color=colors)
+    plt.yticks(range(len(order)), order)
+    plt.xlabel("Hazard Ratio (exp(coef))")
+    plt.title(title)
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    plt.show()
+    plt.close()
+
+
+def cox_multiple_random_splits(df_all: pd.DataFrame, N: int, endpoint: str = "PE"):
+    """Run N random 70/30 train/validation splits with CoxPH models across feature sets and sex setups.
+    - Sex-agnostic uses sex-balancing undersampling for fairness
+    - Sex-specific trains separate models per sex and combines predictions
+    Returns (results, summary_df) where summary_df is formatted for Excel output.
+    """
+    feature_sets = {
+        'guideline': ["NYHA Class", "LVEF"],
+        'benchmark': ["Female", "Age by decade", "BMI", "AF", "Beta Blocker", "CrCl>45", 
+                      "LVEF", "QTc", "NYHA>2", "CRT", "AAD", "Significant LGE"],
+        'proposed': ["Female", "Age by decade", "BMI", "AF", "Beta Blocker", "CrCl>45", 
+                     "LVEF", "QTc", "NYHA>2", "CRT", "AAD", "Significant LGE", "DM", "HTN", 
+                     "HLP", "LVEDVi", "LV Mass Index", "RVEDVi", "RVEF", "LA EF", "LAVi", 
+                     "MRF (%)", "Sphericity Index", "Relative Wall Thickness", 
+                     "MV Annular Diameter", "ACEi/ARB/ARNi", "Aldosterone Antagonist"],
+        'real_proposed': ["Female", "Age by decade", "BMI", "AF", "Beta Blocker", "CrCl>45", 
+                          "LVEF", "QTc", "CRT", "AAD", "LGE Burden 5SD", "DM", "HTN", 
+                          "HLP", "LVEDVi", "LV Mass Index", "RVEDVi", "RVEF", "LA EF", "LAVi", 
+                          "MRF (%)", "Sphericity Index", "Relative Wall Thickness", 
+                          "MV Annular Diameter", "ACEi/ARB/ARNi", "Aldosterone Antagonist", "NYHA Class"]
+    }
+
+    model_configs = [
+        {'name': 'Guideline Cox (sex-agnostic)', 'features': 'guideline', 'type': 'cox_all'},
+        {'name': 'Benchmark Cox (sex-agnostic)', 'features': 'benchmark', 'type': 'cox_all'},
+        {'name': 'Benchmark Cox (sex-agnostic undersampled)', 'features': 'benchmark', 'type': 'cox_all_us'},
+        {'name': 'Benchmark Cox (male)', 'features': 'benchmark', 'type': 'cox_male'},
+        {'name': 'Benchmark Cox (female)', 'features': 'benchmark', 'type': 'cox_female'},
+        {'name': 'Benchmark Cox (sex-specific)', 'features': 'benchmark', 'type': 'cox_sex_specific'},
+        {'name': 'Proposed Cox (sex-agnostic)', 'features': 'proposed', 'type': 'cox_all'},
+        {'name': 'Proposed Cox (sex-agnostic undersampled)', 'features': 'proposed', 'type': 'cox_all_us'},
+        {'name': 'Proposed Cox (male)', 'features': 'proposed', 'type': 'cox_male'},
+        {'name': 'Proposed Cox (female)', 'features': 'proposed', 'type': 'cox_female'},
+        {'name': 'Proposed Cox (sex-specific)', 'features': 'proposed', 'type': 'cox_sex_specific'},
+        {'name': 'Real Proposed Cox (sex-agnostic)', 'features': 'real_proposed', 'type': 'cox_all'},
+        {'name': 'Real Proposed Cox (sex-agnostic undersampled)', 'features': 'real_proposed', 'type': 'cox_all_us'},
+        {'name': 'Real Proposed Cox (male)', 'features': 'real_proposed', 'type': 'cox_male'},
+        {'name': 'Real Proposed Cox (female)', 'features': 'real_proposed', 'type': 'cox_female'},
+        {'name': 'Real Proposed Cox (sex-specific)', 'features': 'real_proposed', 'type': 'cox_sex_specific'}
+    ]
+
+    metrics = ['cindex_overall', 'cindex_male', 'cindex_female', 'logrank_p', 'hr_high_vs_low']
+    results = {config['name']: {m: [] for m in metrics} for config in model_configs}
+
+    for seed in range(N):
+        train_df, val_df = train_test_split(df_all, test_size=0.3, random_state=seed, stratify=df_all['Female'])
+        mask_m = val_df["Female"].values == 0
+        mask_f = val_df["Female"].values == 1
+
+        for config in model_configs:
+            model_name = config['name']
+            feature_set = feature_sets[config['features']]
+            # Prepare modeling data
+            train_model = prepare_cox_dataset(train_df, survival_df, feature_set, endpoint=endpoint)
+            val_model = prepare_cox_dataset(val_df, survival_df, feature_set, endpoint=endpoint)
+            if len(train_model) == 0 or len(val_model) == 0:
+                for m in metrics:
+                    results[model_name][m].append(np.nan)
+                continue
+
+            try:
+                if config['type'] == 'cox_all':
+                    cph, val_risk, thr = fit_cox_and_predict(train_model, val_model, feature_set)
+                    pred_label = (val_risk >= thr).astype(int)
+                elif config['type'] == 'cox_all_us':
+                    balanced_train = balance_sex_undersample(train_model, seed)
+                    cph, val_risk, thr = fit_cox_and_predict(balanced_train, val_model, feature_set)
+                    pred_label = (val_risk >= thr).astype(int)
+                elif config['type'] == 'cox_male':
+                    tr_m = train_model[train_model['Female'] == 0]
+                    va_m = val_model[val_model['Female'] == 0]
+                    if len(tr_m) == 0 or len(va_m) == 0:
+                        raise ValueError('no male data')
+                    cph_m, risk_m, thr_m = fit_cox_and_predict(tr_m, va_m, feature_set)
+                    pred_label = np.zeros(len(val_model), dtype=int)
+                    pred_label[val_model['Female'].values == 0] = (risk_m >= thr_m).astype(int)
+                elif config['type'] == 'cox_female':
+                    tr_f = train_model[train_model['Female'] == 1]
+                    va_f = val_model[val_model['Female'] == 1]
+                    if len(tr_f) == 0 or len(va_f) == 0:
+                        raise ValueError('no female data')
+                    cph_f, risk_f, thr_f = fit_cox_and_predict(tr_f, va_f, feature_set)
+                    pred_label = np.zeros(len(val_model), dtype=int)
+                    pred_label[val_model['Female'].values == 1] = (risk_f >= thr_f).astype(int)
+                elif config['type'] == 'cox_sex_specific':
+                    tr_m = train_model[train_model['Female'] == 0]
+                    va_m = val_model[val_model['Female'] == 0]
+                    tr_f = train_model[train_model['Female'] == 1]
+                    va_f = val_model[val_model['Female'] == 1]
+                    pred_label = np.zeros(len(val_model), dtype=int)
+                    if len(tr_m) > 0 and len(va_m) > 0:
+                        cph_m, risk_m, thr_m = fit_cox_and_predict(tr_m, va_m, feature_set)
+                        pred_label[val_model['Female'].values == 0] = (risk_m >= thr_m).astype(int)
+                    if len(tr_f) > 0 and len(va_f) > 0:
+                        cph_f, risk_f, thr_f = fit_cox_and_predict(tr_f, va_f, feature_set)
+                        pred_label[val_model['Female'].values == 1] = (risk_f >= thr_f).astype(int)
+                else:
+                    raise ValueError('unknown type')
+
+                # Metrics on validation
+                # c-index overall and by sex using predicted risk proxy (higher risk -> higher event rate)
+                val_times = val_model['duration'].values
+                val_events = val_model['event'].values
+                # Use continuous risk when available; fall back to binary label ranking
+                # Build risk vector: reuse pred_label when continuous risk not computed for some rows
+                if 'val_risk' in locals():
+                    risk_vec = val_risk
+                else:
+                    # For sex-specific/male/female branches, approximate risk by 0/1
+                    risk_vec = pred_label.astype(float)
+                cidx_all = concordance_index(val_times, risk_vec, val_events)
+                cidx_m = concordance_index(val_times[mask_m], risk_vec[mask_m], val_events[mask_m]) if mask_m.sum() > 1 else np.nan
+                cidx_f = concordance_index(val_times[mask_f], risk_vec[mask_f], val_events[mask_f]) if mask_f.sum() > 1 else np.nan
+
+                # Logrank p between high vs low risk on validation
+                high = pred_label == 1
+                if high.any() and (~high).any():
+                    lr = logrank_test(val_times[high], val_times[~high], event_observed_A=val_events[high], event_observed_B=val_events[~high])
+                    p_lr = float(lr.p_value)
+                    # HR via univariate Cox on risk group
+                    tmp = pd.DataFrame({
+                        'duration': val_times,
+                        'event': val_events,
+                        'risk_high': pred_label.astype(int)
+                    })
+                    cph_tmp = CoxPHFitter()
+                    cph_tmp.fit(tmp, duration_col='duration', event_col='event')
+                    hr = float(np.exp(cph_tmp.params_['risk_high']))
+                else:
+                    p_lr = np.nan
+                    hr = np.nan
+
+                results[model_name]['cindex_overall'].append(cidx_all)
+                results[model_name]['cindex_male'].append(cidx_m)
+                results[model_name]['cindex_female'].append(cidx_f)
+                results[model_name]['logrank_p'].append(p_lr)
+                results[model_name]['hr_high_vs_low'].append(hr)
+            except Exception:
+                for m in metrics:
+                    results[model_name][m].append(np.nan)
+
+    # Summarize mean and 95% CI
+    summary = {}
+    for model, md in results.items():
+        summary[model] = {}
+        for metric, values in md.items():
+            arr = np.array(values, dtype=float)
+            mu = np.nanmean(arr)
+            se = np.nanstd(arr, ddof=1) / np.sqrt(np.sum(~np.isnan(arr))) if np.sum(~np.isnan(arr)) > 1 else np.nan
+            ci = 1.96 * se if se == se else np.nan
+            summary[model][metric] = (mu, mu - ci if ci == ci else np.nan, mu + ci if ci == ci else np.nan)
+
+    summary_df = pd.concat({
+        model: pd.DataFrame.from_dict(metrics_dict, orient='index', columns=['mean', 'ci_lower', 'ci_upper'])
+        for model, metrics_dict in summary.items()
+    }, axis=0)
+
+    formatted = summary_df.apply(lambda row: f"{row['mean']:.3f} ({row['ci_lower']:.3f}, {row['ci_upper']:.3f})" if row.notna().all() else "nan", axis=1)
+    summary_table = formatted.unstack(level=1)
+    return results, summary_table
