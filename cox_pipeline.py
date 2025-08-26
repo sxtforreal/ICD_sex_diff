@@ -240,12 +240,24 @@ def fit_cox_model(
     ).copy()
 
     # Drop constant and duplicate columns
-    kept_after_basic, _ = _drop_constant_and_duplicate_columns(df_fit, numeric_features)
+    kept_after_basic, basic_drop = _drop_constant_and_duplicate_columns(df_fit, numeric_features)
+    if basic_drop:
+        dropped_constant = [c for c, r in basic_drop.items() if r == "constant_or_single_unique"]
+        dropped_duplicate = [c for c, r in basic_drop.items() if r == "duplicate_column"]
+        if dropped_constant:
+            print(f"Removed constant/single-unique columns: {dropped_constant}")
+        if dropped_duplicate:
+            print(f"Removed duplicate columns: {dropped_duplicate}")
 
     # Drop highly correlated columns (almost identical)
-    kept_after_corr, _ = _drop_highly_correlated_columns(
-        df_fit, kept_after_basic, correlation_threshold=0.999
+    corr_threshold_primary = 0.999
+    kept_after_corr, corr_drop = _drop_highly_correlated_columns(
+        df_fit, kept_after_basic, correlation_threshold=corr_threshold_primary
     )
+    if corr_drop:
+        print(
+            f"Removed highly correlated columns (|r|>={corr_threshold_primary}): {list(corr_drop.keys())}"
+        )
 
     final_features = kept_after_corr
     if len(final_features) == 0:
@@ -273,9 +285,13 @@ def fit_cox_model(
             continue
 
     # As a last resort, lower the correlation threshold and retry with moderate penalization
-    kept_after_corr_loose, _ = _drop_highly_correlated_columns(
+    kept_after_corr_loose, corr_drop_loose = _drop_highly_correlated_columns(
         df_fit, kept_after_basic, correlation_threshold=0.99
     )
+    if corr_drop_loose:
+        print(
+            f"Retry: removed highly correlated columns (|r|>=0.99): {list(corr_drop_loose.keys())}"
+        )
     if len(kept_after_corr_loose) >= 1:
         df_fit_final2 = df_fit[[time_col, event_col] + kept_after_corr_loose].copy()
         try:
