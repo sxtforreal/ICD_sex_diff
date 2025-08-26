@@ -57,8 +57,8 @@ def create_undersampled_dataset(
 
 
 def _select_numerical_feature_columns(df: pd.DataFrame, feature_cols: List[str]) -> List[str]:
-    """Return the subset of feature_cols that are numeric in df."""
-    numeric_cols = df[feature_cols].select_dtypes(include=[np.number]).columns.tolist()
+    """Return the subset of feature_cols that are numeric in df (including bool)."""
+    numeric_cols = df[feature_cols].select_dtypes(include=[np.number, "bool"]).columns.tolist()
     return numeric_cols
 
 
@@ -123,6 +123,68 @@ def _drop_highly_correlated_columns(
 
     kept_cols = [c for c in X.columns if c not in to_drop]
     return kept_cols, drop_reasons
+
+
+def _coerce_binary_like_columns(
+    df: pd.DataFrame, feature_cols: List[str]
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, object]]]:
+    """Convert binary-like non-numeric columns to numeric 0/1. Returns (df_copy, maps).
+
+    maps: {col: {"mapping": {raw_value: 0/1}, "default": 0}}
+    """
+    df_out = df.copy()
+    binary_maps: Dict[str, Dict[str, object]] = {}
+
+    for col in feature_cols:
+        if col not in df_out.columns:
+            continue
+        s = df_out[col]
+        if pd.api.types.is_bool_dtype(s):
+            # Cast booleans to 0/1
+            df_out[col] = s.astype(int)
+            binary_maps[col] = {"mapping": {False: 0, True: 1}, "default": 0}
+            continue
+
+        if pd.api.types.is_numeric_dtype(s):
+            # Already numeric; skip
+            continue
+
+        # For object/category dtypes, detect binary-like
+        unique_non_null = pd.Series(s.dropna().unique())
+        if len(unique_non_null) == 2:
+            # Create deterministic mapping: first seen -> 0, second -> 1
+            v0, v1 = unique_non_null.iloc[0], unique_non_null.iloc[1]
+            mapping = {v0: 0, v1: 1}
+            df_out[col] = s.map(mapping).fillna(0).astype(int)
+            binary_maps[col] = {"mapping": mapping, "default": 0}
+        else:
+            # Not binary-like; leave as-is
+            pass
+
+    return df_out, binary_maps
+
+
+def _apply_binary_maps_for_inference(
+    df: pd.DataFrame, feature_cols: List[str], binary_maps: Dict[str, Dict[str, object]]
+) -> pd.DataFrame:
+    """Apply stored binary mappings to df for inference. Returns a new DataFrame copy."""
+    if not binary_maps:
+        return df.copy()
+    df_out = df.copy()
+    for col, info in binary_maps.items():
+        if col not in df_out.columns:
+            continue
+        mapping = info.get("mapping", {})
+        default_val = info.get("default", 0)
+        s = df_out[col]
+        if pd.api.types.is_bool_dtype(s):
+            df_out[col] = s.astype(int)
+        elif pd.api.types.is_numeric_dtype(s):
+            # already numeric; keep
+            pass
+        else:
+            df_out[col] = s.map(mapping).fillna(default_val).astype(int)
+    return df_out
 
 
 def plot_cox_coefficients(
@@ -229,13 +291,17 @@ def plot_km_curves_four_groups(merged_df: pd.DataFrame) -> None:
 def fit_cox_model(
     train_df: pd.DataFrame, feature_cols: List[str], time_col: str, event_col: str
 ) -> CoxPHFitter:
-    # Keep only numeric feature columns
-    numeric_features = _select_numerical_feature_columns(train_df, feature_cols)
+    # Start with selected columns
+    base_df = train_df[[time_col, event_col] + feature_cols].copy()
+    # Coerce binary-like non-numeric features to 0/1 to preserve useful binary vars
+    coerced_df, binary_maps = _coerce_binary_like_columns(base_df, feature_cols)
+    # Keep only numeric feature columns (after coercion)
+    numeric_features = _select_numerical_feature_columns(coerced_df, feature_cols)
     if len(numeric_features) == 0:
         raise ValueError("No numeric features available for CoxPH fitting.")
 
     # Drop rows with missing survival info
-    df_fit = train_df[[time_col, event_col] + numeric_features].dropna(
+    df_fit = coerced_df[[time_col, event_col] + numeric_features].dropna(
         subset=[time_col, event_col]
     ).copy()
 
@@ -279,6 +345,8 @@ def fit_cox_model(
                     event_col=event_col,
                     robust=True,
                 )
+            # store mapping for inference
+            setattr(cph, "_binary_maps", binary_maps)
             return cph
         except (ConvergenceError, LinAlgError, ValueError) as e:
             last_err = e
@@ -304,6 +372,7 @@ def fit_cox_model(
                     event_col=event_col,
                     robust=True,
                 )
+            setattr(cph, "_binary_maps", binary_maps)
             return cph
         except (ConvergenceError, LinAlgError, ValueError) as e:
             last_err = e
@@ -316,6 +385,9 @@ def fit_cox_model(
 def predict_risk(
     model: CoxPHFitter, df: pd.DataFrame, feature_cols: List[str]
 ) -> np.ndarray:
+    # Apply stored binary mappings if available
+    if hasattr(model, "_binary_maps") and isinstance(getattr(model, "_binary_maps"), dict):
+        df = _apply_binary_maps_for_inference(df, feature_cols, getattr(model, "_binary_maps"))
     # Use the model's trained columns to avoid mismatches if features were filtered
     trained_cols = model.params_.index.tolist()
     X = df[trained_cols].copy()
