@@ -46,6 +46,8 @@ from sklearn.model_selection import RandomizedSearchCV
 from sklearn.cluster import KMeans
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
+from lifelines import CoxPHFitter
+from lifelines.utils import concordance_index
 from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
 import numpy as np
