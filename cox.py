@@ -309,20 +309,83 @@ def generate_tableone_by_sex_icd(
             warnings.warn(f"[TableOne] Failed to generate TableOne: {e}")
 
     # Fallback summary if TableOne is not available
+    # Build a simple TableOne-like table where the four groups are COLUMNS
     try:
-        numeric_cols = [c for c in variables if pd.api.types.is_numeric_dtype(df_local[c])]
-        parts = []
-        for grp_name in group_order:
-            grp = df_local[df_local["Group"] == grp_name]
-            if grp.empty:
-                continue
-            desc = grp[numeric_cols].describe().T
-            desc.insert(0, "group", grp_name)
-            parts.append(desc)
-        if parts:
-            fallback_df = pd.concat(parts, axis=0)
-            print("==== Numeric summary by group (fallback) ====")
+        def format_mean_sd(series: pd.Series) -> str:
+            s = pd.to_numeric(series, errors="coerce")
+            mean = s.mean()
+            std = s.std()
+            if pd.isna(mean):
+                return ""
+            return f"{mean:.1f} ({std:.1f})"
+
+        def is_binary(series: pd.Series) -> bool:
+            vals = pd.Series(series.dropna().unique())
+            return len(vals) <= 2
+
+        def format_n_pct(series: pd.Series, positive_value=None) -> str:
+            s = series.dropna()
+            n = len(s)
+            if n == 0:
+                return "0 (0.0%)"
+            if positive_value is None:
+                # Prefer 1 if present, else the most frequent non-zero/non-False value
+                uniques = list(pd.unique(s))
+                if 1 in uniques:
+                    positive_value = 1
+                else:
+                    # pick the most frequent value that is not 0/False if possible
+                    vc = s.value_counts(dropna=True)
+                    candidates = [idx for idx in vc.index if idx not in (0, False, "No", "None")] or list(vc.index)
+                    positive_value = candidates[0]
+            cnt = int((s == positive_value).sum())
+            pct = 100.0 * cnt / n
+            return f"{cnt} ({pct:.1f}%)"
+
+        # Precompute overall and per-group frames
+        rows = []
+        for var in variables:
+            row = {"rowname": var}
+            # Missing percentage overall
+            miss_pct = float(df_local[var].isna().mean() * 100.0)
+            row["Missing"] = f"{miss_pct:.1f}%"
+
+            if pd.api.types.is_numeric_dtype(df_local[var]):
+                row["Overall"] = format_mean_sd(df_local[var])
+                for grp_name in group_order:
+                    grp_series = df_local.loc[df_local["Group"] == grp_name, var]
+                    row[grp_name] = format_mean_sd(grp_series)
+            else:
+                # Treat binary categoricals as n (%) of positive_value
+                if is_binary(df_local[var]):
+                    row["Overall"] = format_n_pct(df_local[var])
+                    for grp_name in group_order:
+                        grp_series = df_local.loc[df_local["Group"] == grp_name, var]
+                        row[grp_name] = format_n_pct(grp_series)
+                else:
+                    # For non-binary categoricals, show the most frequent category as n (%)
+                    overall_mode = df_local[var].dropna().mode()
+                    mode_val = overall_mode.iloc[0] if not overall_mode.empty else None
+                    if mode_val is None:
+                        row["Overall"] = ""
+                    else:
+                        row["Overall"] = format_n_pct(df_local[var], positive_value=mode_val)
+                    for grp_name in group_order:
+                        grp_series = df_local.loc[df_local["Group"] == grp_name, var]
+                        if mode_val is None:
+                            row[grp_name] = ""
+                        else:
+                            row[grp_name] = format_n_pct(grp_series, positive_value=mode_val)
+
+            rows.append(row)
+
+        if rows:
+            cols = ["Missing", "Overall"] + group_order
+            fallback_df = pd.DataFrame(rows)
+            fallback_df = fallback_df.set_index("rowname")[cols]
+            print("==== Table-like summary (fallback, groups as columns) ====")
             print(fallback_df.head())
+
             if output_excel_path:
                 os.makedirs(os.path.dirname(output_excel_path), exist_ok=True)
                 fallback_df.to_excel(output_excel_path)
