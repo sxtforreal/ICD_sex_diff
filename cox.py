@@ -167,7 +167,7 @@ def plot_cox_coefficients(
 
     plt.figure(figsize=(9, 4))
     plt.bar(range(len(feats)), coef_series.values, color=colors)
-    plt.xticks(range(len(feats)), feats, rotation=90)
+    plt.xticks(range(len(feats)), feats, rotation=45, ha="right", fontsize=12)
     plt.ylabel(ylabel)
     plt.title(title)
     plt.tight_layout()
@@ -190,7 +190,7 @@ def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame) -> None:
         ax = axes[ax_idx]
         subset = merged_df[merged_df["Female"] == sex_val]
         if subset.empty:
-            ax.set_title(f"{sex_name} (no data)")
+            ax.set_title(f"{sex_name.upper()} (no data)")
             ax.axis("off")
             continue
 
@@ -203,8 +203,8 @@ def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame) -> None:
             grp = subset[subset["pred_label"] == pred_val]
             if grp.empty:
                 continue
-            n_samples = len(grp)
-            events = grp[ep_event_col].sum()
+            n_samples = int(len(grp))
+            events = int(grp[ep_event_col].sum())
             label = f"{label_base} (n={n_samples}, events={events})"
             kmf.fit(
                 durations=grp[ep_time_col],
@@ -231,15 +231,19 @@ def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame) -> None:
                 ha="right",
                 va="bottom",
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+                fontsize=12,
             )
 
-        ax.set_title(sex_name)
+        ax.set_title(sex_name.upper())
         ax.set_xlabel("Time (days)")
         if ax_idx == 0:
             ax.set_ylabel("Survival Probability")
         ax.grid(alpha=0.3)
+        # Legend with larger font size per subplot (only if labels exist)
+        handles, labels = ax.get_legend_handles_labels()
+        if labels:
+            ax.legend(loc="best", fontsize=12)
 
-    axes[0].legend(loc="best")
     plt.suptitle("Primary Endpoint - Survival by Gender and Risk Group", y=1.02)
     plt.tight_layout()
     plt.show()
