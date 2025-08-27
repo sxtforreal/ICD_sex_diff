@@ -45,7 +45,7 @@ def plot_metrics_with_ci_groups(df):
 
     sns.set_theme(style="whitegrid")
 
-    fig, axs = plt.subplots(1, num_metrics, figsize=(5 * num_metrics, 6), sharey=True)
+    fig, axs = plt.subplots(1, num_metrics, figsize=(5 * num_metrics, 6.5), sharey=True)
     if num_metrics == 1:
         axs = [axs]
 
@@ -65,6 +65,12 @@ def plot_metrics_with_ci_groups(df):
 
         # For each model, draw bars across groups, color by model
         for model_idx, model in enumerate(models):
+            # Remap model display names when plotting
+            display_label = str(model)
+            if display_label.strip().lower() == "basic":
+                display_label = "Basic CMR Model"
+            elif display_label.strip().lower() == "advanced":
+                display_label = "Advanced CMR Model"
             means, lowers, uppers = [], [], []
             for group_idx in range(len(group_names)):
                 val = subset.iloc[group_idx][model]
@@ -80,14 +86,22 @@ def plot_metrics_with_ci_groups(df):
                 color=model_colors[model_idx],
                 yerr=[lowers, uppers],
                 capsize=3,
-                label=model,
+                label=display_label,
             )
 
         ax.set_xticks(x)
-        ax.set_xticklabels(group_names, ha="center", fontsize=9)
-        ax.set_ylabel("Metric Value")
-        ax.set_title(metric_label)
+        # Uppercase and enlarge tick labels for ALL/MALE/FEMALE
+        ax.set_xticklabels([g.upper() for g in group_names], ha="center", fontsize=13)
+        ax.set_ylabel("Metric Value", fontsize=13)
+        ax.set_title(metric_label, fontsize=15)
+        ax.tick_params(axis='y', labelsize=12)
         ax.grid(axis="y", linestyle="--", alpha=0.3)
+
+        # Enlarge any p-value style annotations if present on the axis
+        for txt in ax.texts:
+            if isinstance(txt.get_text(), str) and re.search(r"(?i)(p\s*=|p-?value|log-?rank)", txt.get_text() or ""):
+                txt.set_fontsize(14)
+                txt.set_fontweight("bold")
 
     # Shared legend on the right side (models)
     handles, labels = axs[0].get_legend_handles_labels()
@@ -97,6 +111,7 @@ def plot_metrics_with_ci_groups(df):
         loc="center left",
         ncol=1,
         bbox_to_anchor=(1.02, 0.5),
+        fontsize=13,
     )
 
     plt.tight_layout(rect=[0, 0, 0.85, 1])
@@ -126,13 +141,19 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
     num_groups = len(group_names)
 
     sns.set_theme(style="whitegrid")
-    fig, ax = plt.subplots(1, 1, figsize=(6.5, 6))
+    fig, ax = plt.subplots(1, 1, figsize=(7.5, 6.5))
 
     x = np.arange(num_groups)
     width = 0.8 / max(num_models, 1)
     model_colors = sns.color_palette("Set2", n_colors=num_models)
 
     for model_index, model_label in enumerate(model_labels):
+        # Remap model labels for display
+        display_label = str(model_label)
+        if display_label.strip().lower() == "basic":
+            display_label = "Basic CMR Model"
+        elif display_label.strip().lower() == "advanced":
+            display_label = "Advanced CMR Model"
         row = df.iloc[model_index]
 
         means_for_groups = []
@@ -152,14 +173,21 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
             color=model_colors[model_index],
             yerr=[lower_errors_for_groups, upper_errors_for_groups],
             capsize=3,
-            label=model_label,
+            label=display_label,
         )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(group_names, ha="center", fontsize=9)
-    ax.set_ylabel("Metric Value")
-    ax.set_title(metric_title)
+    ax.set_xticklabels([g.upper() for g in group_names], ha="center", fontsize=13)
+    ax.set_ylabel("Metric Value", fontsize=13)
+    ax.set_title(metric_title, fontsize=15)
+    ax.tick_params(axis='y', labelsize=12)
     ax.grid(axis="y", linestyle="--", alpha=0.3)
+
+    # Enlarge any p-value style annotations if present on the axis
+    for txt in ax.texts:
+        if isinstance(txt.get_text(), str) and re.search(r"(?i)(p\s*=|p-?value|log-?rank)", txt.get_text() or ""):
+            txt.set_fontsize(14)
+            txt.set_fontweight("bold")
 
     handles, labels = ax.get_legend_handles_labels()
     fig.legend(
@@ -168,6 +196,7 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
         loc="center left",
         ncol=1,
         bbox_to_anchor=(1.02, 0.5),
+        fontsize=13,
     )
 
     plt.tight_layout(rect=[0, 0, 0.85, 1])
