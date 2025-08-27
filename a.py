@@ -1209,7 +1209,7 @@ def plot_feature_importances(model, features, title, seed, gray_features=None, r
     if 'blue' in present_colors:
         legend_elements.append(Patch(facecolor='blue', label='advanced cmr features'))
     if len(legend_elements) > 0:
-        plt.legend(handles=legend_elements, loc='upper right')
+        plt.legend(handles=legend_elements, loc='upper right', fontsize=14)
     plt.tight_layout()
     plt.show()
 
@@ -1279,12 +1279,13 @@ def plot_km_by_gender_and_risk(merged_df, gender_col, risk_col, time_col, event_
                         gender_data.loc[high_mask, ep_event_col]
                     )
                     ax.text(0.95, 0.05, f"Log-rank p = {lr.p_value:.5f}", 
-                            transform=ax.transAxes, ha="right", va="bottom")
+                            transform=ax.transAxes, ha="right", va="bottom", fontsize=14)
             
-            ax.set_title(f"{ep_name} by Risk Group - {gender_label}")
-            ax.set_xlabel("Time")
-            ax.set_ylabel("Survival Probability")
-            ax.legend()
+            ax.set_title(f"{ep_name} by Risk Group - {gender_label}", fontsize=16)
+            ax.set_xlabel("Time", fontsize=14)
+            ax.set_ylabel("Survival Probability", fontsize=14)
+            ax.tick_params(axis="both", labelsize=14)
+            ax.legend(fontsize=14)
         
         plt.suptitle(f"{title_prefix} - {gender_label}")
         plt.tight_layout()
@@ -1378,12 +1379,13 @@ def plot_km_curves_merged(merged_df):
             # Add log-rank test result to bottom right corner
             ax.text(0.95, 0.05, f"Log-rank p = {lr_test.p_value:.4f}", 
                    transform=ax.transAxes, ha="right", va="bottom",
-                   bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8), fontsize=14)
         
-        ax.set_title(f"{ep_name} - Combined Analysis")
-        ax.set_xlabel("Time (days)")
-        ax.set_ylabel("Survival Probability")
-        ax.legend(loc='upper right')
+        ax.set_title(f"{ep_name} - Combined Analysis", fontsize=16)
+        ax.set_xlabel("Time (days)", fontsize=14)
+        ax.set_ylabel("Survival Probability", fontsize=14)
+        ax.tick_params(axis="both", labelsize=14)
+        ax.legend(loc='upper right', fontsize=14)
         ax.grid(True, alpha=0.3)
     
     plt.suptitle("Merged Survival Analysis: Low Risk vs High Risk")
@@ -1449,12 +1451,13 @@ def plot_km_curves_four_groups(merged_df):
                 # Add log-rank test result to bottom right corner
                 ax.text(0.95, 0.05, f"Log-rank p = {lr_test.p_value:.4f}", 
                        transform=ax.transAxes, ha="right", va="bottom",
-                       bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8), fontsize=14)
             
-            ax.set_title(f"{ep_name} - {gender_name}")
-            ax.set_xlabel("Time (days)")
-            ax.set_ylabel("Survival Probability")
-            ax.legend(loc='upper right')
+            ax.set_title(f"{ep_name} - {gender_name}", fontsize=16)
+            ax.set_xlabel("Time (days)", fontsize=14)
+            ax.set_ylabel("Survival Probability", fontsize=14)
+            ax.legend(loc='upper right', fontsize=14)
+            ax.tick_params(axis="both", labelsize=14)
             ax.grid(True, alpha=0.3)
     
     plt.tight_layout()

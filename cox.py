@@ -227,6 +227,7 @@ def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame) -> None:
                 ha="right",
                 va="bottom",
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+                fontsize=14,
             )
 
         ax.set_title(sex_name)
@@ -235,7 +236,7 @@ def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame) -> None:
             ax.set_ylabel("Survival Probability")
         ax.grid(alpha=0.3)
 
-    axes[0].legend(loc="best")
+    axes[0].legend(loc="best", fontsize=14)
     plt.suptitle("Primary Endpoint - Survival by Gender and Risk Group", y=1.02)
     plt.tight_layout()
     plt.show()

@@ -15,6 +15,25 @@ def parse_value(s):
         return float("nan"), float("nan"), float("nan")
 
 
+# Standardized font sizes for figures
+TITLE_FONTSIZE = 16
+AXIS_LABEL_FONTSIZE = 14
+TICK_LABEL_FONTSIZE = 14
+LEGEND_FONTSIZE = 14
+PVALUE_FONTSIZE = 14
+
+
+def _normalize_model_label_display(raw_label):
+    """Map raw model labels to desired display names."""
+    base = str(raw_label).strip()
+    lowered = base.lower()
+    if lowered == "basic":
+        return "Basic CMR Model"
+    if lowered == "advanced":
+        return "Advanced CMR Model"
+    return base
+
+
 # Function to create subplots per metric, x-axis = [all, male, female]; color = model
 def plot_metrics_with_ci_groups(df):
     # Expect rows repeating by [All, Male, Female] for each metric
@@ -80,13 +99,14 @@ def plot_metrics_with_ci_groups(df):
                 color=model_colors[model_idx],
                 yerr=[lowers, uppers],
                 capsize=3,
-                label=model,
+                label=_normalize_model_label_display(model),
             )
 
         ax.set_xticks(x)
-        ax.set_xticklabels(group_names, ha="center", fontsize=9)
-        ax.set_ylabel("Metric Value")
-        ax.set_title(metric_label)
+        ax.set_xticklabels(group_names, ha="center", fontsize=TICK_LABEL_FONTSIZE)
+        ax.set_ylabel("Metric Value", fontsize=AXIS_LABEL_FONTSIZE)
+        ax.set_title(metric_label, fontsize=TITLE_FONTSIZE)
+        ax.tick_params(axis="y", labelsize=TICK_LABEL_FONTSIZE)
         ax.grid(axis="y", linestyle="--", alpha=0.3)
 
     # Shared legend on the right side (models)
@@ -97,6 +117,7 @@ def plot_metrics_with_ci_groups(df):
         loc="center left",
         ncol=1,
         bbox_to_anchor=(1.02, 0.5),
+        fontsize=LEGEND_FONTSIZE,
     )
 
     plt.tight_layout(rect=[0, 0, 0.85, 1])
@@ -152,13 +173,14 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
             color=model_colors[model_index],
             yerr=[lower_errors_for_groups, upper_errors_for_groups],
             capsize=3,
-            label=model_label,
+            label=_normalize_model_label_display(model_label),
         )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(group_names, ha="center", fontsize=9)
-    ax.set_ylabel("Metric Value")
-    ax.set_title(metric_title)
+    ax.set_xticklabels(group_names, ha="center", fontsize=TICK_LABEL_FONTSIZE)
+    ax.set_ylabel("Metric Value", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_title(metric_title, fontsize=TITLE_FONTSIZE)
+    ax.tick_params(axis="y", labelsize=TICK_LABEL_FONTSIZE)
     ax.grid(axis="y", linestyle="--", alpha=0.3)
 
     handles, labels = ax.get_legend_handles_labels()
@@ -168,6 +190,7 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
         loc="center left",
         ncol=1,
         bbox_to_anchor=(1.02, 0.5),
+        fontsize=LEGEND_FONTSIZE,
     )
 
     plt.tight_layout(rect=[0, 0, 0.85, 1])
