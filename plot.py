@@ -20,7 +20,9 @@ def plot_metrics_with_ci_groups(df):
     # Expect rows repeating by [All, Male, Female] for each metric
     num_rows = len(df)
     if num_rows % 3 != 0:
-        raise ValueError("Input table must have rows in multiples of 3: [All, Male, Female] per metric")
+        raise ValueError(
+            "Input table must have rows in multiples of 3: [All, Male, Female] per metric"
+        )
 
     # Filter to keep only AUC, specificity, and sensitivity
     allowed_keywords = ["auc", "auroc", "specificity", "sensitivity"]
@@ -32,20 +34,24 @@ def plot_metrics_with_ci_groups(df):
         if any(keyword in metric_label for keyword in allowed_keywords):
             keep_metric_indices.append(metric_index)
     if not keep_metric_indices:
-        raise ValueError("No metrics matching AUC, specificity, or sensitivity were found.")
-    df = pd.concat([df.iloc[i * 3 : i * 3 + 3] for i in keep_metric_indices], ignore_index=True)
+        raise ValueError(
+            "No metrics matching AUC, specificity, or sensitivity were found."
+        )
+    df = pd.concat(
+        [df.iloc[i * 3 : i * 3 + 3] for i in keep_metric_indices], ignore_index=True
+    )
     num_rows = len(df)
 
     models = df.columns[1:]
     num_models = len(models)
-    group_names = ["all", "male", "female"]
+    group_names = ["ALL", "MALE", "FEMALE"]
     model_colors = sns.color_palette("Set2", n_colors=num_models)
 
     num_metrics = num_rows // 3
 
     sns.set_theme(style="whitegrid")
 
-    fig, axs = plt.subplots(1, num_metrics, figsize=(5 * num_metrics, 6.5), sharey=True)
+    fig, axs = plt.subplots(1, num_metrics, figsize=(5 * num_metrics, 6), sharey=True)
     if num_metrics == 1:
         axs = [axs]
 
@@ -65,12 +71,6 @@ def plot_metrics_with_ci_groups(df):
 
         # For each model, draw bars across groups, color by model
         for model_idx, model in enumerate(models):
-            # Remap model display names when plotting
-            display_label = str(model)
-            if display_label.strip().lower() == "basic":
-                display_label = "Basic CMR Model"
-            elif display_label.strip().lower() == "advanced":
-                display_label = "Advanced CMR Model"
             means, lowers, uppers = [], [], []
             for group_idx in range(len(group_names)):
                 val = subset.iloc[group_idx][model]
@@ -86,22 +86,15 @@ def plot_metrics_with_ci_groups(df):
                 color=model_colors[model_idx],
                 yerr=[lowers, uppers],
                 capsize=3,
-                label=display_label,
+                label=model,
             )
 
         ax.set_xticks(x)
-        # Uppercase and enlarge tick labels for ALL/MALE/FEMALE
-        ax.set_xticklabels([g.upper() for g in group_names], ha="center", fontsize=13)
-        ax.set_ylabel("Metric Value", fontsize=13)
-        ax.set_title(metric_label, fontsize=15)
-        ax.tick_params(axis='y', labelsize=12)
-        ax.grid(axis="y", linestyle="--", alpha=0.3)
+        ax.set_xticklabels([c.upper() for c in df.columns[1:]], ha="center", fontsize=12)
 
-        # Enlarge any p-value style annotations if present on the axis
-        for txt in ax.texts:
-            if isinstance(txt.get_text(), str) and re.search(r"(?i)(p\s*=|p-?value|log-?rank)", txt.get_text() or ""):
-                txt.set_fontsize(14)
-                txt.set_fontweight("bold")
+        ax.set_ylabel("Metric Value", fontsize=12)
+        ax.set_title(metric_label, fontsize=14)
+        ax.grid(axis="y", linestyle="--", alpha=0.3)
 
     # Shared legend on the right side (models)
     handles, labels = axs[0].get_legend_handles_labels()
@@ -111,7 +104,7 @@ def plot_metrics_with_ci_groups(df):
         loc="center left",
         ncol=1,
         bbox_to_anchor=(1.02, 0.5),
-        fontsize=13,
+        fontsize=12,  # increased font
     )
 
     plt.tight_layout(rect=[0, 0, 0.85, 1])
@@ -124,14 +117,11 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
     - Column 0 contains row names (treated as model labels)
     - Remaining columns are groups (e.g., ["all", "male", "female"]) and
       each cell is a string formatted as "mean (lower, upper)".
-
-    This produces a single subplot with grouped bars by group on the x-axis
-    and different colors per model, including symmetric error bars derived
-    from the provided confidence intervals.
     """
-
     if df.shape[1] < 2:
-        raise ValueError("Expected at least two columns: row labels and one group column")
+        raise ValueError(
+            "Expected at least two columns: row labels and one group column"
+        )
 
     # Identify names
     model_labels = [str(v) for v in df.iloc[:, 0].tolist()]
@@ -141,19 +131,13 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
     num_groups = len(group_names)
 
     sns.set_theme(style="whitegrid")
-    fig, ax = plt.subplots(1, 1, figsize=(7.5, 6.5))
+    fig, ax = plt.subplots(1, 1, figsize=(6.5, 6))
 
     x = np.arange(num_groups)
     width = 0.8 / max(num_models, 1)
     model_colors = sns.color_palette("Set2", n_colors=num_models)
 
     for model_index, model_label in enumerate(model_labels):
-        # Remap model labels for display
-        display_label = str(model_label)
-        if display_label.strip().lower() == "basic":
-            display_label = "Basic CMR Model"
-        elif display_label.strip().lower() == "advanced":
-            display_label = "Advanced CMR Model"
         row = df.iloc[model_index]
 
         means_for_groups = []
@@ -173,21 +157,15 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
             color=model_colors[model_index],
             yerr=[lower_errors_for_groups, upper_errors_for_groups],
             capsize=3,
-            label=display_label,
+            label=model_label,
         )
 
     ax.set_xticks(x)
-    ax.set_xticklabels([g.upper() for g in group_names], ha="center", fontsize=13)
-    ax.set_ylabel("Metric Value", fontsize=13)
-    ax.set_title(metric_title, fontsize=15)
-    ax.tick_params(axis='y', labelsize=12)
-    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.set_xticklabels([c.upper() for c in df.columns[1:]], ha="center", fontsize=15)
 
-    # Enlarge any p-value style annotations if present on the axis
-    for txt in ax.texts:
-        if isinstance(txt.get_text(), str) and re.search(r"(?i)(p\s*=|p-?value|log-?rank)", txt.get_text() or ""):
-            txt.set_fontsize(14)
-            txt.set_fontweight("bold")
+    ax.set_ylabel("Metric Value", fontsize=15)
+    ax.set_title(metric_title, fontsize=18)
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
 
     handles, labels = ax.get_legend_handles_labels()
     fig.legend(
@@ -196,18 +174,18 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
         loc="center left",
         ncol=1,
         bbox_to_anchor=(1.02, 0.5),
-        fontsize=13,
+        fontsize=15,  # increased font
     )
 
-    plt.tight_layout(rect=[0, 0, 0.85, 1])
+    plt.tight_layout(rect=[0, 0, 0, 1])
     plt.show()
 
 
 if __name__ == "__main__":
     # Load the table
     table = pd.read_excel(
-        "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/scmr_table.xlsx"
+        "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/results_cox.xlsx"
     )
     # For DataFrames shaped like image1 (rows=models, columns=[all, male, female])
     # produce a single-subplot grouped bar chart.
-    plot_single_metric_rows_as_models(table, metric_title="AUC")
+    plot_single_metric_rows_as_models(table, metric_title="C-Index")
