@@ -89,17 +89,17 @@ def plot_metrics_with_ci_groups(df):
         ax.set_title(metric_label)
         ax.grid(axis="y", linestyle="--", alpha=0.3)
 
-    # Shared legend above plots (models)
+    # Shared legend on the right side (models)
     handles, labels = axs[0].get_legend_handles_labels()
     fig.legend(
         handles,
         labels,
-        loc="upper center",
-        ncol=len(labels),
-        bbox_to_anchor=(0.5, 1.05),
+        loc="center left",
+        ncol=1,
+        bbox_to_anchor=(1.02, 0.5),
     )
 
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.tight_layout(rect=[0, 0, 0.85, 1])
     plt.show()
 
 
@@ -165,12 +165,12 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
     fig.legend(
         handles,
         labels,
-        loc="upper center",
-        ncol=min(len(labels), 4),
-        bbox_to_anchor=(0.5, 1.05),
+        loc="center left",
+        ncol=1,
+        bbox_to_anchor=(1.02, 0.5),
     )
 
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.tight_layout(rect=[0, 0, 0.85, 1])
     plt.show()
 
 
