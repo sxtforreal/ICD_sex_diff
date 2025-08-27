@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple, Any
 # ==========================================
 SELECTED_FEATURES_STORE: Dict[str, Any] = {
     "proposed_sex_agnostic": None,  # type: List[str] | None
-    "proposed_sex_specific": {      # type: Dict[str, List[str]] | None
+    "proposed_sex_specific": {  # type: Dict[str, List[str]] | None
         "male": None,
         "female": None,
     },
@@ -117,7 +117,9 @@ def plot_cox_coefficients(
                         iqr = q75 - q25
                     except Exception:
                         iqr = np.nan
-                    scales[col] = 1.0 if not np.isfinite(iqr) or iqr == 0.0 else float(iqr)
+                    scales[col] = (
+                        1.0 if not np.isfinite(iqr) or iqr == 0.0 else float(iqr)
+                    )
     else:
         scales = {f: 1.0 for f in base_coefs.index.tolist()}
 
@@ -127,7 +129,9 @@ def plot_cox_coefficients(
     for f in base_coefs.index.tolist():
         order.append(f)
         scaled_values.append(float(base_coefs.loc[f]) * float(scales.get(f, 1.0)))
-    coef_series = pd.Series(data=scaled_values, index=order).sort_values(ascending=False)
+    coef_series = pd.Series(data=scaled_values, index=order).sort_values(
+        ascending=False
+    )
     feats = coef_series.index.tolist()
 
     # Build category sets from FEATURE_SETS
@@ -245,6 +249,7 @@ def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame) -> None:
 # TableOne generation (Sex x ICD -> 4 groups)
 # ==========================================
 
+
 def generate_tableone_by_sex_icd(
     df: pd.DataFrame, output_excel_path: str = None
 ) -> None:
@@ -339,7 +344,9 @@ def generate_tableone_by_sex_icd(
                         cols_unique.append(c)
                 ordered_first = [c for c in ["Missing", "Overall"] if c in cols_unique]
                 ordered_groups = [c for c in group_order if c in cols_unique]
-                ordered_tail = [c for c in ["p-value", "P-Value", "pval"] if c in cols_unique]
+                ordered_tail = [
+                    c for c in ["p-value", "P-Value", "pval"] if c in cols_unique
+                ]
                 desired_order = ordered_first + ordered_groups + ordered_tail
                 # Only reorder if we computed a non-empty desired order
                 if desired_order:
@@ -379,7 +386,11 @@ def generate_tableone_by_sex_icd(
     # Fallback summary if TableOne is not available
     try:
         # Identify numeric vs categorical
-        numeric_cols = [c for c in variables if pd.api.types.is_numeric_dtype(df_local[c]) and c not in categorical_cols]
+        numeric_cols = [
+            c
+            for c in variables
+            if pd.api.types.is_numeric_dtype(df_local[c]) and c not in categorical_cols
+        ]
         cat_cols = [c for c in categorical_cols if c in variables]
 
         # Build a wide table with groups as columns to mirror TableOne orientation
@@ -393,12 +404,18 @@ def generate_tableone_by_sex_icd(
         for var in numeric_cols:
             row: Dict[str, object] = {}
             # Missing count overall
-            row["Missing"] = int(pd.to_numeric(df_local[var], errors="coerce").isna().sum())
+            row["Missing"] = int(
+                pd.to_numeric(df_local[var], errors="coerce").isna().sum()
+            )
             # Overall summary as "mean (sd)"
             overall_series = pd.to_numeric(df_local[var], errors="coerce")
             overall_mean = overall_series.mean()
             overall_std = overall_series.std()
-            row["Overall"] = "" if pd.isna(overall_mean) else f"{overall_mean:.1f} ({overall_std:.1f})"
+            row["Overall"] = (
+                ""
+                if pd.isna(overall_mean)
+                else f"{overall_mean:.1f} ({overall_std:.1f})"
+            )
             # Per-group summaries
             for grp_name in group_order:
                 grp_series = pd.to_numeric(
@@ -419,7 +436,9 @@ def generate_tableone_by_sex_icd(
             series = df_local[var]
             # Determine level order: prefer categorical order if available, else sorted unique
             try:
-                levels = [lvl for lvl in pd.Categorical(series).categories if pd.notna(lvl)]
+                levels = [
+                    lvl for lvl in pd.Categorical(series).categories if pd.notna(lvl)
+                ]
             except Exception:
                 levels = [lvl for lvl in series.dropna().unique().tolist()]
                 try:
@@ -476,6 +495,7 @@ def generate_tableone_by_sex_icd(
             print(f"Saved fallback summary to: {output_excel_path}")
     except Exception as e:
         warnings.warn(f"[TableOne Fallback] Failed to generate summary: {e}")
+
 
 # Drop constant/duplicate/highly correlated columns to mitigate singular matrices
 def _sanitize_cox_features_matrix(
@@ -648,14 +668,20 @@ def select_features_max_cindex_forward(
     remaining = list(pool)
 
     # Limit the number of selected features if requested
-    max_iters = len(remaining) if max_features is None else max(0, min(len(remaining), max_features))
+    max_iters = (
+        len(remaining)
+        if max_features is None
+        else max(0, min(len(remaining), max_features))
+    )
 
     for step_idx in range(max_iters):
         best_feat = None
         best_feat_cidx = best_cidx
         if verbose:
             try:
-                print(f"[FS][Forward] seed={random_state} step={step_idx+1}/{max_iters} remaining={len(remaining)}")
+                print(
+                    f"[FS][Forward] seed={random_state} step={step_idx+1}/{max_iters} remaining={len(remaining)}"
+                )
             except Exception:
                 pass
         for feat in remaining:
@@ -663,7 +689,9 @@ def select_features_max_cindex_forward(
             try:
                 cph = fit_cox_model(inner_tr, trial_feats, time_col, event_col)
                 risk_val = predict_risk(cph, inner_val, trial_feats)
-                cidx = concordance_index(inner_val[time_col], -risk_val, inner_val[event_col])
+                cidx = concordance_index(
+                    inner_val[time_col], -risk_val, inner_val[event_col]
+                )
             except Exception:
                 cidx = np.nan
             if np.isfinite(cidx) and (cidx > best_feat_cidx + 1e-10):
@@ -771,6 +799,7 @@ def stability_select_features(
         return list(kept_final)
     return []
 
+
 def sex_specific_inference(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -872,15 +901,26 @@ def sex_specific_full_inference(
         # Feature selection only if this is the Proposed set
         try:
             if set(features) == set(FEATURE_SETS.get("Proposed", [])):
-                selected_m = SELECTED_FEATURES_STORE.get("proposed_sex_specific", {}).get("male")
+                selected_m = SELECTED_FEATURES_STORE.get(
+                    "proposed_sex_specific", {}
+                ).get("male")
                 if not selected_m:
                     selected_m = select_features_max_cindex_forward(
-                        data_m, list(used_features), "PE_Time", "VT/VF/SCD", random_state=42, verbose=True
+                        data_m,
+                        list(used_features),
+                        "PE_Time",
+                        "VT/VF/SCD",
+                        random_state=42,
+                        verbose=True,
                     )
                     if selected_m:
                         try:
-                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["male"] = list(selected_m)
-                            print(f"[FS][Store] Proposed male-specific features stored: {len(selected_m)}")
+                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["male"] = (
+                                list(selected_m)
+                            )
+                            print(
+                                f"[FS][Store] Proposed male-specific features stored: {len(selected_m)}"
+                            )
                         except Exception:
                             pass
                 if selected_m:
@@ -904,15 +944,26 @@ def sex_specific_full_inference(
         # Feature selection only if this is the Proposed set
         try:
             if set(features) == set(FEATURE_SETS.get("Proposed", [])):
-                selected_f = SELECTED_FEATURES_STORE.get("proposed_sex_specific", {}).get("female")
+                selected_f = SELECTED_FEATURES_STORE.get(
+                    "proposed_sex_specific", {}
+                ).get("female")
                 if not selected_f:
                     selected_f = select_features_max_cindex_forward(
-                        data_f, list(used_features), "PE_Time", "VT/VF/SCD", random_state=42, verbose=True
+                        data_f,
+                        list(used_features),
+                        "PE_Time",
+                        "VT/VF/SCD",
+                        random_state=42,
+                        verbose=True,
                     )
                     if selected_f:
                         try:
-                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["female"] = list(selected_f)
-                            print(f"[FS][Store] Proposed female-specific features stored: {len(selected_f)}")
+                            SELECTED_FEATURES_STORE["proposed_sex_specific"][
+                                "female"
+                            ] = list(selected_f)
+                            print(
+                                f"[FS][Store] Proposed female-specific features stored: {len(selected_f)}"
+                            )
                         except Exception:
                             pass
                 if selected_f:
@@ -943,7 +994,9 @@ def sex_specific_full_inference(
         ).astype(int)
     if "female" in models and not out[out["Female"] == 1].empty:
         te_f = out[out["Female"] == 1]
-        risk_f = predict_risk(models["female"], te_f, list(models["female"].params_.index))
+        risk_f = predict_risk(
+            models["female"], te_f, list(models["female"].params_.index)
+        )
         out.loc[out["Female"] == 1, "pred_prob"] = risk_f
         out.loc[out["Female"] == 1, "pred_label"] = (
             risk_f >= thresholds["female"]
@@ -1034,11 +1087,18 @@ def sex_agnostic_full_inference(
             selected = SELECTED_FEATURES_STORE.get("proposed_sex_agnostic")
             if not selected:
                 selected = select_features_max_cindex_forward(
-                    df_base, list(features), "PE_Time", label_col, random_state=42, verbose=True
+                    df_base,
+                    list(features),
+                    "PE_Time",
+                    label_col,
+                    random_state=42,
+                    verbose=True,
                 )
                 if selected:
                     SELECTED_FEATURES_STORE["proposed_sex_agnostic"] = list(selected)
-                    print(f"[FS][Store] Proposed sex-agnostic features stored: {len(selected)}")
+                    print(
+                        f"[FS][Store] Proposed sex-agnostic features stored: {len(selected)}"
+                    )
             if selected:
                 used_features = list(selected)
     except Exception:
@@ -1111,7 +1171,9 @@ def evaluate_split(
                     )
                     if selected:
                         used_features = selected
-                        print(f"[FS] Sex-agnostic: selected {len(selected)} features for Proposed: {selected}")
+                        print(
+                            f"[FS] Sex-agnostic: selected {len(selected)} features for Proposed: {selected}"
+                        )
             except Exception:
                 pass
         cph = fit_cox_model(tr, used_features, time_col, event_col)
@@ -1177,8 +1239,13 @@ def evaluate_split(
         risk_scores = np.zeros(len(test_df))
         if not tr_m.empty and not te_m.empty:
             # If override is provided, use it; otherwise optionally select per split
-            if sex_specific_feature_override and "male" in sex_specific_feature_override:
-                used_features_m = [f for f in sex_specific_feature_override["male"] if f != "Female"]
+            if (
+                sex_specific_feature_override
+                and "male" in sex_specific_feature_override
+            ):
+                used_features_m = [
+                    f for f in sex_specific_feature_override["male"] if f != "Female"
+                ]
             else:
                 used_features_m = used_features
                 if not disable_within_split_feature_selection:
@@ -1186,11 +1253,17 @@ def evaluate_split(
                     try:
                         if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
                             selected_m = select_features_max_cindex_forward(
-                                tr_m, list(used_features), time_col, event_col, random_state=seed
+                                tr_m,
+                                list(used_features),
+                                time_col,
+                                event_col,
+                                random_state=seed,
                             )
                             if selected_m:
                                 used_features_m = selected_m
-                                print(f"[FS] Sex-specific (male): selected {len(selected_m)} features for Proposed: {selected_m}")
+                                print(
+                                    f"[FS] Sex-specific (male): selected {len(selected_m)} features for Proposed: {selected_m}"
+                                )
                     except Exception:
                         pass
             cph_m = fit_cox_model(tr_m, used_features_m, time_col, event_col)
@@ -1204,8 +1277,13 @@ def evaluate_split(
         tr_f = train_df[train_df["Female"] == 1]
         te_f = test_df[test_df["Female"] == 1]
         if not tr_f.empty and not te_f.empty:
-            if sex_specific_feature_override and "female" in sex_specific_feature_override:
-                used_features_f = [f for f in sex_specific_feature_override["female"] if f != "Female"]
+            if (
+                sex_specific_feature_override
+                and "female" in sex_specific_feature_override
+            ):
+                used_features_f = [
+                    f for f in sex_specific_feature_override["female"] if f != "Female"
+                ]
             else:
                 used_features_f = used_features
                 if not disable_within_split_feature_selection:
@@ -1213,11 +1291,17 @@ def evaluate_split(
                     try:
                         if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
                             selected_f = select_features_max_cindex_forward(
-                                tr_f, list(used_features), time_col, event_col, random_state=seed
+                                tr_f,
+                                list(used_features),
+                                time_col,
+                                event_col,
+                                random_state=seed,
                             )
                             if selected_f:
                                 used_features_f = selected_f
-                                print(f"[FS] Sex-specific (female): selected {len(selected_f)} features for Proposed: {selected_f}")
+                                print(
+                                    f"[FS] Sex-specific (female): selected {len(selected_f)} features for Proposed: {selected_f}"
+                                )
                     except Exception:
                         pass
             cph_f = fit_cox_model(tr_f, used_features_f, time_col, event_col)
@@ -1452,7 +1536,7 @@ def run_cox_experiments(
             results[f"{featset_name} - {cfg['name']}"] = {m: [] for m in metrics}
 
     # Precompute stable feature sets to ensure consistent specification across splits
-    seeds_for_stability = list(range(min(N, 50)))
+    seeds_for_stability = list(range(min(N, 20)))
     stable_agnostic_features: Dict[str, List[str]] = {}
     stable_sex_specific_features: Dict[str, Dict[str, List[str]]] = {}
 
@@ -1483,8 +1567,12 @@ def run_cox_experiments(
                     stable_agnostic_features[featset_name] = sel_agn
                     try:
                         if featset_name == "Proposed":
-                            SELECTED_FEATURES_STORE["proposed_sex_agnostic"] = list(sel_agn)
-                            print(f"[FS][Store] Proposed sex-agnostic features: {len(sel_agn)} selected")
+                            SELECTED_FEATURES_STORE["proposed_sex_agnostic"] = list(
+                                sel_agn
+                            )
+                            print(
+                                f"[FS][Store] Proposed sex-agnostic features: {len(sel_agn)} selected"
+                            )
                     except Exception:
                         pass
 
@@ -1493,43 +1581,59 @@ def run_cox_experiments(
                 df_f = df[df["Female"] == 1].dropna(subset=[time_col, event_col]).copy()
                 base_feats = [f for f in feature_cols if f != "Female"]
 
-                sel_m = stability_select_features(
-                    df=df_m,
-                    candidate_features=list(base_feats),
-                    time_col=time_col,
-                    event_col=event_col,
-                    seeds=seeds_for_stability,
-                    max_features=None,
-                    threshold=0.4,
-                    min_features=None,
-                    verbose=True,
-                ) if not df_m.empty else []
-                sel_f = stability_select_features(
-                    df=df_f,
-                    candidate_features=list(base_feats),
-                    time_col=time_col,
-                    event_col=event_col,
-                    seeds=seeds_for_stability,
-                    max_features=None,
-                    threshold=0.4,
-                    min_features=None,
-                    verbose=True,
-                ) if not df_f.empty else []
+                sel_m = (
+                    stability_select_features(
+                        df=df_m,
+                        candidate_features=list(base_feats),
+                        time_col=time_col,
+                        event_col=event_col,
+                        seeds=seeds_for_stability,
+                        max_features=None,
+                        threshold=0.4,
+                        min_features=None,
+                        verbose=True,
+                    )
+                    if not df_m.empty
+                    else []
+                )
+                sel_f = (
+                    stability_select_features(
+                        df=df_f,
+                        candidate_features=list(base_feats),
+                        time_col=time_col,
+                        event_col=event_col,
+                        seeds=seeds_for_stability,
+                        max_features=None,
+                        threshold=0.4,
+                        min_features=None,
+                        verbose=True,
+                    )
+                    if not df_f.empty
+                    else []
+                )
 
                 if sel_m:
                     stable_sex_specific_features[featset_name]["male"] = sel_m
                     try:
                         if featset_name == "Proposed":
-                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["male"] = list(sel_m)
-                            print(f"[FS][Store] Proposed male-specific features: {len(sel_m)} selected")
+                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["male"] = (
+                                list(sel_m)
+                            )
+                            print(
+                                f"[FS][Store] Proposed male-specific features: {len(sel_m)} selected"
+                            )
                     except Exception:
                         pass
                 if sel_f:
                     stable_sex_specific_features[featset_name]["female"] = sel_f
                     try:
                         if featset_name == "Proposed":
-                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["female"] = list(sel_f)
-                            print(f"[FS][Store] Proposed female-specific features: {len(sel_f)} selected")
+                            SELECTED_FEATURES_STORE["proposed_sex_specific"][
+                                "female"
+                            ] = list(sel_f)
+                            print(
+                                f"[FS][Store] Proposed female-specific features: {len(sel_f)} selected"
+                            )
                     except Exception:
                         pass
         except Exception:
@@ -1549,7 +1653,9 @@ def run_cox_experiments(
                 use_undersampling = cfg["mode"] == "sex_agnostic"
                 # Use stabilized features and disable per-split selection
                 if cfg["mode"] == "sex_agnostic":
-                    frozen_feats = stable_agnostic_features.get(featset_name, feature_cols)
+                    frozen_feats = stable_agnostic_features.get(
+                        featset_name, feature_cols
+                    )
                     if not frozen_feats:
                         frozen_feats = feature_cols
                     # Ensure Proposed uses the stored selection if available
@@ -1573,8 +1679,12 @@ def run_cox_experiments(
                     # Ensure Proposed uses the stored sex-specific selections if available
                     if featset_name == "Proposed":
                         try:
-                            stored_m = SELECTED_FEATURES_STORE.get("proposed_sex_specific", {}).get("male")
-                            stored_f = SELECTED_FEATURES_STORE.get("proposed_sex_specific", {}).get("female")
+                            stored_m = SELECTED_FEATURES_STORE.get(
+                                "proposed_sex_specific", {}
+                            ).get("male")
+                            stored_f = SELECTED_FEATURES_STORE.get(
+                                "proposed_sex_specific", {}
+                            ).get("female")
                             if overrides is None:
                                 overrides = {}
                             if stored_m:
@@ -1689,7 +1799,7 @@ FEATURE_SETS = {
     ],
     "Proposed": [
         "Female",
-        "Age by decade",
+        "Age at CMR",
         "BMI",
         "DM",
         "HTN",
@@ -1708,11 +1818,6 @@ FEATURE_SETS = {
         "Sphericity Index",
         "Relative Wall Thickness",
         "MV Annular Diameter",
-        "Beta Blocker",
-        "ACEi/ARB/ARNi",
-        "Aldosterone Antagonist",
-        "AAD",
-        "CRT",
         "QRS",
         "QTc",
         "CrCl>45",
