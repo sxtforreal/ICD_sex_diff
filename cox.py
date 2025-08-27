@@ -608,6 +608,50 @@ def select_features_max_cindex_forward(
     return selected
 
 
+def compute_stable_features_repeated(
+    df: pd.DataFrame,
+    candidate_features: List[str],
+    time_col: str,
+    event_col: str,
+    n_repeats: int = 50,
+    random_state_start: int = 0,
+    max_features: int = None,
+    min_freq: float = 0.5,
+) -> Tuple[List[str], Dict[str, int]]:
+    """Run forward selection multiple times and keep features that are selected
+    at least ``min_freq`` fraction of runs.
+
+    Returns (stable_feature_list, selection_counts_dict).
+    """
+    df_local = df.dropna(subset=[time_col, event_col]).copy()
+    if df_local.empty:
+        return [], {}
+
+    selection_counts: Dict[str, int] = {f: 0 for f in candidate_features if f in df_local.columns}
+    num_runs = max(1, int(n_repeats))
+
+    for i in range(num_runs):
+        try:
+            selected = select_features_max_cindex_forward(
+                df_local,
+                candidate_features,
+                time_col,
+                event_col,
+                random_state=random_state_start + i,
+                max_features=max_features,
+                verbose=False,
+            )
+        except Exception:
+            selected = []
+        for f in selected:
+            if f in selection_counts:
+                selection_counts[f] += 1
+
+    threshold = min_freq * float(num_runs)
+    stable_features = [f for f, cnt in selection_counts.items() if cnt >= threshold]
+    return stable_features, selection_counts
+
+
 def sex_specific_inference(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -874,6 +918,7 @@ def evaluate_split(
     mode: str,
     seed: int,
     use_undersampling: bool = False,
+    featset_name: str = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
     """Train CoxPH and return (pred_label, risk_scores, metrics dict).
 
@@ -891,12 +936,19 @@ def evaluate_split(
         # Feature selection only for Proposed set
         try:
             if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
-                selected = select_features_max_cindex_forward(
-                    tr, list(feature_cols), time_col, event_col, random_state=seed
-                )
-                if selected:
-                    used_features = selected
-                    print(f"[FS] Sex-agnostic: selected {len(selected)} features for Proposed: {selected}")
+                # If a frozen set is available, use it; else do per-split selection
+                frozen_key = None if featset_name is None else f"{featset_name}|sex_agnostic"
+                frozen = FROZEN_FEATURES.get(frozen_key, None) if frozen_key is not None else None
+                if isinstance(frozen, list) and len(frozen) > 0:
+                    used_features = frozen
+                    print(f"[FS] Sex-agnostic: using frozen {len(used_features)} features for Proposed: {used_features}")
+                else:
+                    selected = select_features_max_cindex_forward(
+                        tr, list(feature_cols), time_col, event_col, random_state=seed
+                    )
+                    if selected:
+                        used_features = selected
+                        print(f"[FS] Sex-agnostic: selected {len(selected)} features for Proposed: {selected}")
         except Exception:
             pass
         cph = fit_cox_model(tr, used_features, time_col, event_col)
@@ -904,7 +956,7 @@ def evaluate_split(
         thr = threshold_by_top_quantile(risk_scores, 0.5)
         pred = (risk_scores >= thr).astype(int)
         cidx = concordance_index(test_df[time_col], -risk_scores, test_df[event_col])
-        return pred, risk_scores, {"c_index": cidx}
+        return pred, risk_scores, {"c_index": cidx, "selected_features": used_features}
 
     if mode == "male_only":
         # For single-sex model, exclude Female from features
@@ -960,17 +1012,26 @@ def evaluate_split(
         te_m = test_df[test_df["Female"] == 0]
         pred = np.zeros(len(test_df), dtype=int)
         risk_scores = np.zeros(len(test_df))
+        selected_m_list: List[str] = []
+        selected_f_list: List[str] = []
         if not tr_m.empty and not te_m.empty:
             used_features_m = used_features
             # Feature selection for Proposed per sex (male)
             try:
                 if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
-                    selected_m = select_features_max_cindex_forward(
-                        tr_m, list(used_features), time_col, event_col, random_state=seed
-                    )
-                    if selected_m:
-                        used_features_m = selected_m
-                        print(f"[FS] Sex-specific (male): selected {len(selected_m)} features for Proposed: {selected_m}")
+                    frozen_key = None if featset_name is None else f"{featset_name}|sex_specific"
+                    frozen_sex = FROZEN_FEATURES.get(frozen_key, None) if frozen_key is not None else None
+                    if isinstance(frozen_sex, dict) and isinstance(frozen_sex.get("male", None), list) and len(frozen_sex.get("male", [])) > 0:
+                        used_features_m = frozen_sex["male"]
+                        print(f"[FS] Sex-specific (male): using frozen {len(used_features_m)} features for Proposed: {used_features_m}")
+                    else:
+                        selected_m = select_features_max_cindex_forward(
+                            tr_m, list(used_features), time_col, event_col, random_state=seed
+                        )
+                        if selected_m:
+                            used_features_m = selected_m
+                            print(f"[FS] Sex-specific (male): selected {len(selected_m)} features for Proposed: {selected_m}")
+                    selected_m_list = list(used_features_m)
             except Exception:
                 pass
             cph_m = fit_cox_model(tr_m, used_features_m, time_col, event_col)
@@ -988,12 +1049,19 @@ def evaluate_split(
             # Feature selection for Proposed per sex (female)
             try:
                 if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
-                    selected_f = select_features_max_cindex_forward(
-                        tr_f, list(used_features), time_col, event_col, random_state=seed
-                    )
-                    if selected_f:
-                        used_features_f = selected_f
-                        print(f"[FS] Sex-specific (female): selected {len(selected_f)} features for Proposed: {selected_f}")
+                    frozen_key = None if featset_name is None else f"{featset_name}|sex_specific"
+                    frozen_sex = FROZEN_FEATURES.get(frozen_key, None) if frozen_key is not None else None
+                    if isinstance(frozen_sex, dict) and isinstance(frozen_sex.get("female", None), list) and len(frozen_sex.get("female", [])) > 0:
+                        used_features_f = frozen_sex["female"]
+                        print(f"[FS] Sex-specific (female): using frozen {len(used_features_f)} features for Proposed: {used_features_f}")
+                    else:
+                        selected_f = select_features_max_cindex_forward(
+                            tr_f, list(used_features), time_col, event_col, random_state=seed
+                        )
+                        if selected_f:
+                            used_features_f = selected_f
+                            print(f"[FS] Sex-specific (female): selected {len(selected_f)} features for Proposed: {selected_f}")
+                    selected_f_list = list(used_features_f)
             except Exception:
                 pass
             cph_f = fit_cox_model(tr_f, used_features_f, time_col, event_col)
@@ -1005,7 +1073,7 @@ def evaluate_split(
             risk_scores[mask_f] = risk_f
         # get c-index on full test using risk_scores (where available)
         cidx = concordance_index(test_df[time_col], -risk_scores, test_df[event_col])
-        return pred, risk_scores, {"c_index": cidx}
+        return pred, risk_scores, {"c_index": cidx, "selected_features_male": selected_m_list, "selected_features_female": selected_f_list}
 
     raise ValueError(f"Unknown mode: {mode}")
 
@@ -1209,6 +1277,10 @@ def run_cox_experiments(
     time_col: str = "PE_Time",
     event_col: str = "VT/VF/SCD",
     export_excel_path: str = None,
+    selection_strategy: str = "frozen",
+    selection_n_repeats: int = 50,
+    selection_min_freq: float = 0.5,
+    selection_max_features: int = None,
 ) -> Tuple[Dict[str, Dict[str, List[float]]], pd.DataFrame]:
     """Run 50 random 70/30 splits across configurations, compute performance and export summary.
 
@@ -1226,6 +1298,113 @@ def run_cox_experiments(
     for featset_name in feature_sets:
         for cfg in model_configs:
             results[f"{featset_name} - {cfg['name']}"] = {m: [] for m in metrics}
+
+    # Optionally precompute stable/frozen sets for Proposed features across the whole dataset
+    # so that all splits use an identical feature subset, addressing variability across splits.
+    global FROZEN_FEATURES
+    FROZEN_FEATURES = {}
+    stability_records: List[Dict[str, object]] = []
+
+    if selection_strategy == "frozen":
+        for featset_name, feature_cols in feature_sets.items():
+            try:
+                if set(feature_cols) != set(FEATURE_SETS.get("Proposed", [])):
+                    continue
+            except Exception:
+                continue
+
+            # Sex-agnostic frozen set (includes Female)
+            try:
+                stable_agn, counts_agn = compute_stable_features_repeated(
+                    df,
+                    list(feature_cols),
+                    time_col,
+                    event_col,
+                    n_repeats=selection_n_repeats,
+                    random_state_start=0,
+                    max_features=selection_max_features,
+                    min_freq=selection_min_freq,
+                )
+                FROZEN_FEATURES[f"{featset_name}|sex_agnostic"] = stable_agn
+                # Log stability
+                total_runs = max(1, int(selection_n_repeats))
+                for f in feature_cols:
+                    cnt = int(counts_agn.get(f, 0))
+                    stability_records.append(
+                        {
+                            "Feature Set": featset_name,
+                            "Mode": "sex_agnostic",
+                            "Sex": "both",
+                            "Feature": f,
+                            "Frequency": cnt / float(total_runs),
+                            "Selected (>=min_freq)": 1 if (cnt / float(total_runs)) >= selection_min_freq else 0,
+                            "Repeats": total_runs,
+                            "MinFreq": selection_min_freq,
+                        }
+                    )
+            except Exception:
+                pass
+
+            # Sex-specific frozen sets (exclude Female)
+            try:
+                df_m = df[df["Female"] == 0]
+                df_f = df[df["Female"] == 1]
+                base_feats = [f for f in feature_cols if f != "Female"]
+
+                stable_m, counts_m = compute_stable_features_repeated(
+                    df_m,
+                    list(base_feats),
+                    time_col,
+                    event_col,
+                    n_repeats=selection_n_repeats,
+                    random_state_start=0,
+                    max_features=selection_max_features,
+                    min_freq=selection_min_freq,
+                )
+                stable_f, counts_f = compute_stable_features_repeated(
+                    df_f,
+                    list(base_feats),
+                    time_col,
+                    event_col,
+                    n_repeats=selection_n_repeats,
+                    random_state_start=0,
+                    max_features=selection_max_features,
+                    min_freq=selection_min_freq,
+                )
+                FROZEN_FEATURES[f"{featset_name}|sex_specific"] = {
+                    "male": stable_m,
+                    "female": stable_f,
+                }
+                total_runs = max(1, int(selection_n_repeats))
+                for f in base_feats:
+                    cnt_m = int(counts_m.get(f, 0))
+                    cnt_f = int(counts_f.get(f, 0))
+                    stability_records.append(
+                        {
+                            "Feature Set": featset_name,
+                            "Mode": "sex_specific",
+                            "Sex": "male",
+                            "Feature": f,
+                            "Frequency": cnt_m / float(total_runs),
+                            "Selected (>=min_freq)": 1 if (cnt_m / float(total_runs)) >= selection_min_freq else 0,
+                            "Repeats": total_runs,
+                            "MinFreq": selection_min_freq,
+                        }
+                    )
+                    stability_records.append(
+                        {
+                            "Feature Set": featset_name,
+                            "Mode": "sex_specific",
+                            "Sex": "female",
+                            "Feature": f,
+                            "Frequency": cnt_f / float(total_runs),
+                            "Selected (>=min_freq)": 1 if (cnt_f / float(total_runs)) >= selection_min_freq else 0,
+                            "Repeats": total_runs,
+                            "MinFreq": selection_min_freq,
+                        }
+                    )
+            except Exception:
+                pass
 
     for seed in range(N):
         print(seed)
@@ -1248,6 +1427,7 @@ def run_cox_experiments(
                     mode=cfg["mode"],
                     seed=seed,
                     use_undersampling=use_undersampling,
+                    featset_name=featset_name,
                 )
                 # overall, male, female C-index based on risk
                 cidx_all = met.get("c_index", np.nan)
@@ -1320,7 +1500,15 @@ def run_cox_experiments(
 
     if export_excel_path is not None:
         os.makedirs(os.path.dirname(export_excel_path), exist_ok=True)
-        summary_table.to_excel(export_excel_path, index=True, index_label="RowName")
+        try:
+            with pd.ExcelWriter(export_excel_path) as writer:
+                summary_table.to_excel(writer, index=True, index_label="RowName", sheet_name="summary")
+                if selection_strategy == "frozen" and len(stability_records) > 0:
+                    stability_df = pd.DataFrame(stability_records)
+                    stability_df.to_excel(writer, index=False, sheet_name="feature_stability")
+        except Exception:
+            # Fallback to single-sheet write if multi-sheet fails in the environment
+            summary_table.to_excel(export_excel_path, index=True, index_label="RowName")
 
     return results, summary_table
 
@@ -1373,6 +1561,9 @@ FEATURE_SETS = {
     ],
 }
 
+
+# Global container for frozen/stable feature sets computed before multi-split runs
+FROZEN_FEATURES = {}
 
 if __name__ == "__main__":
     # Load and prepare data
