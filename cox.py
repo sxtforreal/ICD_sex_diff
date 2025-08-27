@@ -11,6 +11,7 @@ from lifelines.utils import concordance_index
 from lifelines.exceptions import ConvergenceError
 
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 
 try:
@@ -532,6 +533,179 @@ def threshold_by_top_quantile(risk_scores: np.ndarray, quantile: float = 0.5) ->
     return float(q)
 
 
+def _cv_cindex_for_subset(
+    df: pd.DataFrame,
+    features: List[str],
+    mode: str,
+    time_col: str,
+    event_col: str,
+    seed: int,
+    use_undersampling: bool,
+    n_splits: int = 5,
+) -> float:
+    """Compute mean validation c-index for a given feature subset using stratified K-fold CV.
+
+    - For sex_agnostic: include Female as-is; fit on each train fold (with optional undersampling),
+      predict risk on validation fold, compute c-index.
+    - For sex_specific: exclude Female from features; fit separate models on each sex in train fold,
+      predict risks on corresponding sex in validation fold, combine and compute overall c-index.
+    """
+    if not features:
+        return -np.inf
+
+    # Prepare folds stratified by event
+    df_local = df.dropna(subset=[time_col, event_col]).copy()
+    if df_local.empty:
+        return -np.inf
+
+    skf = StratifiedKFold(n_splits=max(2, n_splits), shuffle=True, random_state=seed)
+    y = df_local[event_col].astype(int).values
+
+    cidx_vals: List[float] = []
+    for train_idx, val_idx in skf.split(df_local, y):
+        tr_fold = df_local.iloc[train_idx]
+        va_fold = df_local.iloc[val_idx]
+
+        try:
+            if mode == "sex_agnostic":
+                used_features = list(features)
+                tr_use = (
+                    create_undersampled_dataset(tr_fold, event_col, seed)
+                    if use_undersampling
+                    else tr_fold
+                )
+                cph = fit_cox_model(tr_use, used_features, time_col, event_col)
+                risk = predict_risk(cph, va_fold, used_features)
+                cidx = concordance_index(
+                    va_fold[time_col].values, -risk, va_fold[event_col].values
+                )
+                cidx_vals.append(cidx)
+            elif mode in ("sex_specific", "male_only", "female_only"):
+                used_features = [f for f in features if f != "Female"]
+                # male branch
+                risk_va = np.full(len(va_fold), np.nan, dtype=float)
+                # male
+                tr_m = tr_fold[tr_fold["Female"] == 0]
+                va_m = va_fold[va_fold["Female"] == 0]
+                if not tr_m.empty and not va_m.empty:
+                    cph_m = fit_cox_model(tr_m, used_features, time_col, event_col)
+                    risk_m = predict_risk(cph_m, va_m, used_features)
+                    risk_va[va_fold["Female"].values == 0] = risk_m
+                # female
+                tr_f = tr_fold[tr_fold["Female"] == 1]
+                va_f = va_fold[va_fold["Female"] == 1]
+                if not tr_f.empty and not va_f.empty:
+                    cph_f = fit_cox_model(tr_f, used_features, time_col, event_col)
+                    risk_f = predict_risk(cph_f, va_f, used_features)
+                    risk_va[va_fold["Female"].values == 1] = risk_f
+
+                mask = np.isfinite(risk_va)
+                if np.sum(mask) >= 2 and not np.allclose(risk_va[mask], risk_va[mask][0]):
+                    cidx = concordance_index(
+                        va_fold[time_col].values[mask],
+                        -risk_va[mask],
+                        va_fold[event_col].values[mask],
+                    )
+                    cidx_vals.append(cidx)
+                else:
+                    cidx_vals.append(np.nan)
+            else:
+                return -np.inf
+        except Exception:
+            cidx_vals.append(np.nan)
+
+    # Mean of valid c-index values
+    cidx_arr = np.array(cidx_vals, dtype=float)
+    if np.all(np.isnan(cidx_arr)):
+        return -np.inf
+    return float(np.nanmean(cidx_arr))
+
+
+def forward_select_features_by_cindex(
+    df: pd.DataFrame,
+    candidate_features: List[str],
+    mode: str,
+    time_col: str,
+    event_col: str,
+    seed: int,
+    use_undersampling: bool,
+    n_splits: int = 5,
+    max_features: int = None,
+    min_improvement: float = 1e-4,
+) -> List[str]:
+    """Greedy forward selection to maximize CV c-index.
+
+    Returns the selected feature subset. If selection fails, returns the original candidate list.
+    """
+    # For sex-specific, exclude Female from candidates during selection
+    if mode in ("sex_specific", "male_only", "female_only"):
+        candidates = [f for f in candidate_features if f != "Female"]
+    else:
+        candidates = list(candidate_features)
+
+    remaining = list(candidates)
+    selected: List[str] = []
+
+    # Initialize with best single feature
+    best_score = -np.inf
+    best_feat = None
+    for feat in remaining:
+        score = _cv_cindex_for_subset(
+            df,
+            [feat],
+            mode,
+            time_col,
+            event_col,
+            seed,
+            use_undersampling,
+            n_splits=n_splits,
+        )
+        if score > best_score:
+            best_score = score
+            best_feat = feat
+
+    if best_feat is None or not np.isfinite(best_score):
+        return candidate_features
+
+    selected.append(best_feat)
+    remaining.remove(best_feat)
+
+    # Iteratively add features that improve c-index
+    while remaining and (max_features is None or len(selected) < max_features):
+        improved = False
+        best_next = None
+        trial_best = best_score
+        for feat in list(remaining):
+            subset = selected + [feat]
+            score = _cv_cindex_for_subset(
+                df,
+                subset,
+                mode,
+                time_col,
+                event_col,
+                seed,
+                use_undersampling,
+                n_splits=n_splits,
+            )
+            if score > trial_best + min_improvement:
+                trial_best = score
+                best_next = feat
+
+        if best_next is None:
+            break
+
+        selected.append(best_next)
+        remaining.remove(best_next)
+        best_score = trial_best
+        improved = True
+
+        if not improved:
+            break
+
+    # If sex-agnostic and Female was in candidates but not selected, keep as-is (respect data-driven choice)
+    return selected if selected else candidate_features
+
+
 def sex_specific_inference(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -543,7 +717,22 @@ def sex_specific_inference(
     Assumes survival labels/time are in the input dataframes (uses PE_Time and VT/VF/SCD).
     Female is excluded from features for single-sex models.
     """
-    used_features = [f for f in features if f != "Female"]
+    # Perform feature selection only for Proposed feature set
+    if set(features) == set(FEATURE_SETS.get("Proposed", [])):
+        used_features = forward_select_features_by_cindex(
+            train_df,
+            features,
+            mode="sex_specific",
+            time_col="PE_Time",
+            event_col="VT/VF/SCD",
+            seed=42,
+            use_undersampling=False,
+            n_splits=5,
+        )
+        used_features = [f for f in used_features if f != "Female"]
+        print(f"[FS] Sex-specific selected features (Proposed): {used_features}")
+    else:
+        used_features = [f for f in features if f != "Female"]
 
     train_m = (
         train_df[train_df["Female"] == 0].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
@@ -610,7 +799,22 @@ def sex_specific_full_inference(
     - Excludes Female from submodel features
     - Dichotomizes by sex-specific median risks
     """
-    used_features = [f for f in features if f != "Female"]
+    # Perform feature selection only for Proposed feature set
+    if set(features) == set(FEATURE_SETS.get("Proposed", [])):
+        used_features = forward_select_features_by_cindex(
+            df,
+            features,
+            mode="sex_specific",
+            time_col="PE_Time",
+            event_col="VT/VF/SCD",
+            seed=42,
+            use_undersampling=False,
+            n_splits=5,
+        )
+        used_features = [f for f in used_features if f != "Female"]
+        print(f"[FS] Sex-specific (full) selected features (Proposed): {used_features}")
+    else:
+        used_features = [f for f in features if f != "Female"]
 
     data_m = df[df["Female"] == 0].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
     data_f = df[df["Female"] == 1].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
@@ -674,7 +878,21 @@ def sex_agnostic_inference(
     Assumes survival labels/time are in the input dataframes (uses PE_Time and label_col).
     Female is INCLUDED in features for agnostic model.
     """
-    used_features = features
+    # Perform feature selection only for Proposed feature set
+    if set(features) == set(FEATURE_SETS.get("Proposed", [])):
+        used_features = forward_select_features_by_cindex(
+            train_df,
+            features,
+            mode="sex_agnostic",
+            time_col="PE_Time",
+            event_col=label_col,
+            seed=42,
+            use_undersampling=use_undersampling,
+            n_splits=5,
+        )
+        print(f"[FS] Sex-agnostic selected features (Proposed): {used_features}")
+    else:
+        used_features = features
     tr_base = (
         create_undersampled_dataset(train_df, label_col, 42)
         if use_undersampling
@@ -720,7 +938,21 @@ def sex_agnostic_full_inference(
     - Includes Female in features
     - Dichotomizes risk by overall median
     """
-    used_features = features
+    # Perform feature selection only for Proposed feature set
+    if set(features) == set(FEATURE_SETS.get("Proposed", [])):
+        used_features = forward_select_features_by_cindex(
+            df,
+            features,
+            mode="sex_agnostic",
+            time_col="PE_Time",
+            event_col=label_col,
+            seed=42,
+            use_undersampling=use_undersampling,
+            n_splits=5,
+        )
+        print(f"[FS] Sex-agnostic (full) selected features (Proposed): {used_features}")
+    else:
+        used_features = features
     df_base = (
         create_undersampled_dataset(df, label_col, 42) if use_undersampling else df
     )
@@ -768,6 +1000,22 @@ def evaluate_split(
     mode in {"sex_agnostic", "male_only", "female_only", "sex_specific"}.
     Sex-agnostic removes Female from features if present.
     """
+    # If Proposed feature set, perform feature selection to maximize c-index
+    if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
+        fs_mode = "sex_specific" if mode in ("sex_specific", "male_only", "female_only") else "sex_agnostic"
+        selected = forward_select_features_by_cindex(
+            train_df,
+            feature_cols,
+            mode=fs_mode,
+            time_col=time_col,
+            event_col=event_col,
+            seed=seed,
+            use_undersampling=use_undersampling,
+            n_splits=5,
+        )
+        feature_cols = selected
+        print(f"[FS] Selected features for Proposed ({mode}): {feature_cols}")
+
     if mode == "sex_agnostic":
         # In agnostic model, Female is included
         used_features = feature_cols
