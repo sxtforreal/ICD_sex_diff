@@ -532,6 +532,82 @@ def threshold_by_top_quantile(risk_scores: np.ndarray, quantile: float = 0.5) ->
     return float(q)
 
 
+def select_features_max_cindex_forward(
+    train_df: pd.DataFrame,
+    candidate_features: List[str],
+    time_col: str,
+    event_col: str,
+    random_state: int = 0,
+    max_features: int = None,
+    verbose: bool = False,
+) -> List[str]:
+    """Greedy forward selection to maximize validation C-index.
+
+    - Uses an inner 70/30 split of train_df for selection.
+    - Applies the same sanitization as model fitting to avoid degenerate cols.
+    - Returns a subset (possibly empty -> will be handled by callers).
+    """
+    df_local = train_df.dropna(subset=[time_col, event_col]).copy()
+    if df_local.empty:
+        return []
+
+    # Initial candidate pool after basic sanitization
+    try:
+        X_sanitized, kept = _sanitize_cox_features_matrix(
+            df_local, candidate_features, corr_threshold=0.995, verbose=False
+        )
+        pool: List[str] = list(kept)
+    except Exception:
+        pool = [f for f in candidate_features if f in df_local.columns]
+
+    if len(pool) <= 1:
+        return list(pool)
+
+    try:
+        inner_tr, inner_val = train_test_split(
+            df_local,
+            test_size=0.3,
+            random_state=random_state,
+            stratify=df_local[event_col] if df_local[event_col].nunique() > 1 else None,
+        )
+    except Exception:
+        inner_tr, inner_val = train_test_split(
+            df_local, test_size=0.3, random_state=random_state
+        )
+
+    selected: List[str] = []
+    best_cidx: float = -np.inf
+    remaining = list(pool)
+
+    # Limit the number of selected features if requested
+    max_iters = len(remaining) if max_features is None else max(0, min(len(remaining), max_features))
+
+    for _ in range(max_iters):
+        best_feat = None
+        best_feat_cidx = best_cidx
+        for feat in remaining:
+            trial_feats = selected + [feat]
+            try:
+                cph = fit_cox_model(inner_tr, trial_feats, time_col, event_col)
+                risk_val = predict_risk(cph, inner_val, trial_feats)
+                cidx = concordance_index(inner_val[time_col], -risk_val, inner_val[event_col])
+            except Exception:
+                cidx = np.nan
+            if np.isfinite(cidx) and (cidx > best_feat_cidx + 1e-10):
+                best_feat_cidx = float(cidx)
+                best_feat = feat
+
+        if best_feat is None:
+            break
+        selected.append(best_feat)
+        remaining.remove(best_feat)
+        best_cidx = best_feat_cidx
+        if verbose:
+            print(f"[FS] add: {best_feat} -> val c-index={best_cidx:.4f}")
+
+    return selected
+
+
 def sex_specific_inference(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -619,16 +695,40 @@ def sex_specific_full_inference(
     thresholds = {}
 
     if not data_m.empty:
-        cph_m = fit_cox_model(data_m, used_features, "PE_Time", "VT/VF/SCD")
-        r_m = predict_risk(cph_m, data_m, used_features)
+        used_features_m = list(used_features)
+        # Feature selection only if this is the Proposed set
+        try:
+            if set(features) == set(FEATURE_SETS.get("Proposed", [])):
+                selected_m = select_features_max_cindex_forward(
+                    data_m, list(used_features), "PE_Time", "VT/VF/SCD", random_state=42
+                )
+                if selected_m:
+                    used_features_m = selected_m
+                    print(f"[FS] Sex-specific full-data (male): selected {len(selected_m)} features for Proposed: {selected_m}")
+        except Exception:
+            pass
+        cph_m = fit_cox_model(data_m, used_features_m, "PE_Time", "VT/VF/SCD")
+        r_m = predict_risk(cph_m, data_m, used_features_m)
         thresholds["male"] = float(np.nanmedian(r_m))
         models["male"] = cph_m
         plot_cox_coefficients(
             cph_m, "Male Cox Coefficients (log HR)", gray_features, red_features
         )
     if not data_f.empty:
-        cph_f = fit_cox_model(data_f, used_features, "PE_Time", "VT/VF/SCD")
-        r_f = predict_risk(cph_f, data_f, used_features)
+        used_features_f = list(used_features)
+        # Feature selection only if this is the Proposed set
+        try:
+            if set(features) == set(FEATURE_SETS.get("Proposed", [])):
+                selected_f = select_features_max_cindex_forward(
+                    data_f, list(used_features), "PE_Time", "VT/VF/SCD", random_state=42
+                )
+                if selected_f:
+                    used_features_f = selected_f
+                    print(f"[FS] Sex-specific full-data (female): selected {len(selected_f)} features for Proposed: {selected_f}")
+        except Exception:
+            pass
+        cph_f = fit_cox_model(data_f, used_features_f, "PE_Time", "VT/VF/SCD")
+        r_f = predict_risk(cph_f, data_f, used_features_f)
         thresholds["female"] = float(np.nanmedian(r_f))
         models["female"] = cph_f
         plot_cox_coefficients(
@@ -638,14 +738,15 @@ def sex_specific_full_inference(
     out = df.copy()
     if "male" in models and not out[out["Female"] == 0].empty:
         te_m = out[out["Female"] == 0]
-        risk_m = predict_risk(models["male"], te_m, used_features)
+        # If selection happened, the model params capture the selected set, so we just pass any list
+        risk_m = predict_risk(models["male"], te_m, list(models["male"].params_.index))
         out.loc[out["Female"] == 0, "pred_prob"] = risk_m
         out.loc[out["Female"] == 0, "pred_label"] = (
             risk_m >= thresholds["male"]
         ).astype(int)
     if "female" in models and not out[out["Female"] == 1].empty:
         te_f = out[out["Female"] == 1]
-        risk_f = predict_risk(models["female"], te_f, used_features)
+        risk_f = predict_risk(models["female"], te_f, list(models["female"].params_.index))
         out.loc[out["Female"] == 1, "pred_prob"] = risk_f
         out.loc[out["Female"] == 1, "pred_label"] = (
             risk_f >= thresholds["female"]
@@ -720,10 +821,21 @@ def sex_agnostic_full_inference(
     - Includes Female in features
     - Dichotomizes risk by overall median
     """
-    used_features = features
     df_base = (
         create_undersampled_dataset(df, label_col, 42) if use_undersampling else df
     )
+    used_features = features
+    # If features correspond to Proposed, perform feature selection to maximize c-index
+    try:
+        if set(features) == set(FEATURE_SETS.get("Proposed", [])):
+            selected = select_features_max_cindex_forward(
+                df_base, list(features), "PE_Time", label_col, random_state=42
+            )
+            if selected:
+                used_features = selected
+                print(f"[FS] Sex-agnostic full-data: selected {len(selected)} features for Proposed: {selected}")
+    except Exception:
+        pass
     data = df_base.dropna(subset=["PE_Time", label_col]).copy()
     if data.empty:
         return pd.DataFrame()
@@ -776,6 +888,17 @@ def evaluate_split(
             if use_undersampling
             else train_df
         )
+        # Feature selection only for Proposed set
+        try:
+            if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
+                selected = select_features_max_cindex_forward(
+                    tr, list(feature_cols), time_col, event_col, random_state=seed
+                )
+                if selected:
+                    used_features = selected
+                    print(f"[FS] Sex-agnostic: selected {len(selected)} features for Proposed: {selected}")
+        except Exception:
+            pass
         cph = fit_cox_model(tr, used_features, time_col, event_col)
         risk_scores = predict_risk(cph, test_df, used_features)
         thr = threshold_by_top_quantile(risk_scores, 0.5)
@@ -838,8 +961,20 @@ def evaluate_split(
         pred = np.zeros(len(test_df), dtype=int)
         risk_scores = np.zeros(len(test_df))
         if not tr_m.empty and not te_m.empty:
-            cph_m = fit_cox_model(tr_m, used_features, time_col, event_col)
-            risk_m = predict_risk(cph_m, te_m, used_features)
+            used_features_m = used_features
+            # Feature selection for Proposed per sex (male)
+            try:
+                if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
+                    selected_m = select_features_max_cindex_forward(
+                        tr_m, list(used_features), time_col, event_col, random_state=seed
+                    )
+                    if selected_m:
+                        used_features_m = selected_m
+                        print(f"[FS] Sex-specific (male): selected {len(selected_m)} features for Proposed: {selected_m}")
+            except Exception:
+                pass
+            cph_m = fit_cox_model(tr_m, used_features_m, time_col, event_col)
+            risk_m = predict_risk(cph_m, te_m, used_features_m)
             thr_m = threshold_by_top_quantile(risk_m, 0.5)
             pred_m = (risk_m >= thr_m).astype(int)
             mask_m = test_df["Female"].values == 0
@@ -849,8 +984,20 @@ def evaluate_split(
         tr_f = train_df[train_df["Female"] == 1]
         te_f = test_df[test_df["Female"] == 1]
         if not tr_f.empty and not te_f.empty:
-            cph_f = fit_cox_model(tr_f, used_features, time_col, event_col)
-            risk_f = predict_risk(cph_f, te_f, used_features)
+            used_features_f = used_features
+            # Feature selection for Proposed per sex (female)
+            try:
+                if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
+                    selected_f = select_features_max_cindex_forward(
+                        tr_f, list(used_features), time_col, event_col, random_state=seed
+                    )
+                    if selected_f:
+                        used_features_f = selected_f
+                        print(f"[FS] Sex-specific (female): selected {len(selected_f)} features for Proposed: {selected_f}")
+            except Exception:
+                pass
+            cph_f = fit_cox_model(tr_f, used_features_f, time_col, event_col)
+            risk_f = predict_risk(cph_f, te_f, used_features_f)
             thr_f = threshold_by_top_quantile(risk_f, 0.5)
             pred_f = (risk_f >= thr_f).astype(int)
             mask_f = test_df["Female"].values == 1
