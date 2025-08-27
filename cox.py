@@ -608,6 +608,94 @@ def select_features_max_cindex_forward(
     return selected
 
 
+def stability_select_features(
+    df: pd.DataFrame,
+    candidate_features: List[str],
+    time_col: str,
+    event_col: str,
+    seeds: List[int],
+    max_features: int = None,
+    threshold: float = 0.5,
+    min_features: int = 8,
+    verbose: bool = False,
+) -> List[str]:
+    """Run forward selection across multiple seeds and keep features that
+    are repeatedly selected (frequency >= threshold).
+
+    This stabilizes the feature set so downstream multi-split averages are
+    computed for a consistent model specification.
+    """
+    if df is None or df.empty:
+        return []
+
+    # Initial sanitized pool
+    try:
+        _, pool = _sanitize_cox_features_matrix(
+            df, candidate_features, corr_threshold=0.995, verbose=False
+        )
+    except Exception:
+        pool = [f for f in candidate_features if f in df.columns]
+
+    if len(pool) == 0:
+        return []
+
+    from collections import Counter
+
+    counter: Counter = Counter()
+    total_runs = 0
+    for s in seeds:
+        try:
+            sel = select_features_max_cindex_forward(
+                train_df=df,
+                candidate_features=list(pool),
+                time_col=time_col,
+                event_col=event_col,
+                random_state=s,
+                max_features=max_features,
+                verbose=False,
+            )
+            if sel:
+                counter.update(sel)
+            total_runs += 1
+        except Exception:
+            continue
+
+    if total_runs == 0 or not counter:
+        return list(pool)
+
+    # Keep features meeting frequency threshold
+    ranked = list(counter.most_common())
+    kept: List[str] = []
+    for feat, count in ranked:
+        freq = count / total_runs
+        if freq >= threshold:
+            kept.append(feat)
+
+    # Ensure a minimum number of features by backfilling with next most frequent
+    if min_features is not None and min_features > 0:
+        i = 0
+        while len(kept) < min_features and i < len(ranked):
+            feat_i = ranked[i][0]
+            if feat_i not in kept:
+                kept.append(feat_i)
+            i += 1
+
+    if verbose:
+        try:
+            print(
+                f"[FS][Stability] kept {len(kept)} features (threshold={threshold}, min_features={min_features}) out of pool {len(pool)}"
+            )
+        except Exception:
+            pass
+
+    # Final sanitization to avoid collinearity
+    if kept:
+        X_final, kept_final = _sanitize_cox_features_matrix(
+            df, kept, corr_threshold=0.995, verbose=False
+        )
+        return list(kept_final)
+    return []
+
 def sex_specific_inference(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -874,6 +962,8 @@ def evaluate_split(
     mode: str,
     seed: int,
     use_undersampling: bool = False,
+    disable_within_split_feature_selection: bool = False,
+    sex_specific_feature_override: Dict[str, List[str]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
     """Train CoxPH and return (pred_label, risk_scores, metrics dict).
 
@@ -889,16 +979,17 @@ def evaluate_split(
             else train_df
         )
         # Feature selection only for Proposed set
-        try:
-            if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
-                selected = select_features_max_cindex_forward(
-                    tr, list(feature_cols), time_col, event_col, random_state=seed
-                )
-                if selected:
-                    used_features = selected
-                    print(f"[FS] Sex-agnostic: selected {len(selected)} features for Proposed: {selected}")
-        except Exception:
-            pass
+        if not disable_within_split_feature_selection:
+            try:
+                if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
+                    selected = select_features_max_cindex_forward(
+                        tr, list(feature_cols), time_col, event_col, random_state=seed
+                    )
+                    if selected:
+                        used_features = selected
+                        print(f"[FS] Sex-agnostic: selected {len(selected)} features for Proposed: {selected}")
+            except Exception:
+                pass
         cph = fit_cox_model(tr, used_features, time_col, event_col)
         risk_scores = predict_risk(cph, test_df, used_features)
         thr = threshold_by_top_quantile(risk_scores, 0.5)
@@ -961,18 +1052,23 @@ def evaluate_split(
         pred = np.zeros(len(test_df), dtype=int)
         risk_scores = np.zeros(len(test_df))
         if not tr_m.empty and not te_m.empty:
-            used_features_m = used_features
-            # Feature selection for Proposed per sex (male)
-            try:
-                if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
-                    selected_m = select_features_max_cindex_forward(
-                        tr_m, list(used_features), time_col, event_col, random_state=seed
-                    )
-                    if selected_m:
-                        used_features_m = selected_m
-                        print(f"[FS] Sex-specific (male): selected {len(selected_m)} features for Proposed: {selected_m}")
-            except Exception:
-                pass
+            # If override is provided, use it; otherwise optionally select per split
+            if sex_specific_feature_override and "male" in sex_specific_feature_override:
+                used_features_m = [f for f in sex_specific_feature_override["male"] if f != "Female"]
+            else:
+                used_features_m = used_features
+                if not disable_within_split_feature_selection:
+                    # Feature selection for Proposed per sex (male)
+                    try:
+                        if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
+                            selected_m = select_features_max_cindex_forward(
+                                tr_m, list(used_features), time_col, event_col, random_state=seed
+                            )
+                            if selected_m:
+                                used_features_m = selected_m
+                                print(f"[FS] Sex-specific (male): selected {len(selected_m)} features for Proposed: {selected_m}")
+                    except Exception:
+                        pass
             cph_m = fit_cox_model(tr_m, used_features_m, time_col, event_col)
             risk_m = predict_risk(cph_m, te_m, used_features_m)
             thr_m = threshold_by_top_quantile(risk_m, 0.5)
@@ -984,18 +1080,22 @@ def evaluate_split(
         tr_f = train_df[train_df["Female"] == 1]
         te_f = test_df[test_df["Female"] == 1]
         if not tr_f.empty and not te_f.empty:
-            used_features_f = used_features
-            # Feature selection for Proposed per sex (female)
-            try:
-                if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
-                    selected_f = select_features_max_cindex_forward(
-                        tr_f, list(used_features), time_col, event_col, random_state=seed
-                    )
-                    if selected_f:
-                        used_features_f = selected_f
-                        print(f"[FS] Sex-specific (female): selected {len(selected_f)} features for Proposed: {selected_f}")
-            except Exception:
-                pass
+            if sex_specific_feature_override and "female" in sex_specific_feature_override:
+                used_features_f = [f for f in sex_specific_feature_override["female"] if f != "Female"]
+            else:
+                used_features_f = used_features
+                if not disable_within_split_feature_selection:
+                    # Feature selection for Proposed per sex (female)
+                    try:
+                        if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
+                            selected_f = select_features_max_cindex_forward(
+                                tr_f, list(used_features), time_col, event_col, random_state=seed
+                            )
+                            if selected_f:
+                                used_features_f = selected_f
+                                print(f"[FS] Sex-specific (female): selected {len(selected_f)} features for Proposed: {selected_f}")
+                    except Exception:
+                        pass
             cph_f = fit_cox_model(tr_f, used_features_f, time_col, event_col)
             risk_f = predict_risk(cph_f, te_f, used_features_f)
             thr_f = threshold_by_top_quantile(risk_f, 0.5)
@@ -1227,6 +1327,72 @@ def run_cox_experiments(
         for cfg in model_configs:
             results[f"{featset_name} - {cfg['name']}"] = {m: [] for m in metrics}
 
+    # Precompute stable feature sets to ensure consistent specification across splits
+    seeds_for_stability = list(range(min(N, 50)))
+    stable_agnostic_features: Dict[str, List[str]] = {}
+    stable_sex_specific_features: Dict[str, Dict[str, List[str]]] = {}
+
+    for featset_name, feature_cols in feature_sets.items():
+        # Default to original sets when no selection logic is intended
+        stable_agnostic_features[featset_name] = list(feature_cols)
+        stable_sex_specific_features[featset_name] = {
+            "male": [f for f in feature_cols if f != "Female"],
+            "female": [f for f in feature_cols if f != "Female"],
+        }
+
+        # Only Proposed set uses selection; stabilize it once globally
+        try:
+            if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
+                # Sex-agnostic stabilization
+                sel_agn = stability_select_features(
+                    df.dropna(subset=[time_col, event_col]).copy(),
+                    candidate_features=list(feature_cols),
+                    time_col=time_col,
+                    event_col=event_col,
+                    seeds=seeds_for_stability,
+                    max_features=None,
+                    threshold=0.4,
+                    min_features=10,
+                    verbose=True,
+                )
+                if sel_agn:
+                    stable_agnostic_features[featset_name] = sel_agn
+
+                # Sex-specific stabilization per sex
+                df_m = df[df["Female"] == 0].dropna(subset=[time_col, event_col]).copy()
+                df_f = df[df["Female"] == 1].dropna(subset=[time_col, event_col]).copy()
+                base_feats = [f for f in feature_cols if f != "Female"]
+
+                sel_m = stability_select_features(
+                    df=df_m,
+                    candidate_features=list(base_feats),
+                    time_col=time_col,
+                    event_col=event_col,
+                    seeds=seeds_for_stability,
+                    max_features=None,
+                    threshold=0.4,
+                    min_features=10,
+                    verbose=True,
+                ) if not df_m.empty else []
+                sel_f = stability_select_features(
+                    df=df_f,
+                    candidate_features=list(base_feats),
+                    time_col=time_col,
+                    event_col=event_col,
+                    seeds=seeds_for_stability,
+                    max_features=None,
+                    threshold=0.4,
+                    min_features=10,
+                    verbose=True,
+                ) if not df_f.empty else []
+
+                if sel_m:
+                    stable_sex_specific_features[featset_name]["male"] = sel_m
+                if sel_f:
+                    stable_sex_specific_features[featset_name]["female"] = sel_f
+        except Exception:
+            pass
+
     for seed in range(N):
         print(seed)
         tr, te = train_test_split(
@@ -1239,16 +1405,36 @@ def run_cox_experiments(
             for cfg in model_configs:
                 name = f"{featset_name} - {cfg['name']}"
                 use_undersampling = cfg["mode"] == "sex_agnostic"
-                pred, risk, met = evaluate_split(
-                    tr,
-                    te,
-                    feature_cols,
-                    time_col,
-                    event_col,
-                    mode=cfg["mode"],
-                    seed=seed,
-                    use_undersampling=use_undersampling,
-                )
+                # Use stabilized features and disable per-split selection
+                if cfg["mode"] == "sex_agnostic":
+                    frozen_feats = stable_agnostic_features.get(featset_name, feature_cols)
+                    if not frozen_feats:
+                        frozen_feats = feature_cols
+                    pred, risk, met = evaluate_split(
+                        tr,
+                        te,
+                        frozen_feats,
+                        time_col,
+                        event_col,
+                        mode=cfg["mode"],
+                        seed=seed,
+                        use_undersampling=use_undersampling,
+                        disable_within_split_feature_selection=True,
+                    )
+                else:
+                    overrides = stable_sex_specific_features.get(featset_name, None)
+                    pred, risk, met = evaluate_split(
+                        tr,
+                        te,
+                        feature_cols,
+                        time_col,
+                        event_col,
+                        mode=cfg["mode"],
+                        seed=seed,
+                        use_undersampling=use_undersampling,
+                        disable_within_split_feature_selection=True,
+                        sex_specific_feature_override=overrides,
+                    )
                 # overall, male, female C-index based on risk
                 cidx_all = met.get("c_index", np.nan)
                 try:
