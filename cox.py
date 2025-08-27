@@ -616,6 +616,7 @@ def stability_select_features(
     seeds: List[int],
     max_features: int = None,
     threshold: float = 0.5,
+    min_features: int = 8,
     verbose: bool = False,
 ) -> List[str]:
     """Run forward selection across multiple seeds and keep features that
@@ -663,16 +664,26 @@ def stability_select_features(
         return list(pool)
 
     # Keep features meeting frequency threshold
+    ranked = list(counter.most_common())
     kept: List[str] = []
-    for feat, count in counter.most_common():
+    for feat, count in ranked:
         freq = count / total_runs
         if freq >= threshold:
             kept.append(feat)
 
+    # Ensure a minimum number of features by backfilling with next most frequent
+    if min_features is not None and min_features > 0:
+        i = 0
+        while len(kept) < min_features and i < len(ranked):
+            feat_i = ranked[i][0]
+            if feat_i not in kept:
+                kept.append(feat_i)
+            i += 1
+
     if verbose:
         try:
             print(
-                f"[FS][Stability] kept {len(kept)} features (threshold={threshold}) out of pool {len(pool)}"
+                f"[FS][Stability] kept {len(kept)} features (threshold={threshold}, min_features={min_features}) out of pool {len(pool)}"
             )
         except Exception:
             pass
@@ -1340,7 +1351,8 @@ def run_cox_experiments(
                     event_col=event_col,
                     seeds=seeds_for_stability,
                     max_features=None,
-                    threshold=0.5,
+                    threshold=0.4,
+                    min_features=10,
                     verbose=True,
                 )
                 if sel_agn:
@@ -1358,7 +1370,8 @@ def run_cox_experiments(
                     event_col=event_col,
                     seeds=seeds_for_stability,
                     max_features=None,
-                    threshold=0.5,
+                    threshold=0.4,
+                    min_features=10,
                     verbose=True,
                 ) if not df_m.empty else []
                 sel_f = stability_select_features(
@@ -1368,7 +1381,8 @@ def run_cox_experiments(
                     event_col=event_col,
                     seeds=seeds_for_stability,
                     max_features=None,
-                    threshold=0.5,
+                    threshold=0.4,
+                    min_features=10,
                     verbose=True,
                 ) if not df_f.empty else []
 
