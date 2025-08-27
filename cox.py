@@ -78,8 +78,56 @@ def plot_cox_coefficients(
     title: str,
     gray_features: List[str] = None,
     red_features: List[str] = None,
+    reference_df: pd.DataFrame = None,
+    effect_scale: str = "raw",  # one of {"raw", "per_sd", "per_iqr"}
 ) -> None:
-    coef_series = model.params_.sort_values(ascending=False)
+    """Plot Cox coefficients with optional standardized scaling.
+
+    effect_scale controls comparability between binary and continuous features:
+      - "raw": plot raw log HR (model coefficients)
+      - "per_sd": plot log HR per one standard deviation (binary kept as 1 vs 0)
+      - "per_iqr": plot log HR per IQR (Q75-Q25) (binary kept as 1 vs 0)
+    """
+    base_coefs = model.params_.copy()
+
+    # Compute scaling factors per feature if requested
+    scales: Dict[str, float] = {}
+    if effect_scale in ("per_sd", "per_iqr") and reference_df is not None:
+        for col in base_coefs.index.tolist():
+            if col not in reference_df.columns:
+                scales[col] = 1.0
+                continue
+            series = pd.to_numeric(reference_df[col], errors="coerce")
+            # Detect binary {0,1}
+            vals = series.dropna().unique()
+            try:
+                is_binary = len(vals) <= 2 and set(np.unique(vals)).issubset({0, 1})
+            except Exception:
+                is_binary = False
+            if is_binary:
+                scales[col] = 1.0  # interpret as 1 vs 0
+            else:
+                if effect_scale == "per_sd":
+                    s = float(np.nanstd(series.values, ddof=1))
+                    scales[col] = 1.0 if not np.isfinite(s) or s == 0.0 else s
+                else:  # per_iqr
+                    try:
+                        q75 = float(np.nanpercentile(series.values, 75))
+                        q25 = float(np.nanpercentile(series.values, 25))
+                        iqr = q75 - q25
+                    except Exception:
+                        iqr = np.nan
+                    scales[col] = 1.0 if not np.isfinite(iqr) or iqr == 0.0 else float(iqr)
+    else:
+        scales = {f: 1.0 for f in base_coefs.index.tolist()}
+
+    # Apply scaling to coefficients (log HR per unit/SD/IQR)
+    scaled_values = []
+    order = []
+    for f in base_coefs.index.tolist():
+        order.append(f)
+        scaled_values.append(float(base_coefs.loc[f]) * float(scales.get(f, 1.0)))
+    coef_series = pd.Series(data=scaled_values, index=order).sort_values(ascending=False)
     feats = coef_series.index.tolist()
 
     # Build category sets from FEATURE_SETS
@@ -104,10 +152,19 @@ def plot_cox_coefficients(
             colors.append("orange")
         else:
             colors.append("blue")
+
+    # Choose ylabel according to effect_scale
+    if effect_scale == "per_sd":
+        ylabel = "Cox coefficient (log HR per SD)"
+    elif effect_scale == "per_iqr":
+        ylabel = "Cox coefficient (log HR per IQR)"
+    else:
+        ylabel = "Cox coefficient (log HR)"
+
     plt.figure(figsize=(9, 4))
     plt.bar(range(len(feats)), coef_series.values, color=colors)
     plt.xticks(range(len(feats)), feats, rotation=90)
-    plt.ylabel("Cox coefficient (log HR)")
+    plt.ylabel(ylabel)
     plt.title(title)
     plt.tight_layout()
     plt.show()
@@ -745,7 +802,12 @@ def sex_specific_inference(
         thresholds["male"] = float(np.nanmedian(tr_risk_m))
         models["male"] = cph_m
         plot_cox_coefficients(
-            cph_m, "Male Cox Coefficients (log HR)", gray_features, red_features
+            cph_m,
+            "Male Cox Coefficients (log HR)",
+            gray_features,
+            red_features,
+            reference_df=train_m,
+            effect_scale="per_sd",
         )
     if not train_f.empty:
         cph_f = fit_cox_model(train_f, used_features, "PE_Time", "VT/VF/SCD")
@@ -753,7 +815,12 @@ def sex_specific_inference(
         thresholds["female"] = float(np.nanmedian(tr_risk_f))
         models["female"] = cph_f
         plot_cox_coefficients(
-            cph_f, "Female Cox Coefficients (log HR)", gray_features, red_features
+            cph_f,
+            "Female Cox Coefficients (log HR)",
+            gray_features,
+            red_features,
+            reference_df=train_f,
+            effect_scale="per_sd",
         )
 
     df_out = test_df.copy()
@@ -825,7 +892,12 @@ def sex_specific_full_inference(
         thresholds["male"] = float(np.nanmedian(r_m))
         models["male"] = cph_m
         plot_cox_coefficients(
-            cph_m, "Male Cox Coefficients (log HR)", gray_features, red_features
+            cph_m,
+            "Male Cox Coefficients (log HR)",
+            gray_features,
+            red_features,
+            reference_df=data_m,
+            effect_scale="per_sd",
         )
     if not data_f.empty:
         used_features_f = list(used_features)
@@ -852,7 +924,12 @@ def sex_specific_full_inference(
         thresholds["female"] = float(np.nanmedian(r_f))
         models["female"] = cph_f
         plot_cox_coefficients(
-            cph_f, "Female Cox Coefficients (log HR)", gray_features, red_features
+            cph_f,
+            "Female Cox Coefficients (log HR)",
+            gray_features,
+            red_features,
+            reference_df=data_f,
+            effect_scale="per_sd",
         )
 
     out = df.copy()
@@ -907,7 +984,12 @@ def sex_agnostic_inference(
 
     cph = fit_cox_model(tr, used_features, "PE_Time", label_col)
     plot_cox_coefficients(
-        cph, "Sex-Agnostic Cox Coefficients (log HR)", gray_features, red_features
+        cph,
+        "Sex-Agnostic Cox Coefficients (log HR)",
+        gray_features,
+        red_features,
+        reference_df=tr,
+        effect_scale="per_sd",
     )
     tr_risk = predict_risk(cph, tr, used_features)
     thr = float(np.nanmedian(tr_risk))
@@ -967,7 +1049,12 @@ def sex_agnostic_full_inference(
 
     cph = fit_cox_model(data, used_features, "PE_Time", label_col)
     plot_cox_coefficients(
-        cph, "Sex-Agnostic Cox Coefficients (log HR)", gray_features, red_features
+        cph,
+        "Sex-Agnostic Cox Coefficients (log HR)",
+        gray_features,
+        red_features,
+        reference_df=data,
+        effect_scale="per_sd",
     )
     risk_all = predict_risk(cph, data, used_features)
     thr = float(np.nanmedian(risk_all))
