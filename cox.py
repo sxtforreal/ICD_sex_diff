@@ -3,7 +3,18 @@ import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
+
+# ==========================================
+# Global store for Proposed selected features
+# ==========================================
+SELECTED_FEATURES_STORE: Dict[str, Any] = {
+    "proposed_sex_agnostic": None,  # type: List[str] | None
+    "proposed_sex_specific": {      # type: Dict[str, List[str]] | None
+        "male": None,
+        "female": None,
+    },
+}
 
 from lifelines import CoxPHFitter, KaplanMeierFitter
 from lifelines.statistics import logrank_test
@@ -582,9 +593,14 @@ def select_features_max_cindex_forward(
     # Limit the number of selected features if requested
     max_iters = len(remaining) if max_features is None else max(0, min(len(remaining), max_features))
 
-    for _ in range(max_iters):
+    for step_idx in range(max_iters):
         best_feat = None
         best_feat_cidx = best_cidx
+        if verbose:
+            try:
+                print(f"[FS][Forward] seed={random_state} step={step_idx+1}/{max_iters} remaining={len(remaining)}")
+            except Exception:
+                pass
         for feat in remaining:
             trial_feats = selected + [feat]
             try:
@@ -603,7 +619,10 @@ def select_features_max_cindex_forward(
         remaining.remove(best_feat)
         best_cidx = best_feat_cidx
         if verbose:
-            print(f"[FS] add: {best_feat} -> val c-index={best_cidx:.4f}")
+            try:
+                print(f"[FS][Forward] + {best_feat} -> val c-index={best_cidx:.4f}")
+            except Exception:
+                pass
 
     return selected
 
@@ -616,7 +635,7 @@ def stability_select_features(
     seeds: List[int],
     max_features: int = None,
     threshold: float = 0.5,
-    min_features: int = 8,
+    min_features: int = None,
     verbose: bool = False,
 ) -> List[str]:
     """Run forward selection across multiple seeds and keep features that
@@ -643,8 +662,14 @@ def stability_select_features(
 
     counter: Counter = Counter()
     total_runs = 0
-    for s in seeds:
+    total_seeds = len(seeds)
+    for idx, s in enumerate(seeds, start=1):
         try:
+            if verbose:
+                try:
+                    print(f"[FS][Stability] seed {idx}/{total_seeds} -> start")
+                except Exception:
+                    pass
             sel = select_features_max_cindex_forward(
                 train_df=df,
                 candidate_features=list(pool),
@@ -652,7 +677,7 @@ def stability_select_features(
                 event_col=event_col,
                 random_state=s,
                 max_features=max_features,
-                verbose=False,
+                verbose=verbose,
             )
             if sel:
                 counter.update(sel)
@@ -671,19 +696,12 @@ def stability_select_features(
         if freq >= threshold:
             kept.append(feat)
 
-    # Ensure a minimum number of features by backfilling with next most frequent
-    if min_features is not None and min_features > 0:
-        i = 0
-        while len(kept) < min_features and i < len(ranked):
-            feat_i = ranked[i][0]
-            if feat_i not in kept:
-                kept.append(feat_i)
-            i += 1
+    # No minimum backfilling when min_features is None (allow any size)
 
     if verbose:
         try:
             print(
-                f"[FS][Stability] kept {len(kept)} features (threshold={threshold}, min_features={min_features}) out of pool {len(pool)}"
+                f"[FS][Stability] kept {len(kept)} features (threshold={threshold}) out of pool {len(pool)}"
             )
         except Exception:
             pass
@@ -787,12 +805,19 @@ def sex_specific_full_inference(
         # Feature selection only if this is the Proposed set
         try:
             if set(features) == set(FEATURE_SETS.get("Proposed", [])):
-                selected_m = select_features_max_cindex_forward(
-                    data_m, list(used_features), "PE_Time", "VT/VF/SCD", random_state=42
-                )
+                selected_m = SELECTED_FEATURES_STORE.get("proposed_sex_specific", {}).get("male")
+                if not selected_m:
+                    selected_m = select_features_max_cindex_forward(
+                        data_m, list(used_features), "PE_Time", "VT/VF/SCD", random_state=42, verbose=True
+                    )
+                    if selected_m:
+                        try:
+                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["male"] = list(selected_m)
+                            print(f"[FS][Store] Proposed male-specific features stored: {len(selected_m)}")
+                        except Exception:
+                            pass
                 if selected_m:
-                    used_features_m = selected_m
-                    print(f"[FS] Sex-specific full-data (male): selected {len(selected_m)} features for Proposed: {selected_m}")
+                    used_features_m = list(selected_m)
         except Exception:
             pass
         cph_m = fit_cox_model(data_m, used_features_m, "PE_Time", "VT/VF/SCD")
@@ -807,12 +832,19 @@ def sex_specific_full_inference(
         # Feature selection only if this is the Proposed set
         try:
             if set(features) == set(FEATURE_SETS.get("Proposed", [])):
-                selected_f = select_features_max_cindex_forward(
-                    data_f, list(used_features), "PE_Time", "VT/VF/SCD", random_state=42
-                )
+                selected_f = SELECTED_FEATURES_STORE.get("proposed_sex_specific", {}).get("female")
+                if not selected_f:
+                    selected_f = select_features_max_cindex_forward(
+                        data_f, list(used_features), "PE_Time", "VT/VF/SCD", random_state=42, verbose=True
+                    )
+                    if selected_f:
+                        try:
+                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["female"] = list(selected_f)
+                            print(f"[FS][Store] Proposed female-specific features stored: {len(selected_f)}")
+                        except Exception:
+                            pass
                 if selected_f:
-                    used_features_f = selected_f
-                    print(f"[FS] Sex-specific full-data (female): selected {len(selected_f)} features for Proposed: {selected_f}")
+                    used_features_f = list(selected_f)
         except Exception:
             pass
         cph_f = fit_cox_model(data_f, used_features_f, "PE_Time", "VT/VF/SCD")
@@ -916,12 +948,17 @@ def sex_agnostic_full_inference(
     # If features correspond to Proposed, perform feature selection to maximize c-index
     try:
         if set(features) == set(FEATURE_SETS.get("Proposed", [])):
-            selected = select_features_max_cindex_forward(
-                df_base, list(features), "PE_Time", label_col, random_state=42
-            )
+            # Reuse from store if available; otherwise select once and store
+            selected = SELECTED_FEATURES_STORE.get("proposed_sex_agnostic")
+            if not selected:
+                selected = select_features_max_cindex_forward(
+                    df_base, list(features), "PE_Time", label_col, random_state=42, verbose=True
+                )
+                if selected:
+                    SELECTED_FEATURES_STORE["proposed_sex_agnostic"] = list(selected)
+                    print(f"[FS][Store] Proposed sex-agnostic features stored: {len(selected)}")
             if selected:
-                used_features = selected
-                print(f"[FS] Sex-agnostic full-data: selected {len(selected)} features for Proposed: {selected}")
+                used_features = list(selected)
     except Exception:
         pass
     data = df_base.dropna(subset=["PE_Time", label_col]).copy()
@@ -1352,11 +1389,17 @@ def run_cox_experiments(
                     seeds=seeds_for_stability,
                     max_features=None,
                     threshold=0.4,
-                    min_features=10,
+                    min_features=None,
                     verbose=True,
                 )
                 if sel_agn:
                     stable_agnostic_features[featset_name] = sel_agn
+                    try:
+                        if featset_name == "Proposed":
+                            SELECTED_FEATURES_STORE["proposed_sex_agnostic"] = list(sel_agn)
+                            print(f"[FS][Store] Proposed sex-agnostic features: {len(sel_agn)} selected")
+                    except Exception:
+                        pass
 
                 # Sex-specific stabilization per sex
                 df_m = df[df["Female"] == 0].dropna(subset=[time_col, event_col]).copy()
@@ -1371,7 +1414,7 @@ def run_cox_experiments(
                     seeds=seeds_for_stability,
                     max_features=None,
                     threshold=0.4,
-                    min_features=10,
+                    min_features=None,
                     verbose=True,
                 ) if not df_m.empty else []
                 sel_f = stability_select_features(
@@ -1382,14 +1425,26 @@ def run_cox_experiments(
                     seeds=seeds_for_stability,
                     max_features=None,
                     threshold=0.4,
-                    min_features=10,
+                    min_features=None,
                     verbose=True,
                 ) if not df_f.empty else []
 
                 if sel_m:
                     stable_sex_specific_features[featset_name]["male"] = sel_m
+                    try:
+                        if featset_name == "Proposed":
+                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["male"] = list(sel_m)
+                            print(f"[FS][Store] Proposed male-specific features: {len(sel_m)} selected")
+                    except Exception:
+                        pass
                 if sel_f:
                     stable_sex_specific_features[featset_name]["female"] = sel_f
+                    try:
+                        if featset_name == "Proposed":
+                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["female"] = list(sel_f)
+                            print(f"[FS][Store] Proposed female-specific features: {len(sel_f)} selected")
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -1410,6 +1465,11 @@ def run_cox_experiments(
                     frozen_feats = stable_agnostic_features.get(featset_name, feature_cols)
                     if not frozen_feats:
                         frozen_feats = feature_cols
+                    # Ensure Proposed uses the stored selection if available
+                    if featset_name == "Proposed":
+                        stored = SELECTED_FEATURES_STORE.get("proposed_sex_agnostic")
+                        if stored:
+                            frozen_feats = list(stored)
                     pred, risk, met = evaluate_split(
                         tr,
                         te,
@@ -1423,6 +1483,19 @@ def run_cox_experiments(
                     )
                 else:
                     overrides = stable_sex_specific_features.get(featset_name, None)
+                    # Ensure Proposed uses the stored sex-specific selections if available
+                    if featset_name == "Proposed":
+                        try:
+                            stored_m = SELECTED_FEATURES_STORE.get("proposed_sex_specific", {}).get("male")
+                            stored_f = SELECTED_FEATURES_STORE.get("proposed_sex_specific", {}).get("female")
+                            if overrides is None:
+                                overrides = {}
+                            if stored_m:
+                                overrides["male"] = list(stored_m)
+                            if stored_f:
+                                overrides["female"] = list(stored_f)
+                        except Exception:
+                            pass
                     pred, risk, met = evaluate_split(
                         tr,
                         te,
