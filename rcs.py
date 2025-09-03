@@ -1,9 +1,3 @@
-# === rcs_cox_sex_thresholds.py ===
-# 功能：
-# 1) Cox + RCS 拟合 LGE->VT/VF 非线性 + 性别交互（可选协变量）
-# 2) 绘制男女 HR–LGE 曲线（含95%CI）
-# 3) 给出两种性别特异的“阈值”候选：曲线法 & 三分法（AIC最佳）
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -16,8 +10,6 @@ from cox import load_dataframes
 # ---------------------- 数据准备 ----------------------
 def prepare_df_for_model(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
-    # 1) NYHA Class -> 标准 1–4，0->1，5->4；转 float64
     if "NYHA Class" in df.columns:
         nyha = df["NYHA Class"].astype("string").str.strip().str.upper()
         MAP = {
@@ -32,12 +24,10 @@ def prepare_df_for_model(df: pd.DataFrame) -> pd.DataFrame:
             "4": 4,
             "5": 4,
         }
-        df["NYHA Class"] = nyha.map(MAP)
-        df["NYHA Class"] = pd.to_numeric(df["NYHA Class"], errors="coerce").astype(
+        df["NYHA Class"] = pd.to_numeric(nyha.map(MAP), errors="coerce").astype(
             "float64"
         )
-
-    # 2) 可空扩展数值列统一为 float64（消灭 pd.NA）
+    # 可空整型/布尔转 float64
     nullable_mask = df.dtypes.astype(str).str.contains(
         r"^(Int64|Float64|boolean)$", case=False
     )
@@ -46,35 +36,56 @@ def prepare_df_for_model(df: pd.DataFrame) -> pd.DataFrame:
         df[nullable_cols] = df[nullable_cols].apply(
             lambda s: pd.to_numeric(s, errors="coerce").astype("float64")
         )
-
     return df
 
 
-# ---------------------- 基础构件 ----------------------
-def build_rcs_basis(x, df=4, knots=None):
+# ---------------------- RCS 相关 ----------------------
+def build_rcs_basis(x, df=4, knots=None, lower_bound=None, upper_bound=None):
+    """自然样条 (Restricted Cubic Spline)，带边界。"""
+    x = np.asarray(x, dtype=float)
     if knots is not None:
         knots = np.sort(np.array(knots, dtype=float))
         dm = dmatrix(
-            "cr(x, knots=knots, constraints='center') - 1",
-            {"x": np.asarray(x, dtype=float), "knots": knots},
+            "cr(x, knots=knots, lower_bound=lb, upper_bound=ub) - 1",
+            {"x": x, "knots": knots, "lb": lower_bound, "ub": upper_bound},
             return_type="dataframe",
         )
     else:
         dm = dmatrix(
-            f"cr(x, df={df}, constraints='center') - 1",
-            {"x": np.asarray(x, dtype=float)},
+            "cr(x, df=df_, lower_bound=lb, upper_bound=ub) - 1",
+            {"x": x, "df_": int(df), "lb": lower_bound, "ub": upper_bound},
             return_type="dataframe",
         )
     dm.columns = [f"rcs_{i+1}" for i in range(dm.shape[1])]
     return dm
 
 
-def add_interactions(X_rcs, sex_binary):
-    X_int = X_rcs.mul(sex_binary.values.reshape(-1, 1))
-    X_int.columns = [c + ":sex" for c in X_rcs.columns]
+def choose_rcs_spec_from_quantiles(
+    series, df_rcs=4, knot_q=(0.35, 0.65), lb_q=0.01, ub_q=0.97
+):
+    """用分位数选择 knots 和边界。"""
+    s = pd.to_numeric(pd.Series(series).dropna(), errors="coerce")
+    lb = float(s.quantile(lb_q))
+    ub = float(s.quantile(ub_q))
+    if ub <= lb:
+        span = max(1.0, abs(lb) * 0.1, 0.1)
+        lb, ub = lb - span / 2, ub + span / 2
+    if df_rcs <= 3:
+        ks = [float(s.quantile(0.5))]
+    else:
+        qs = [0.35, 0.65][: max(1, df_rcs - 2)]
+        ks = [float(s.quantile(q)) for q in qs]
+    ks = [min(max(k, lb + 1e-8), ub - 1e-8) for k in ks]
+    return ks, lb, ub
+
+
+def add_interactions(X_rcs, sex_series, sex_col="Female"):
+    X_int = X_rcs.mul(sex_series.values.reshape(-1, 1))
+    X_int.columns = [c + f":{sex_col}" for c in X_rcs.columns]
     return X_int
 
 
+# ---------------------- 数据清理 ----------------------
 def _numeric_covariates(df_cov: pd.DataFrame) -> pd.DataFrame:
     if df_cov is None or df_cov.empty:
         return pd.DataFrame(index=df_cov.index if df_cov is not None else None)
@@ -83,72 +94,30 @@ def _numeric_covariates(df_cov: pd.DataFrame) -> pd.DataFrame:
     other = df_cov.drop(columns=list(num.columns) + list(boo.columns), errors="ignore")
     if not other.empty:
         other = pd.get_dummies(other, drop_first=True, dummy_na=False)
-    out = pd.concat([num, boo, other], axis=1)
-    out = out.apply(pd.to_numeric, errors="coerce")
-    return out
+    return pd.concat([num, boo, other], axis=1).apply(pd.to_numeric, errors="coerce")
 
 
 def _clean_design_matrix(dfX, verbose=True):
     X = dfX.copy().apply(pd.to_numeric, errors="coerce")
     arr = X.to_numpy(dtype="float64", na_value=np.nan)
-
     bad_rows = ~np.isfinite(arr).all(axis=1)
     if verbose and bad_rows.sum() > 0:
         print(f"[clean] drop rows with non-finite values: {bad_rows.sum()}")
-        bad_cols = X.columns[~np.isfinite(arr).all(axis=0)].tolist()
-        print("[clean] columns with non-finite after coercion:", bad_cols[:20])
     X = X.loc[~bad_rows]
-    arr = arr[~bad_rows]
-
-    nunq = X.nunique(dropna=False)
-    const_cols = nunq[nunq <= 1].index.tolist()
-    if const_cols:
-        print(f"[clean] drop constant/near-constant cols: {const_cols}")
-        X = X.drop(columns=const_cols)
-        arr = X.to_numpy(dtype="float64", na_value=np.nan)
-
-    dup_cols, seen = [], {}
-    for j, c in enumerate(X.columns):
-        key = tuple(np.round(arr[:, j], 12))
-        if key in seen:
-            dup_cols.append(c)
-        else:
-            seen[key] = c
-    if dup_cols:
-        print(f"[clean] drop duplicate cols: {dup_cols}")
-        X = X.drop(columns=dup_cols)
-    # Drop highly correlated columns to reduce ill-conditioning
-    if X.shape[1] >= 2:
-        try:
-            corr = X.fillna(0.0).corr().abs()
-            upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-            to_drop = [col for col in upper.columns if (upper[col] >= 0.995).any()]
-            if to_drop:
-                print(f"[clean] drop high-corr cols (|r|>=0.995): {to_drop}")
-                X = X.drop(columns=to_drop, errors="ignore")
-        except Exception:
-            pass
-
     return X
 
 
-def _drop_separation_features(X: pd.DataFrame, y: pd.Series, verbose: bool = True) -> pd.DataFrame:
-    """Drop features showing no variance within either event or non-event group (risk of separation)."""
-    try:
-        yy = pd.to_numeric(y, errors="coerce").fillna(0).astype(int).values.astype(bool)
-        if yy.sum() == 0 or (~yy).sum() == 0:
-            return X
-        to_drop = []
-        for col in X.columns:
-            v1 = float(np.nanvar(pd.to_numeric(X.loc[yy, col], errors="coerce").values))
-            v0 = float(np.nanvar(pd.to_numeric(X.loc[~yy, col], errors="coerce").values))
-            if v1 < 1e-10 or v0 < 1e-10:
-                to_drop.append(col)
-        if to_drop and verbose:
-            print(f"[clean] drop potential-separation cols: {to_drop}")
-        return X.drop(columns=to_drop, errors="ignore")
-    except Exception:
-        return X
+def _drop_separation_features(X: pd.DataFrame, y: pd.Series, verbose=True):
+    yy = y.astype(bool).values
+    to_drop = []
+    for col in X.columns:
+        v1 = float(np.nanvar(X.loc[yy, col].values))
+        v0 = float(np.nanvar(X.loc[~yy, col].values))
+        if v1 < 1e-10 or v0 < 1e-10:
+            to_drop.append(col)
+    if to_drop and verbose:
+        print(f"[clean] drop potential-separation cols: {to_drop}")
+    return X.drop(columns=to_drop, errors="ignore")
 
 
 # ---------------------- 拟合 & 预测 ----------------------
@@ -161,70 +130,63 @@ def fit_cox_rcs_interaction(
     covariates=None,
     df_rcs=4,
     knots=None,
+    lower_bound=None,
+    upper_bound=None,
     use_penalizer=True,
     penalizer=0.1,
 ):
     dat = df[[time_col, event_col, lge_col, sex_col] + (covariates or [])].copy()
-    dat = dat.replace([np.inf, -np.inf], np.nan)
     dat = dat.dropna(subset=[time_col, event_col, lge_col, sex_col])
     dat = dat[dat[time_col] > 0].copy()
-    dat[event_col] = (dat[event_col].astype(int) > 0).astype(int)
+    dat[event_col] = dat[event_col].astype(int)
 
-    # Female=1, Male=0
-    dat["Sex_bin"] = dat[sex_col].astype(int)
+    print("\n=== Sanity check: counts by sex ===")
+    print(dat.groupby(sex_col)[event_col].agg(n="count", events="sum"))
 
-    print("\n=== Sanity check: counts by sex (Sex_bin: 0=Male, 1=Female) ===")
-    cnt = dat.groupby("Sex_bin")[event_col].agg(n="count", events="sum")
-    print(cnt)
+    if knots is None or lower_bound is None or upper_bound is None:
+        ks, lb, ub = choose_rcs_spec_from_quantiles(dat[lge_col], df_rcs=df_rcs)
+    else:
+        ks, lb, ub = knots, lower_bound, upper_bound
+    print(f"[rcs] knots={ks}, bounds=({lb:.2f},{ub:.2f})")
 
-    X_rcs = build_rcs_basis(dat[lge_col].values, df=df_rcs, knots=knots)
-    X_int = add_interactions(X_rcs, dat["Sex_bin"])
-    X = pd.concat([X_rcs, dat[["Sex_bin"]], X_int], axis=1)
-
+    X_rcs = build_rcs_basis(
+        dat[lge_col].values, df=df_rcs, knots=ks, lower_bound=lb, upper_bound=ub
+    )
+    X_int = add_interactions(X_rcs, dat[sex_col], sex_col)
+    X = pd.concat([X_rcs, dat[[sex_col]], X_int], axis=1)
     if covariates:
-        cov_num = _numeric_covariates(dat[covariates])
-        X = pd.concat([X, cov_num], axis=1)
+        X = pd.concat([X, _numeric_covariates(dat[covariates])], axis=1)
 
-    X_clean = _clean_design_matrix(X)
-    # Remove features likely to cause perfect separation
-    X_clean = _drop_separation_features(X_clean, dat.loc[X_clean.index, event_col])
+    X_tmp = _clean_design_matrix(X)
+    y_tmp = dat.loc[X_tmp.index, event_col]
+    X_clean = _drop_separation_features(X_tmp, y_tmp)
+
     fit_df = pd.concat([dat[[time_col, event_col]].loc[X_clean.index], X_clean], axis=1)
 
-    # Progressive penalization to mitigate convergence/overflow
-    last_err = None
-    for pen in ([penalizer, 1.0, 5.0] if use_penalizer else [0.0, 1.0, 5.0]):
+    for pen in [penalizer, 1.0, 5.0] if use_penalizer else [0.0]:
         try:
-            cph = CoxPHFitter(penalizer=float(pen))
-            import warnings as _warn
-            with _warn.catch_warnings():
-                _warn.simplefilter("ignore")
-                cph.fit(
-                    fit_df,
-                    duration_col=time_col,
-                    event_col=event_col,
-                    show_progress=False,
-                    robust=True,
-                )
-            return cph, X_clean.columns.tolist(), fit_df
+            cph = CoxPHFitter(penalizer=pen)
+            cph.fit(
+                fit_df,
+                duration_col=time_col,
+                event_col=event_col,
+                show_progress=False,
+                robust=True,
+            )
+            return (
+                cph,
+                X_clean.columns.tolist(),
+                fit_df,
+                {"knots": ks, "lb": lb, "ub": ub},
+            )
         except Exception as e:
             last_err = e
             continue
-    # If all attempts failed, re-raise the last error
     raise last_err
 
 
-def make_lge_grid(x, n=200):
-    x = np.asarray(pd.Series(x).dropna().astype(float).values)
-    if x.size == 0:
-        raise ValueError("No valid LGE values to build grid.")
-    q1, q99 = np.percentile(x, [1, 99])
-    if not (np.isfinite(q1) and np.isfinite(q99)):
-        q1, q99 = np.nanmin(x), np.nanmax(x)
-    lo, hi = float(q1), float(q99)
-    if lo >= hi:
-        span = max(1.0, abs(lo) * 0.1, 0.1)
-        lo, hi = lo - span / 2, hi + span / 2
-    return np.linspace(lo, hi, n)
+def make_lge_grid_from_bounds(lb, ub, n=200):
+    return np.linspace(lb, ub, n)
 
 
 def hr_curve_with_ci(
@@ -235,212 +197,63 @@ def hr_curve_with_ci(
     ref_value=None,
     df_rcs=4,
     knots=None,
+    lower_bound=None,
+    upper_bound=None,
     covariates_means=None,
+    sex_col="Female",
 ):
-    sex_bin = int(sex_value)
-
     basis_all = build_rcs_basis(
-        np.asarray(lge_grid, dtype=float), df=df_rcs, knots=knots
+        lge_grid,
+        df=df_rcs,
+        knots=knots,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
     )
-    inter_all = basis_all.mul(sex_bin)
-    inter_all.columns = [c + ":sex" for c in basis_all.columns]
+    inter_all = basis_all.mul(sex_value)
+    inter_all.columns = [c + f":{sex_col}" for c in basis_all.columns]
 
     Xg = pd.concat(
-        [basis_all, pd.Series([sex_bin] * len(basis_all), name="Sex_bin"), inter_all],
+        [basis_all, pd.Series([sex_value] * len(basis_all), name=sex_col), inter_all],
         axis=1,
     )
 
     extra_feats = [f for f in feature_names if f not in Xg.columns]
-    if extra_feats:
-        if covariates_means is None:
-            covariates_means = {f: 0.0 for f in extra_feats}
-        for f in extra_feats:
-            Xg[f] = covariates_means.get(f, 0.0)
+    for f in extra_feats:
+        Xg[f] = 0.0 if covariates_means is None else covariates_means.get(f, 0.0)
 
-    beta = cph.params_.reindex(feature_names).values.reshape(-1, 1)
-    cov = cph.variance_matrix_.loc[feature_names, feature_names].values
-
-    M = Xg[feature_names].to_numpy()
+    valid_features = [f for f in feature_names if f in cph.params_.index]
+    beta = cph.params_.reindex(valid_features).values.reshape(-1, 1)
+    cov = cph.variance_matrix_.loc[valid_features, valid_features].values
+    M = Xg[valid_features].to_numpy()
     eta = M @ beta
     var_eta = np.einsum("ij,jk,ik->i", M, cov, M)
 
     if ref_value is None:
         ref_value = float(np.median(lge_grid))
-    ref_idx = int(np.argmin(np.abs(np.asarray(lge_grid, float) - ref_value)))
+    ref_idx = int(np.argmin(np.abs(lge_grid - ref_value)))
     Xref = M[ref_idx : ref_idx + 1, :]
-
     eta_ref = float(Xref @ beta)
     var_eta_ref = float(Xref @ cov @ Xref.T)
     cov_eta_ref = (M @ cov @ Xref.T).reshape(-1)
 
     eta_rel = eta.reshape(-1) - eta_ref
-    var_eta_rel = var_eta + var_eta_ref - 2 * cov_eta_ref
-    var_eta_rel = np.maximum(var_eta_rel, 1e-12)
-
+    var_eta_rel = np.maximum(var_eta + var_eta_ref - 2 * cov_eta_ref, 1e-12)
     hr = np.exp(eta_rel)
     se = np.sqrt(var_eta_rel)
-    ci_lo = np.exp(eta_rel - 1.96 * se)
-    ci_hi = np.exp(eta_rel + 1.96 * se)
-    return hr, ci_lo, ci_hi, ref_value
+    return hr, np.exp(eta_rel - 1.96 * se), np.exp(eta_rel + 1.96 * se), ref_value
 
 
 # ---------------------- 阈值与绘图 ----------------------
 def suggest_thresholds_from_curve(lge_grid, hr, ci_lo, ci_hi, min_hr=1.2, smooth=7):
     def moving_avg(a, w):
-        if w <= 1:
-            return a
-        return np.convolve(a, np.ones(w) / w, mode="same")
+        return np.convolve(a, np.ones(w) / w, mode="same") if w > 1 else a
 
     hr_s = moving_avg(hr, smooth)
     lo_s = moving_avg(ci_lo, smooth)
-    d1 = np.gradient(hr_s, lge_grid)
-    d2 = np.gradient(d1, lge_grid)
     valid = (hr_s > min_hr) & (lo_s > 1.0)
-    candidates = []
     if np.any(valid):
-        slope_thr = np.nanpercentile(d1[valid], 75)
-        curve_thr = np.nanpercentile(d2[valid], 75)
-        idxs = np.where(valid & (d1 >= slope_thr) & (d2 >= curve_thr))[0]
-        for idx in idxs:
-            if (
-                not candidates
-                or abs(lge_grid[idx] - candidates[-1])
-                > (lge_grid.max() - lge_grid.min()) * 0.05
-            ):
-                candidates.append(lge_grid[idx])
-            if len(candidates) >= 2:
-                break
-    # Fallbacks: relax criteria if no candidates found
-    if not candidates:
-        valid2 = (hr_s > max(1.05, min_hr - 0.1)) & (lo_s > 1.0)
-        if np.any(valid2):
-            idx = int(np.where(valid2)[0][0])
-            candidates.append(float(lge_grid[idx]))
-    # Final fallback: take the grid point with maximal smoothed HR
-    if not candidates:
-        try:
-            idx_max = int(np.nanargmax(hr_s))
-            if np.isfinite(hr_s[idx_max]):
-                candidates.append(float(lge_grid[idx_max]))
-        except Exception:
-            pass
-    return candidates
-
-
-def aic_of_three_groups(df, time_col, event_col, cut1, cut2, lge_col, covariates=None):
-    tmp_base = df[[time_col, event_col, lge_col]].copy().dropna()
-    # Guard against invalid or degenerate cuts
-    if not np.isfinite(cut1) or not np.isfinite(cut2) or cut2 <= cut1:
-        raise ValueError("invalid cut points")
-
-    tmp_base["LGE_3g"] = pd.cut(
-        tmp_base[lge_col], bins=[-np.inf, cut1, cut2, np.inf], labels=["low", "mid", "high"]
-    )
-
-    # Ensure all bins have data and reasonable sample sizes to avoid separation
-    counts = tmp_base["LGE_3g"].value_counts(dropna=False)
-    if (counts.get("mid", 0) < 2) or (counts.get("high", 0) < 2):
-        raise ValueError("insufficient samples in mid/high bins")
-    if tmp_base[event_col].nunique() < 2:
-        raise ValueError("no event variation")
-
-    grp = pd.get_dummies(tmp_base["LGE_3g"], drop_first=True)  # columns: mid, high
-
-    # Skip combinations with near-complete separation in mid/high conditional on event
-    ev_mask = tmp_base[event_col].astype(bool).values
-    for col in grp.columns:
-        v1 = float(np.nanvar(grp.loc[ev_mask, col].values)) if ev_mask.any() else 0.0
-        v0 = float(np.nanvar(grp.loc[~ev_mask, col].values)) if (~ev_mask).any() else 0.0
-        if v1 < 1e-8 or v0 < 1e-8:
-            raise ValueError("potential complete separation")
-
-    X = grp
-    if covariates:
-        try:
-            cov_df = _numeric_covariates(df[covariates])
-            # Fill missing covariates with per-column medians to avoid row drops
-            cov_df = cov_df.apply(
-                lambda s: pd.to_numeric(s, errors="coerce").fillna(
-                    np.nanmedian(pd.to_numeric(s, errors="coerce").values)
-                ),
-                axis=0,
-            )
-            X = pd.concat([X, cov_df.loc[tmp_base.index]], axis=1)
-        except Exception:
-            pass
-
-    fit_df = pd.concat([tmp_base[[time_col, event_col]], X], axis=1)
-
-    # Use stronger ridge penalization and robust variance to stabilize AIC
-    cph = CoxPHFitter(penalizer=2.0)
-    try:
-        cph.fit(
-            fit_df,
-            duration_col=time_col,
-            event_col=event_col,
-            show_progress=False,
-            robust=True,
-        )
-    except Exception:
-        cph = CoxPHFitter(penalizer=5.0)
-        cph.fit(
-            fit_df,
-            duration_col=time_col,
-            event_col=event_col,
-            show_progress=False,
-            robust=True,
-        )
-    return float(cph.AIC_)
-
-
-def three_cut_grid_search_by_sex(
-    df,
-    time_col,
-    event_col,
-    lge_col,
-    sex_col,
-    covariates=None,
-    candidate_q=(20, 30, 40, 50, 60, 70, 80),
-):
-    out = {}
-    # Only require essential columns here to keep candidate grid broad; covariates are handled inside AIC fit
-    dat = df[[time_col, event_col, lge_col, sex_col]].dropna().copy()
-    dat[event_col] = (dat[event_col].astype(int) > 0).astype(int)
-    dat["Sex_bin"] = dat[sex_col].astype(int)
-
-    for sex in [0, 1]:
-        sub = dat[dat["Sex_bin"] == sex]
-        if sub.empty or sub[event_col].sum() == 0:
-            out[sex] = (np.nan, np.nan, np.nan)
-            continue
-        vals = pd.to_numeric(sub[lge_col], errors="coerce").dropna().values
-        if vals.size < 5:
-            out[sex] = (np.nan, np.nan, np.nan)
-            continue
-        qs = np.unique(np.percentile(vals, candidate_q))
-        if qs.size < 2:
-            out[sex] = (np.nan, np.nan, np.nan)
-            continue
-        try:
-            print(
-                f"[grid] {'Male' if sex==0 else 'Female'}: n={len(sub)}, events={int(sub[event_col].sum())}, unique_LGE={np.unique(vals).size}, qs={[f'{q:.2f}' for q in qs]}"
-            )
-        except Exception:
-            pass
-        best = (np.nan, np.nan, np.inf)
-        for i in range(len(qs)):
-            for j in range(i + 1, len(qs)):
-                c1, c2 = qs[i], qs[j]
-                try:
-                    aic = aic_of_three_groups(
-                        sub, time_col, event_col, c1, c2, lge_col, covariates
-                    )
-                    if aic < best[2]:
-                        best = (float(c1), float(c2), float(aic))
-                except Exception:
-                    continue
-        out[sex] = best
-    return out
+        return [lge_grid[np.where(valid)[0][0]]]
+    return []
 
 
 def plot_hr_curves(
@@ -451,7 +264,7 @@ def plot_hr_curves(
     female_ci,
     male_thresh=None,
     female_thresh=None,
-    title="HR vs LGE (RCS + Sex Interaction)",
+    title="HR vs LGE (RCS + Female interaction)",
 ):
     plt.figure(figsize=(7.5, 5.0))
     plt.plot(lge_grid, male_curve, label="Male HR")
@@ -460,180 +273,79 @@ def plot_hr_curves(
     plt.fill_between(lge_grid, female_ci[0], female_ci[1], alpha=0.25)
     plt.axhline(1.0, linestyle="--", linewidth=1)
 
-    def add_vlines(ths, lab_prefix):
-        if not ths:
-            return
-        for k, t in enumerate(ths, 1):
-            plt.axvline(t, linestyle=":", linewidth=1.5)
-            plt.plot([], [], label=f"{lab_prefix} thr{k}: {t:.2f}")
+    def add_vlines(ths, lab):
+        for t in ths or []:
+            plt.axvline(t, ls=":", lw=1.5)
+            plt.plot([], [], label=f"{lab} thr: {t:.2f}")
 
     add_vlines(male_thresh, "Male")
     add_vlines(female_thresh, "Female")
     plt.xlabel("LGE Burden")
-    plt.ylabel("Hazard Ratio (relative to reference)")
+    plt.ylabel("Hazard Ratio")
     plt.title(title)
     plt.legend()
     plt.tight_layout()
     plt.show()
 
 
+# ---------------------- main ----------------------
 if __name__ == "__main__":
     df = load_dataframes()
-    df.drop(
-        columns=["Age by decade", "CrCl>45", "NYHA>2", "Significant LGE"], inplace=True
-    )
     df = prepare_df_for_model(df)
     time_col = "PE_Time"
     event_col = "VT/VF/SCD"
     lge_col = "LGE Burden 5SD"
     sex_col = "Female"
+    covariates = []
 
-    covariates = [
-        "Age at CMR",
-        "BMI",
-        "DM",
-        "HTN",
-        "HLP",
-        "AF",
-        "NYHA Class",
-        "LVEDVi",
-        "LVEF",
-        "LV Mass Index",
-        "RVEDVi",
-        "RVEF",
-        "LA EF",
-        "LAVi",
-        "MRF (%)",
-        "Sphericity Index",
-        "Relative Wall Thickness",
-        "MV Annular Diameter",
-        "Beta Blocker",
-        "ACEi/ARB/ARNi",
-        "Aldosterone Antagonist",
-        "AAD",
-        "CRT",
-        "QRS",
-        "QTc",
-        "Cockcroft-Gault Creatinine Clearance (mL/min)",
-        "ICD",
-    ]
-
-    # 2) 拟合 Cox + RCS + 性别交互
-    #    你可以调 df_rcs 或指定 knots（例如按 5/35/65/95 分位）
-    df_rcs = 4
-    knots = None  # 例如：np.percentile(df[lge_col].dropna(), [5, 35, 65, 95])[1:-1]  # patsy::cr 的 knots 是“内部”结点
-
-    cph, feat_names, fit_df = fit_cox_rcs_interaction(
+    ks, lb, ub = choose_rcs_spec_from_quantiles(df[lge_col], df_rcs=4)
+    cph, feat_names, fit_df, spec = fit_cox_rcs_interaction(
         df,
         time_col,
         event_col,
         lge_col,
         sex_col,
-        covariates=covariates,
-        df_rcs=df_rcs,
-        knots=knots,
+        covariates,
+        df_rcs=4,
+        knots=ks,
+        lower_bound=lb,
+        upper_bound=ub,
     )
-    print("\n=== Cox model summary ===")
     print(cph.summary)
 
-    # 3) 画 HR–LGE 曲线（男/女各一条）
-    #    网格范围建议覆盖 LGE 的 1~99 分位
-    q1, q99 = np.percentile(df[lge_col].dropna(), [1, 99])
-    lge_grid = np.linspace(q1, q99, 200)
-
-    # 协变量在绘图时的固定值（平均/众数）；若不指定，默认 0
-    cov_means = None
-    if covariates:
-        cov_means = {}
-        for c in covariates:
-            if df[c].dtype.kind in "ifu":
-                cov_means[c] = float(np.nanmean(df[c]))
-            else:
-                # 类别/布尔，取众数或0
-                try:
-                    cov_means[c] = df[c].mode(dropna=True).iat[0]
-                except Exception:
-                    cov_means[c] = 0.0
-
-    # 男性曲线（Sex_bin=0）
-    m_hr, m_lo, m_hi, ref_val_m = hr_curve_with_ci(
+    grid = make_lge_grid_from_bounds(spec["lb"], spec["ub"], n=200)
+    m_hr, m_lo, m_hi, ref_m = hr_curve_with_ci(
         cph,
         feat_names,
-        lge_grid,
+        grid,
         sex_value=0,
-        ref_value=None,
-        df_rcs=df_rcs,
-        knots=knots,
-        covariates_means=cov_means,
+        df_rcs=4,
+        knots=spec["knots"],
+        lower_bound=spec["lb"],
+        upper_bound=spec["ub"],
+        sex_col=sex_col,
     )
-    # 女性曲线（Sex_bin=1）
-    f_hr, f_lo, f_hi, ref_val_f = hr_curve_with_ci(
+    f_hr, f_lo, f_hi, ref_f = hr_curve_with_ci(
         cph,
         feat_names,
-        lge_grid,
+        grid,
         sex_value=1,
-        ref_value=None,
-        df_rcs=df_rcs,
-        knots=knots,
-        covariates_means=cov_means,
+        df_rcs=4,
+        knots=spec["knots"],
+        lower_bound=spec["lb"],
+        upper_bound=spec["ub"],
+        sex_col=sex_col,
     )
 
-    # 4) 曲线法：给出候选“阈值”（最多两个）
-    male_thr_curve = suggest_thresholds_from_curve(
-        lge_grid, m_hr, m_lo, m_hi, min_hr=1.2, smooth=7
-    )
-    female_thr_curve = suggest_thresholds_from_curve(
-        lge_grid, f_hr, f_lo, f_hi, min_hr=1.2, smooth=7
-    )
-
-    print("\n=== Curve-based candidate thresholds ===")
-    print(
-        f"Male   (ref={ref_val_m:.2f}): {['{:.2f}'.format(t) for t in male_thr_curve]}"
-    )
-    print(
-        f"Female (ref={ref_val_f:.2f}): {['{:.2f}'.format(t) for t in female_thr_curve]}"
-    )
-
-    # 5) 三分法：按性别做两切点网格搜索（AIC最优）
-    #    默认候选分位：20,30,40,50,60,70,80（可按需加密）
-    tri_best = three_cut_grid_search_by_sex(
-        df,
-        time_col,
-        event_col,
-        lge_col,
-        sex_col,
-        covariates=covariates,
-        candidate_q=(20, 30, 40, 50, 60, 70, 80),
-    )
-    print("\n=== Three-group AIC-best thresholds ===")
-    for sex, (c1, c2, aic) in tri_best.items():
-        tag = "Male" if sex == 0 else "Female"
-        if np.isfinite(aic):
-            print(f"{tag}: cut1={c1:.2f}, cut2={c2:.2f}, AIC={aic:.2f}")
-        else:
-            print(f"{tag}: insufficient data for grid search.")
-
-    # 6) 绘图（带阈值竖线，图例保留两位小数）
-    male_lines = male_thr_curve or [
-        tri_best.get(0, (np.nan, np.nan, np.nan))[0],
-        tri_best.get(0, (np.nan, np.nan, np.nan))[1],
-    ]
-    male_lines = [t for t in male_lines if t is not None and np.isfinite(t)]
-    female_lines = female_thr_curve or [
-        tri_best.get(1, (np.nan, np.nan, np.nan))[0],
-        tri_best.get(1, (np.nan, np.nan, np.nan))[1],
-    ]
-    female_lines = [t for t in female_lines if t is not None and np.isfinite(t)]
+    male_thr = suggest_thresholds_from_curve(grid, m_hr, m_lo, m_hi)
+    female_thr = suggest_thresholds_from_curve(grid, f_hr, f_lo, f_hi)
 
     plot_hr_curves(
-        lge_grid,
-        male_curve=m_hr,
-        female_curve=f_hr,
-        male_ci=(m_lo, m_hi),
-        female_ci=(f_lo, f_hi),
-        male_thresh=male_lines[:2],
-        female_thresh=female_lines[:2],
-        title="HR vs LGE by Sex (RCS interaction)",
+        grid,
+        m_hr,
+        f_hr,
+        (m_lo, m_hi),
+        (f_lo, f_hi),
+        male_thresh=male_thr,
+        female_thresh=female_thr,
     )
-
-    print("\nDone.")
