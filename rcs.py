@@ -1,636 +1,522 @@
-# LGE性别特异性阈值分析完整框架 (Python版)
+# === rcs_cox_sex_thresholds.py ===
+# 功能：
+# 1) Cox + RCS 拟合 LGE->VT/VF 非线性 + 性别交互（可选协变量）
+# 2) 绘制男女 HR–LGE 曲线（含95%CI）
+# 3) 给出两种性别特异的“阈值”候选：曲线法 & 三分法（AIC最佳）
 
-## 第一阶段：数据准备与描述性分析
-
-### 1.1 导入必要库
-```python
-import pandas as pd
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
 from lifelines import CoxPHFitter
-from lifelines.utils import concordance_index
-from lifelines import KaplanMeierFitter
-from sksurv.linear_model import CoxPHSurvivalAnalysis
-from sksurv.preprocessing import OneHotEncoder
 from patsy import dmatrix
-from scipy import optimize
-from scipy.interpolate import UnivariateSpline
-import warnings
-warnings.filterwarnings('ignore')
 
-# 竞争风险分析
-from lifelines import AalenAdditiveFitter
-# 或者使用 pycox 包进行Fine-Gray分析
-```
+from cox import load_dataframes
 
-### 1.2 结局定义与时间窗设置
-```python
-def prepare_endpoint_data(df, T_main=3*365.25):
-    """
-    准备终点事件数据
-    """
+
+# ---------------------- 数据准备 ----------------------
+def prepare_df_for_model(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    
-    # 定义复合结局
-    df['composite_endpoint'] = ((df['scd'] == 1) | (df['appropriate_icd'] == 1)).astype(int)
-    
-    # 计算首次事件时间
-    df['time_to_first_event'] = np.minimum(
-        df['scd_time'].fillna(np.inf), 
-        df['icd_time'].fillna(np.inf)
+
+    # 1) NYHA Class -> 标准 1–4，0->1，5->4；转 float64
+    if "NYHA Class" in df.columns:
+        nyha = df["NYHA Class"].astype("string").str.strip().str.upper()
+        MAP = {
+            "0": 1,
+            "I": 1,
+            "1": 1,
+            "II": 2,
+            "2": 2,
+            "III": 3,
+            "3": 3,
+            "IV": 4,
+            "4": 4,
+            "5": 4,
+        }
+        df["NYHA Class"] = nyha.map(MAP)
+        df["NYHA Class"] = pd.to_numeric(df["NYHA Class"], errors="coerce").astype(
+            "float64"
+        )
+
+    # 2) 可空扩展数值列统一为 float64（消灭 pd.NA）
+    nullable_mask = df.dtypes.astype(str).str.contains(
+        r"^(Int64|Float64|boolean)$", case=False
     )
-    df['time_to_first_event'] = np.where(
-        df['time_to_first_event'] == np.inf,
-        df['followup_time'],
-        df['time_to_first_event']
-    )
-    
-    # 截断到主要评估时间窗
-    df['time_truncated'] = np.minimum(df['time_to_first_event'], T_main)
-    df['event_truncated'] = np.where(
-        df['time_to_first_event'] <= T_main,
-        df['composite_endpoint'],
-        0
-    )
-    
-    # 竞争风险标记
-    df['competing_death'] = (df['non_arrhythmic_death'] == 1).astype(int)
-    
+    nullable_cols = df.columns[nullable_mask].tolist()
+    if nullable_cols:
+        df[nullable_cols] = df[nullable_cols].apply(
+            lambda s: pd.to_numeric(s, errors="coerce").astype("float64")
+        )
+
     return df
 
-# 应用函数
-data = prepare_endpoint_data(your_dataframe)
-```
 
-### 1.3 基线特征描述
-```python
-def descriptive_analysis(df):
-    """
-    描述性分析按性别分层
-    """
-    # 基本统计
-    vars_continuous = ['age', 'ef', 'lge_percent', 'followup_time']
-    vars_categorical = ['composite_endpoint', 'competing_death']
-    
-    print("=== 连续变量（均数±标准差）===")
-    for var in vars_continuous:
-        female_stats = df[df['sex'] == 'Female'][var].agg(['mean', 'std', 'count'])
-        male_stats = df[df['sex'] == 'Male'][var].agg(['mean', 'std', 'count'])
-        
-        print(f"{var}:")
-        print(f"  Female: {female_stats['mean']:.2f}±{female_stats['std']:.2f} (n={female_stats['count']})")
-        print(f"  Male: {male_stats['mean']:.2f}±{male_stats['std']:.2f} (n={male_stats['count']})")
-    
-    # 事件率
-    print("\n=== 事件率 ===")
-    event_rate = df.groupby('sex')['composite_endpoint'].agg(['sum', 'count', 'mean'])
-    print(event_rate)
-    
-    # LGE分布可视化
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    sns.histplot(data=df, x='lge_percent', hue='sex', alpha=0.7)
-    plt.title('LGE分布按性别')
-    
-    plt.subplot(1, 2, 2)
-    sns.boxplot(data=df, x='sex', y='lge_percent')
-    plt.title('LGE分布箱线图')
-    
-    plt.tight_layout()
-    plt.show()
-
-# 执行描述性分析
-descriptive_analysis(data)
-```
-
-## 第二阶段：限制性三次样条函数构建
-
-### 2.1 RCS基函数生成
-```python
-from patsy import dmatrix
-
-def create_rcs_basis(x, knots=None, df=4):
-    """
-    创建限制性三次样条基函数
-    """
-    if knots is None:
-        # 默认使用分位数作为knots
-        quantiles = np.linspace(0.1, 0.9, df-1)
-        knots = np.quantile(x.dropna(), quantiles)
-    
-    # 使用patsy创建RCS基
-    x_clean = x.dropna()
-    basis_formula = f"cr(x_clean, knots={knots.tolist()}, constraints='center')"
-    basis_matrix = dmatrix(basis_formula, {"x_clean": x_clean}, return_type='dataframe')
-    
-    return basis_matrix, knots
-
-def apply_rcs_transform(df, var_name, knots, include_interaction=True):
-    """
-    对变量应用RCS变换并创建交互项
-    """
-    # 创建RCS基函数
-    x_values = df[var_name].values
-    basis_formula = f"cr({var_name}, knots={knots.tolist()}, constraints='center')"
-    rcs_basis = dmatrix(basis_formula, df, return_type='dataframe')
-    
-    # 重命名列
-    rcs_cols = [f"{var_name}_rcs_{i}" for i in range(rcs_basis.shape[1]-1)]  # 排除截距
-    rcs_basis.columns = ['Intercept'] + rcs_cols
-    rcs_basis = rcs_basis.drop('Intercept', axis=1)
-    
-    # 添加到原数据框
-    result_df = pd.concat([df.reset_index(drop=True), rcs_basis.reset_index(drop=True)], axis=1)
-    
-    # 创建与性别的交互项
-    if include_interaction:
-        sex_male = (result_df['sex'] == 'Male').astype(int)
-        for col in rcs_cols:
-            result_df[f"{col}_x_male"] = result_df[col] * sex_male
-    
-    return result_df, rcs_cols
-
-# 应用RCS变换
-lge_basis, lge_knots = create_rcs_basis(data['lge_percent'], df=4)
-data_rcs, rcs_column_names = apply_rcs_transform(data, 'lge_percent', lge_knots)
-
-print(f"RCS knots位置: {lge_knots}")
-print(f"生成的RCS列: {rcs_column_names}")
-```
-
-### 2.2 Cox回归建模
-```python
-def fit_cox_model_with_rcs(df, rcs_cols, other_covars=None, interaction=True):
-    """
-    拟合包含RCS和交互项的Cox模型
-    """
-    if other_covars is None:
-        other_covars = ['age', 'ef']  # 根据你的协变量调整
-    
-    # 构建协变量列表
-    covars = rcs_cols + other_covars + ['sex_male']
-    
-    if interaction:
-        interaction_cols = [col for col in df.columns if '_x_male' in col]
-        covars.extend(interaction_cols)
-    
-    # 准备数据
-    df_model = df[['time_truncated', 'event_truncated'] + covars].dropna()
-    
-    # 转换为lifelines需要的格式
-    cph = CoxPHFitter()
-    cph.fit(df_model, duration_col='time_truncated', event_col='event_truncated')
-    
-    return cph, df_model, covars
-
-# 添加性别指示变量
-data_rcs['sex_male'] = (data_rcs['sex'] == 'Male').astype(int)
-
-# 拟合主要模型
-cox_model, model_data, model_covars = fit_cox_model_with_rcs(
-    data_rcs, rcs_column_names, 
-    other_covars=['age', 'ef'],  # 根据实际协变量调整
-    interaction=True
-)
-
-print("Cox模型拟合完成")
-print(f"C-index: {cox_model.concordance_index_:.3f}")
-print("\n模型系数：")
-print(cox_model.summary[['coef', 'p']])
-```
-
-## 第三阶段：标准化风险曲线生成
-
-### 3.1 风险预测函数
-```python
-def predict_standardized_risk(model, original_data, lge_values, sex_value, 
-                            time_point, rcs_knots, rcs_cols):
-    """
-    计算标准化风险预测
-    """
-    risks = []
-    
-    for lge_val in lge_values:
-        # 为每个个体创建预测数据
-        pred_risks_individual = []
-        
-        for idx, row in original_data.iterrows():
-            # 创建预测数据点
-            pred_data = row.copy()
-            pred_data['lge_percent'] = lge_val
-            pred_data['sex'] = sex_value
-            pred_data['sex_male'] = 1 if sex_value == 'Male' else 0
-            
-            # 重新计算RCS基函数
-            lge_array = np.array([lge_val])
-            basis_formula = f"cr(lge_array, knots={rcs_knots.tolist()}, constraints='center')"
-            rcs_values = dmatrix(basis_formula, {"lge_array": lge_array}, return_type='dataframe')
-            rcs_values = rcs_values.iloc[0, 1:].values  # 去除截距
-            
-            # 更新RCS列
-            for i, col in enumerate(rcs_cols):
-                pred_data[col] = rcs_values[i]
-                if f"{col}_x_male" in pred_data:
-                    pred_data[f"{col}_x_male"] = rcs_values[i] * pred_data['sex_male']
-            
-            # 预测风险
-            pred_df = pd.DataFrame([pred_data])[model_covars]
-            survival_func = model.predict_survival_function(pred_df, times=[time_point])
-            risk = 1 - survival_func.iloc[0, 0]
-            pred_risks_individual.append(risk)
-        
-        # 计算标准化风险（平均）
-        standardized_risk = np.mean(pred_risks_individual)
-        risks.append(standardized_risk)
-    
-    return np.array(risks)
-
-def generate_risk_curves(model, data, time_point=3*365.25, n_points=50):
-    """
-    生成男女标准化风险曲线
-    """
-    # LGE评估网格
-    lge_min, lge_max = data['lge_percent'].quantile([0.01, 0.99])
-    lge_grid = np.linspace(lge_min, lge_max, n_points)
-    
-    # 计算女性风险曲线
-    print("计算女性风险曲线...")
-    female_risks = predict_standardized_risk(
-        model, model_data, lge_grid, 'Female', 
-        time_point, lge_knots, rcs_column_names
-    )
-    
-    # 计算男性风险曲线
-    print("计算男性风险曲线...")
-    male_risks = predict_standardized_risk(
-        model, model_data, lge_grid, 'Male', 
-        time_point, lge_knots, rcs_column_names
-    )
-    
-    return lge_grid, female_risks, male_risks
-
-# 生成风险曲线
-lge_grid, female_risk_curve, male_risk_curve = generate_risk_curves(cox_model, data_rcs)
-
-# 可视化风险曲线
-plt.figure(figsize=(10, 6))
-plt.plot(lge_grid, female_risk_curve * 100, label='Female', linewidth=2, color='red')
-plt.plot(lge_grid, male_risk_curve * 100, label='Male', linewidth=2, color='blue')
-plt.xlabel('LGE (%)')
-plt.ylabel('3年累积风险 (%)')
-plt.title('标准化风险曲线按性别分层')
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.show()
-```
-
-## 第四阶段：阈值确定
-
-### 4.1 方案A：基于临床目标风险
-```python
-def find_risk_based_cutoffs(lge_grid, risk_curve, target_risks=[0.03, 0.10]):
-    """
-    基于目标风险水平找到LGE切点
-    """
-    cutoffs = []
-    
-    for target_risk in target_risks:
-        # 找到最接近目标风险的LGE值
-        idx = np.argmin(np.abs(risk_curve - target_risk))
-        cutoff = lge_grid[idx]
-        actual_risk = risk_curve[idx]
-        
-        cutoffs.append({
-            'target_risk': target_risk,
-            'cutoff': cutoff,
-            'actual_risk': actual_risk
-        })
-    
-    return cutoffs
-
-# 设定目标风险水平（3年风险 <3% 低风险, 3-10% 中风险, ≥10% 高风险）
-target_risks = [0.03, 0.10]
-
-# 计算女性阈值
-female_cutoffs = find_risk_based_cutoffs(lge_grid, female_risk_curve, target_risks)
-male_cutoffs = find_risk_based_cutoffs(lge_grid, male_risk_curve, target_risks)
-
-print("=== 基于风险的阈值 ===")
-print("女性阈值:")
-for i, cutoff in enumerate(female_cutoffs):
-    print(f"  切点{i+1}: LGE {cutoff['cutoff']:.1f}% (目标风险{cutoff['target_risk']*100:.0f}%, 实际风险{cutoff['actual_risk']*100:.1f}%)")
-
-print("男性阈值:")
-for i, cutoff in enumerate(male_cutoffs):
-    print(f"  切点{i+1}: LGE {cutoff['cutoff']:.1f}% (目标风险{cutoff['target_risk']*100:.0f}%, 实际风险{cutoff['actual_risk']*100:.1f}%)")
-```
-
-### 4.2 方案B：数据驱动优化
-```python
-from lifelines.statistics import logrank_test
-
-def evaluate_stratification(df, lge_cutoffs, sex_group):
-    """
-    评估风险分层的区分度
-    """
-    # 筛选特定性别
-    df_sex = df[df['sex'] == sex_group].copy()
-    
-    # 创建风险组
-    df_sex['risk_group'] = pd.cut(
-        df_sex['lge_percent'], 
-        bins=[0] + lge_cutoffs + [100], 
-        labels=['Low', 'Intermediate', 'High'],
-        right=False
-    )
-    
-    # 计算各组样本量
-    group_counts = df_sex['risk_group'].value_counts()
-    min_group_size = group_counts.min() / len(df_sex)
-    
-    # 如果任何组少于10%，返回惩罚分数
-    if min_group_size < 0.10:
-        return -1000
-    
-    # 计算log-rank统计量
-    groups = df_sex.groupby('risk_group')
-    chi_square = 0
-    
-    for name1, group1 in groups:
-        for name2, group2 in groups:
-            if name1 < name2:  # 避免重复比较
-                try:
-                    result = logrank_test(
-                        group1['time_truncated'], group2['time_truncated'],
-                        group1['event_truncated'], group2['event_truncated']
-                    )
-                    chi_square += result.test_statistic
-                except:
-                    return -1000
-    
-    return chi_square
-
-def optimize_cutoffs_data_driven(df, sex_group, lge_range):
-    """
-    数据驱动的阈值优化
-    """
-    def objective(cutoffs):
-        if cutoffs[0] >= cutoffs[1]:  # 确保切点顺序
-            return -1000
-        return -evaluate_stratification(df, cutoffs, sex_group)  # 负号因为要最大化
-    
-    # 初始猜测
-    lge_min, lge_max = lge_range
-    initial_guess = [lge_min + (lge_max-lge_min)*0.33, lge_min + (lge_max-lge_min)*0.67]
-    
-    # 优化
-    bounds = [(lge_min, lge_max-1), (lge_min+1, lge_max)]
-    
-    result = optimize.minimize(
-        objective, 
-        initial_guess,
-        bounds=bounds,
-        method='L-BFGS-B'
-    )
-    
-    if result.success:
-        return result.x
-    else:
-        return initial_guess
-
-# 数据驱动优化
-lge_range = (data['lge_percent'].quantile(0.05), data['lge_percent'].quantile(0.95))
-
-female_optimal_cutoffs = optimize_cutoffs_data_driven(data, 'Female', lge_range)
-male_optimal_cutoffs = optimize_cutoffs_data_driven(data, 'Male', lge_range)
-
-print("\n=== 数据驱动阈值 ===")
-print(f"女性最优切点: {female_optimal_cutoffs[0]:.1f}%, {female_optimal_cutoffs[1]:.1f}%")
-print(f"男性最优切点: {male_optimal_cutoffs[0]:.1f}%, {male_optimal_cutoffs[1]:.1f}%")
-```
-
-## 第五阶段：统计检验与验证
-
-### 5.1 交互作用检验
-```python
-def test_sex_lge_interaction(model):
-    """
-    检验LGE与性别的交互作用
-    """
-    # 获取交互项系数
-    interaction_terms = [col for col in model.summary.index if '_x_male' in col]
-    
-    if len(interaction_terms) == 0:
-        print("模型中未找到交互项")
-        return None
-    
-    # 联合Wald检验
-    interaction_coefs = model.summary.loc[interaction_terms, 'coef'].values
-    interaction_cov = model.variance_matrix_.loc[interaction_terms, interaction_terms].values
-    
-    # 计算Wald统计量
-    wald_stat = np.dot(interaction_coefs, np.dot(np.linalg.inv(interaction_cov), interaction_coefs))
-    p_value = 1 - stats.chi2.cdf(wald_stat, df=len(interaction_terms))
-    
-    print(f"LGE×性别交互作用检验:")
-    print(f"Wald χ² = {wald_stat:.3f}, df = {len(interaction_terms)}, p = {p_value:.4f}")
-    
-    return p_value
-
-# 执行交互检验
-from scipy import stats
-interaction_p = test_sex_lge_interaction(cox_model)
-```
-
-### 5.2 Bootstrap置信区间
-```python
-def bootstrap_cutoffs(df, model_func, n_bootstrap=1000):
-    """
-    Bootstrap估计阈值的置信区间
-    """
-    np.random.seed(42)
-    n_samples = len(df)
-    
-    female_cutoffs_boot = []
-    male_cutoffs_boot = []
-    
-    for i in range(n_bootstrap):
-        if i % 100 == 0:
-            print(f"Bootstrap进度: {i}/{n_bootstrap}")
-        
-        # 重抽样
-        boot_indices = np.random.choice(n_samples, n_samples, replace=True)
-        boot_df = df.iloc[boot_indices].reset_index(drop=True)
-        
-        try:
-            # 重新拟合模型和计算阈值
-            boot_model, _, _ = fit_cox_model_with_rcs(boot_df, rcs_column_names)
-            boot_lge_grid, boot_female_risks, boot_male_risks = generate_risk_curves(boot_model, boot_df)
-            
-            # 计算阈值
-            boot_female_cutoffs = find_risk_based_cutoffs(boot_lge_grid, boot_female_risks, target_risks)
-            boot_male_cutoffs = find_risk_based_cutoffs(boot_lge_grid, boot_male_risks, target_risks)
-            
-            female_cutoffs_boot.append([c['cutoff'] for c in boot_female_cutoffs])
-            male_cutoffs_boot.append([c['cutoff'] for c in boot_male_cutoffs])
-            
-        except:
-            continue
-    
-    # 计算置信区间
-    female_cutoffs_boot = np.array(female_cutoffs_boot)
-    male_cutoffs_boot = np.array(male_cutoffs_boot)
-    
-    female_ci = np.percentile(female_cutoffs_boot, [2.5, 97.5], axis=0)
-    male_ci = np.percentile(male_cutoffs_boot, [2.5, 97.5], axis=0)
-    
-    return female_ci, male_ci, female_cutoffs_boot, male_cutoffs_boot
-
-# 执行Bootstrap（注意：这会比较耗时）
-print("开始Bootstrap分析...")
-female_ci, male_ci, female_boot, male_boot = bootstrap_cutoffs(data_rcs, fit_cox_model_with_rcs)
-
-print("\n=== Bootstrap 95%置信区间 ===")
-for i in range(len(target_risks)):
-    print(f"切点{i+1}:")
-    print(f"  女性: {female_cutoffs[i]['cutoff']:.1f}% (95% CI: {female_ci[0,i]:.1f}%-{female_ci[1,i]:.1f}%)")
-    print(f"  男性: {male_cutoffs[i]['cutoff']:.1f}% (95% CI: {male_ci[0,i]:.1f}%-{male_ci[1,i]:.1f}%)")
-    
-    # 计算差异及其置信区间
-    diff_boot = male_boot[:, i] - female_boot[:, i]
-    diff_ci = np.percentile(diff_boot, [2.5, 97.5])
-    print(f"  差异(男-女): {male_cutoffs[i]['cutoff'] - female_cutoffs[i]['cutoff']:.1f}% (95% CI: {diff_ci[0]:.1f}%-{diff_ci[1]:.1f}%)")
-```
-
-## 第六阶段：模型验证与可视化
-
-### 6.1 风险分层验证
-```python
-def validate_stratification(df, female_cutoffs_vals, male_cutoffs_vals):
-    """
-    验证风险分层效果
-    """
-    results = {}
-    
-    for sex, cutoffs_vals in [('Female', female_cutoffs_vals), ('Male', male_cutoffs_vals)]:
-        df_sex = df[df['sex'] == sex].copy()
-        
-        # 创建风险组
-        df_sex['risk_group'] = pd.cut(
-            df_sex['lge_percent'], 
-            bins=[0] + cutoffs_vals + [100], 
-            labels=['Low', 'Intermediate', 'High'],
-            right=False
+# ---------------------- 基础构件 ----------------------
+def build_rcs_basis(x, df=4, knots=None):
+    if knots is not None:
+        knots = np.sort(np.array(knots, dtype=float))
+        dm = dmatrix(
+            "cr(x, knots=knots, constraints='center') - 1",
+            {"x": np.asarray(x, dtype=float), "knots": knots},
+            return_type="dataframe",
         )
-        
-        # 计算各组事件率
-        group_stats = df_sex.groupby('risk_group').agg({
-            'event_truncated': ['sum', 'count', 'mean'],
-            'time_truncated': 'mean'
-        }).round(3)
-        
-        print(f"\n{sex}风险分层结果:")
-        print(group_stats)
-        
-        # KM生存分析
-        plt.figure(figsize=(10, 6))
-        for group in ['Low', 'Intermediate', 'High']:
-            group_data = df_sex[df_sex['risk_group'] == group]
-            if len(group_data) > 0:
-                kmf = KaplanMeierFitter()
-                kmf.fit(group_data['time_truncated'], group_data['event_truncated'], label=f'{group} (n={len(group_data)})')
-                kmf.plot_survival_function()
-        
-        plt.title(f'{sex} - Kaplan-Meier生存曲线')
-        plt.ylabel('生存概率')
-        plt.xlabel('时间(天)')
-        plt.show()
-        
-        results[sex] = group_stats
-    
-    return results
+    else:
+        dm = dmatrix(
+            f"cr(x, df={df}, constraints='center') - 1",
+            {"x": np.asarray(x, dtype=float)},
+            return_type="dataframe",
+        )
+    dm.columns = [f"rcs_{i+1}" for i in range(dm.shape[1])]
+    return dm
 
-# 应用选定的阈值进行验证
-female_cutoffs_vals = [c['cutoff'] for c in female_cutoffs]
-male_cutoffs_vals = [c['cutoff'] for c in male_cutoffs]
 
-validation_results = validate_stratification(data, female_cutoffs_vals, male_cutoffs_vals)
-```
+def add_interactions(X_rcs, sex_binary):
+    X_int = X_rcs.mul(sex_binary.values.reshape(-1, 1))
+    X_int.columns = [c + ":sex" for c in X_rcs.columns]
+    return X_int
 
-### 6.2 最终可视化
-```python
-def final_visualization(lge_grid, female_risks, male_risks, 
-                       female_cutoffs_vals, male_cutoffs_vals, target_risks):
-    """
-    最终结果可视化
-    """
-    plt.figure(figsize=(12, 8))
-    
-    # 绘制风险曲线
-    plt.plot(lge_grid, female_risks * 100, label='Female', linewidth=3, color='red')
-    plt.plot(lge_grid, male_risks * 100, label='Male', linewidth=3, color='blue')
-    
-    # 添加目标风险水平线
-    for i, target_risk in enumerate(target_risks):
-        plt.axhline(y=target_risk*100, color='gray', linestyle='--', alpha=0.7)
-        plt.text(lge_grid[-1]*0.95, target_risk*100+0.5, f'{target_risk*100:.0f}%', 
-                ha='right', va='bottom')
-    
-    # 添加女性阈值线
-    for i, cutoff in enumerate(female_cutoffs_vals):
-        plt.axvline(x=cutoff, color='red', linestyle=':', alpha=0.8)
-        plt.text(cutoff, plt.ylim()[1]*0.9-i*2, f'F: {cutoff:.1f}%', 
-                rotation=90, ha='right', va='top', color='red')
-    
-    # 添加男性阈值线
-    for i, cutoff in enumerate(male_cutoffs_vals):
-        plt.axvline(x=cutoff, color='blue', linestyle=':', alpha=0.8)
-        plt.text(cutoff, plt.ylim()[1]*0.8-i*2, f'M: {cutoff:.1f}%', 
-                rotation=90, ha='right', va='top', color='blue')
-    
-    plt.xlabel('LGE (%)')
-    plt.ylabel('3年累积风险 (%)')
-    plt.title('LGE性别特异性风险阈值')
+
+def _numeric_covariates(df_cov: pd.DataFrame) -> pd.DataFrame:
+    if df_cov is None or df_cov.empty:
+        return pd.DataFrame(index=df_cov.index if df_cov is not None else None)
+    num = df_cov.select_dtypes(include=["number"])
+    boo = df_cov.select_dtypes(include=["bool"]).astype(int)
+    other = df_cov.drop(columns=list(num.columns) + list(boo.columns), errors="ignore")
+    if not other.empty:
+        other = pd.get_dummies(other, drop_first=True, dummy_na=False)
+    out = pd.concat([num, boo, other], axis=1)
+    out = out.apply(pd.to_numeric, errors="coerce")
+    return out
+
+
+def _clean_design_matrix(dfX, verbose=True):
+    X = dfX.copy().apply(pd.to_numeric, errors="coerce")
+    arr = X.to_numpy(dtype="float64", na_value=np.nan)
+
+    bad_rows = ~np.isfinite(arr).all(axis=1)
+    if verbose and bad_rows.sum() > 0:
+        print(f"[clean] drop rows with non-finite values: {bad_rows.sum()}")
+        bad_cols = X.columns[~np.isfinite(arr).all(axis=0)].tolist()
+        print("[clean] columns with non-finite after coercion:", bad_cols[:20])
+    X = X.loc[~bad_rows]
+    arr = arr[~bad_rows]
+
+    nunq = X.nunique(dropna=False)
+    const_cols = nunq[nunq <= 1].index.tolist()
+    if const_cols:
+        print(f"[clean] drop constant/near-constant cols: {const_cols}")
+        X = X.drop(columns=const_cols)
+        arr = X.to_numpy(dtype="float64", na_value=np.nan)
+
+    dup_cols, seen = [], {}
+    for j, c in enumerate(X.columns):
+        key = tuple(np.round(arr[:, j], 12))
+        if key in seen:
+            dup_cols.append(c)
+        else:
+            seen[key] = c
+    if dup_cols:
+        print(f"[clean] drop duplicate cols: {dup_cols}")
+        X = X.drop(columns=dup_cols)
+
+    return X
+
+
+# ---------------------- 拟合 & 预测 ----------------------
+def fit_cox_rcs_interaction(
+    df,
+    time_col,
+    event_col,
+    lge_col,
+    sex_col,
+    covariates=None,
+    df_rcs=4,
+    knots=None,
+    use_penalizer=True,
+    penalizer=0.1,
+):
+    dat = df[[time_col, event_col, lge_col, sex_col] + (covariates or [])].copy()
+    dat = dat.replace([np.inf, -np.inf], np.nan)
+    dat = dat.dropna(subset=[time_col, event_col, lge_col, sex_col])
+    dat = dat[dat[time_col] > 0].copy()
+    dat[event_col] = (dat[event_col].astype(int) > 0).astype(int)
+
+    # Female=1, Male=0
+    dat["Sex_bin"] = dat[sex_col].astype(int)
+
+    print("\n=== Sanity check: counts by sex (Sex_bin: 0=Male, 1=Female) ===")
+    cnt = dat.groupby("Sex_bin")[event_col].agg(n="count", events="sum")
+    print(cnt)
+
+    X_rcs = build_rcs_basis(dat[lge_col].values, df=df_rcs, knots=knots)
+    X_int = add_interactions(X_rcs, dat["Sex_bin"])
+    X = pd.concat([X_rcs, dat[["Sex_bin"]], X_int], axis=1)
+
+    if covariates:
+        cov_num = _numeric_covariates(dat[covariates])
+        X = pd.concat([X, cov_num], axis=1)
+
+    X_clean = _clean_design_matrix(X)
+    fit_df = pd.concat([dat[[time_col, event_col]].loc[X_clean.index], X_clean], axis=1)
+
+    cph = CoxPHFitter(penalizer=(penalizer if use_penalizer else 0.0))
+    cph.fit(
+        fit_df,
+        duration_col=time_col,
+        event_col=event_col,
+        show_progress=False,
+        robust=True,
+    )
+    return cph, X_clean.columns.tolist(), fit_df
+
+
+def make_lge_grid(x, n=200):
+    x = np.asarray(pd.Series(x).dropna().astype(float).values)
+    if x.size == 0:
+        raise ValueError("No valid LGE values to build grid.")
+    q1, q99 = np.percentile(x, [1, 99])
+    if not (np.isfinite(q1) and np.isfinite(q99)):
+        q1, q99 = np.nanmin(x), np.nanmax(x)
+    lo, hi = float(q1), float(q99)
+    if lo >= hi:
+        span = max(1.0, abs(lo) * 0.1, 0.1)
+        lo, hi = lo - span / 2, hi + span / 2
+    return np.linspace(lo, hi, n)
+
+
+def hr_curve_with_ci(
+    cph,
+    feature_names,
+    lge_grid,
+    sex_value,
+    ref_value=None,
+    df_rcs=4,
+    knots=None,
+    covariates_means=None,
+):
+    sex_bin = int(sex_value)
+
+    basis_all = build_rcs_basis(
+        np.asarray(lge_grid, dtype=float), df=df_rcs, knots=knots
+    )
+    inter_all = basis_all.mul(sex_bin)
+    inter_all.columns = [c + ":sex" for c in basis_all.columns]
+
+    Xg = pd.concat(
+        [basis_all, pd.Series([sex_bin] * len(basis_all), name="Sex_bin"), inter_all],
+        axis=1,
+    )
+
+    extra_feats = [f for f in feature_names if f not in Xg.columns]
+    if extra_feats:
+        if covariates_means is None:
+            covariates_means = {f: 0.0 for f in extra_feats}
+        for f in extra_feats:
+            Xg[f] = covariates_means.get(f, 0.0)
+
+    beta = cph.params_.reindex(feature_names).values.reshape(-1, 1)
+    cov = cph.variance_matrix_.loc[feature_names, feature_names].values
+
+    M = Xg[feature_names].to_numpy()
+    eta = M @ beta
+    var_eta = np.einsum("ij,jk,ik->i", M, cov, M)
+
+    if ref_value is None:
+        ref_value = float(np.median(lge_grid))
+    ref_idx = int(np.argmin(np.abs(np.asarray(lge_grid, float) - ref_value)))
+    Xref = M[ref_idx : ref_idx + 1, :]
+
+    eta_ref = float(Xref @ beta)
+    var_eta_ref = float(Xref @ cov @ Xref.T)
+    cov_eta_ref = (M @ cov @ Xref.T).reshape(-1)
+
+    eta_rel = eta.reshape(-1) - eta_ref
+    var_eta_rel = var_eta + var_eta_ref - 2 * cov_eta_ref
+    var_eta_rel = np.maximum(var_eta_rel, 1e-12)
+
+    hr = np.exp(eta_rel)
+    se = np.sqrt(var_eta_rel)
+    ci_lo = np.exp(eta_rel - 1.96 * se)
+    ci_hi = np.exp(eta_rel + 1.96 * se)
+    return hr, ci_lo, ci_hi, ref_value
+
+
+# ---------------------- 阈值与绘图 ----------------------
+def suggest_thresholds_from_curve(lge_grid, hr, ci_lo, ci_hi, min_hr=1.2, smooth=7):
+    def moving_avg(a, w):
+        if w <= 1:
+            return a
+        return np.convolve(a, np.ones(w) / w, mode="same")
+
+    hr_s = moving_avg(hr, smooth)
+    lo_s = moving_avg(ci_lo, smooth)
+    d1 = np.gradient(hr_s, lge_grid)
+    d2 = np.gradient(d1, lge_grid)
+    valid = (hr_s > min_hr) & (lo_s > 1.0)
+    candidates = []
+    if np.any(valid):
+        slope_thr = np.nanpercentile(d1[valid], 75)
+        curve_thr = np.nanpercentile(d2[valid], 75)
+        idxs = np.where(valid & (d1 >= slope_thr) & (d2 >= curve_thr))[0]
+        for idx in idxs:
+            if (
+                not candidates
+                or abs(lge_grid[idx] - candidates[-1])
+                > (lge_grid.max() - lge_grid.min()) * 0.05
+            ):
+                candidates.append(lge_grid[idx])
+            if len(candidates) >= 2:
+                break
+    return candidates
+
+
+def aic_of_three_groups(df, time_col, event_col, cut1, cut2, lge_col, covariates=None):
+    tmp = df[[time_col, event_col, lge_col] + (covariates or [])].dropna().copy()
+    tmp["LGE_3g"] = pd.cut(
+        tmp[lge_col], bins=[-np.inf, cut1, cut2, np.inf], labels=["low", "mid", "high"]
+    )
+    grp = pd.get_dummies(tmp["LGE_3g"], drop_first=True)  # mid, high
+    X = grp
+    if covariates:
+        X = pd.concat([X, tmp[covariates]], axis=1)
+    cph = CoxPHFitter()
+    cph.fit(
+        pd.concat([tmp[[time_col, event_col]], X], axis=1),
+        duration_col=time_col,
+        event_col=event_col,
+        show_progress=False,
+    )
+    return cph.AIC_
+
+
+def three_cut_grid_search_by_sex(
+    df,
+    time_col,
+    event_col,
+    lge_col,
+    sex_col,
+    covariates=None,
+    candidate_q=(20, 30, 40, 50, 60, 70, 80),
+):
+    out = {}
+    dat = (
+        df[[time_col, event_col, lge_col, sex_col] + (covariates or [])].dropna().copy()
+    )
+    dat[event_col] = (dat[event_col].astype(int) > 0).astype(int)
+    dat["Sex_bin"] = dat[sex_col].astype(int)
+
+    for sex in [0, 1]:
+        sub = dat[dat["Sex_bin"] == sex]
+        if sub.empty or sub[event_col].sum() == 0:
+            out[sex] = (np.nan, np.nan, np.nan)
+            continue
+        qs = np.percentile(sub[lge_col].values, candidate_q)
+        best = (np.nan, np.nan, np.inf)
+        for i in range(len(qs)):
+            for j in range(i + 1, len(qs)):
+                c1, c2 = qs[i], qs[j]
+                try:
+                    aic = aic_of_three_groups(
+                        sub, time_col, event_col, c1, c2, lge_col, covariates
+                    )
+                    if aic < best[2]:
+                        best = (float(c1), float(c2), float(aic))
+                except Exception:
+                    continue
+        out[sex] = best
+    return out
+
+
+def plot_hr_curves(
+    lge_grid,
+    male_curve,
+    female_curve,
+    male_ci,
+    female_ci,
+    male_thresh=None,
+    female_thresh=None,
+    title="HR vs LGE (RCS + Sex Interaction)",
+):
+    plt.figure(figsize=(7.5, 5.0))
+    plt.plot(lge_grid, male_curve, label="Male HR")
+    plt.fill_between(lge_grid, male_ci[0], male_ci[1], alpha=0.25)
+    plt.plot(lge_grid, female_curve, label="Female HR")
+    plt.fill_between(lge_grid, female_ci[0], female_ci[1], alpha=0.25)
+    plt.axhline(1.0, linestyle="--", linewidth=1)
+
+    def add_vlines(ths, lab_prefix):
+        if not ths:
+            return
+        for k, t in enumerate(ths, 1):
+            plt.axvline(t, linestyle=":", linewidth=1.5)
+            plt.plot([], [], label=f"{lab_prefix} thr{k}: {t:.2f}")
+
+    add_vlines(male_thresh, "Male")
+    add_vlines(female_thresh, "Female")
+    plt.xlabel("LGE Burden")
+    plt.ylabel("Hazard Ratio (relative to reference)")
+    plt.title(title)
     plt.legend()
-    plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
 
-# 生成最终可视化
-final_visualization(lge_grid, female_risk_curve, male_risk_curve,
-                   female_cutoffs_vals, male_cutoffs_vals, target_risks)
-```
 
-## 执行总结
+if __name__ == "__main__":
+    df = load_dataframes()
+    df.drop(
+        columns=["Age by decade", "CrCl>45", "NYHA>2", "Significant LGE"], inplace=True
+    )
+    df = prepare_df_for_model(df)
+    time_col = "PE_Time"
+    event_col = "VT/VF/SCD"
+    lge_col = "LGE Burden 5SD"
+    sex_col = "Female"
 
-### 完整执行流程
-```python
-# 1. 数据准备
-data = prepare_endpoint_data(your_dataframe)
-descriptive_analysis(data)
+    covariates = [
+        "Age at CMR",
+        "BMI",
+        "DM",
+        "HTN",
+        "HLP",
+        "AF",
+        "NYHA Class",
+        "LVEDVi",
+        "LVEF",
+        "LV Mass Index",
+        "RVEDVi",
+        "RVEF",
+        "LA EF",
+        "LAVi",
+        "MRF (%)",
+        "Sphericity Index",
+        "Relative Wall Thickness",
+        "MV Annular Diameter",
+        "Beta Blocker",
+        "ACEi/ARB/ARNi",
+        "Aldosterone Antagonist",
+        "AAD",
+        "CRT",
+        "QRS",
+        "QTc",
+        "Cockcroft-Gault Creatinine Clearance (mL/min)",
+        "ICD",
+    ]
 
-# 2. RCS建模
-data_rcs, rcs_column_names = apply_rcs_transform(data, 'lge_percent', lge_knots)
-data_rcs['sex_male'] = (data_rcs['sex'] == 'Male').astype(int)
-cox_model, model_data, model_covars = fit_cox_model_with_rcs(data_rcs, rcs_column_names)
+    # 2) 拟合 Cox + RCS + 性别交互
+    #    你可以调 df_rcs 或指定 knots（例如按 5/35/65/95 分位）
+    df_rcs = 4
+    knots = None  # 例如：np.percentile(df[lge_col].dropna(), [5, 35, 65, 95])[1:-1]  # patsy::cr 的 knots 是“内部”结点
 
-# 3. 风险曲线生成
-lge_grid, female_risk_curve, male_risk_curve = generate_risk_curves(cox_model, data_rcs)
+    cph, feat_names, fit_df = fit_cox_rcs_interaction(
+        df,
+        time_col,
+        event_col,
+        lge_col,
+        sex_col,
+        covariates=covariates,
+        df_rcs=df_rcs,
+        knots=knots,
+    )
+    print("\n=== Cox model summary ===")
+    print(cph.summary)
 
-# 4. 阈值确定
-female_cutoffs = find_risk_based_cutoffs(lge_grid, female_risk_curve, [0.03, 0.10])
-male_cutoffs = find_risk_based_cutoffs(lge_grid, male_risk_curve, [0.03, 0.10])
+    # 3) 画 HR–LGE 曲线（男/女各一条）
+    #    网格范围建议覆盖 LGE 的 1~99 分位
+    q1, q99 = np.percentile(df[lge_col].dropna(), [1, 99])
+    lge_grid = np.linspace(q1, q99, 200)
 
-# 5. 统计检验
-interaction_p = test_sex_lge_interaction(cox_model)
-female_ci, male_ci, female_boot, male_boot = bootstrap_cutoffs(data_rcs, fit_cox_model_with_rcs)
+    # 协变量在绘图时的固定值（平均/众数）；若不指定，默认 0
+    cov_means = None
+    if covariates:
+        cov_means = {}
+        for c in covariates:
+            if df[c].dtype.kind in "ifu":
+                cov_means[c] = float(np.nanmean(df[c]))
+            else:
+                # 类别/布尔，取众数或0
+                try:
+                    cov_means[c] = df[c].mode(dropna=True).iat[0]
+                except Exception:
+                    cov_means[c] = 0.0
 
-# 6. 验证和可视化
-validation_results = validate_stratification(data, female_cutoffs_vals, male_cutoffs_vals)
-final_visualization(lge_grid, female_risk_curve, male_risk_curve, 
-                   female_cutoffs_vals, male_cutoffs_vals, [0.03, 0.10])
-```
+    # 男性曲线
+    m_hr, m_lo, m_hi, ref_val_m = hr_curve_with_ci(
+        cph,
+        feat_names,
+        lge_grid,
+        sex_value=1,
+        ref_value=None,
+        df_rcs=df_rcs,
+        knots=knots,
+        covariates_means=cov_means,
+    )
+    # 女性曲线
+    f_hr, f_lo, f_hi, ref_val_f = hr_curve_with_ci(
+        cph,
+        feat_names,
+        lge_grid,
+        sex_value=0,
+        ref_value=None,
+        df_rcs=df_rcs,
+        knots=knots,
+        covariates_means=cov_means,
+    )
 
-这个完整框架提供了所有必要的分析步骤。根据您的具体数据情况，可能需要调整某些参数（如协变量列表、时间窗、目标风险水平等）。
+    # 4) 曲线法：给出候选“阈值”（最多两个）
+    male_thr_curve = suggest_thresholds_from_curve(
+        lge_grid, m_hr, m_lo, m_hi, min_hr=1.2, smooth=7
+    )
+    female_thr_curve = suggest_thresholds_from_curve(
+        lge_grid, f_hr, f_lo, f_hi, min_hr=1.2, smooth=7
+    )
+
+    print("\n=== Curve-based candidate thresholds ===")
+    print(
+        f"Male   (ref={ref_val_m:.2f}): {['{:.2f}'.format(t) for t in male_thr_curve]}"
+    )
+    print(
+        f"Female (ref={ref_val_f:.2f}): {['{:.2f}'.format(t) for t in female_thr_curve]}"
+    )
+
+    # 5) 三分法：按性别做两切点网格搜索（AIC最优）
+    #    默认候选分位：20,30,40,50,60,70,80（可按需加密）
+    tri_best = three_cut_grid_search_by_sex(
+        df,
+        time_col,
+        event_col,
+        lge_col,
+        sex_col,
+        covariates=covariates,
+        candidate_q=(20, 30, 40, 50, 60, 70, 80),
+    )
+    print("\n=== Three-group AIC-best thresholds ===")
+    for sex, (c1, c2, aic) in tri_best.items():
+        tag = "Male" if sex == 1 else "Female"
+        if np.isfinite(aic):
+            print(f"{tag}: cut1={c1:.2f}, cut2={c2:.2f}, AIC={aic:.2f}")
+        else:
+            print(f"{tag}: insufficient data for grid search.")
+
+    # 6) 绘图（带阈值竖线，图例保留两位小数）
+    male_lines = male_thr_curve or [
+        tri_best.get(1, (np.nan, np.nan, np.nan))[0],
+        tri_best.get(1, (np.nan, np.nan, np.nan))[1],
+    ]
+    male_lines = [t for t in male_lines if t is not None and np.isfinite(t)]
+    female_lines = female_thr_curve or [
+        tri_best.get(0, (np.nan, np.nan, np.nan))[0],
+        tri_best.get(0, (np.nan, np.nan, np.nan))[1],
+    ]
+    female_lines = [t for t in female_lines if t is not None and np.isfinite(t)]
+
+    plot_hr_curves(
+        lge_grid,
+        male_curve=m_hr,
+        female_curve=f_hr,
+        male_ci=(m_lo, m_hi),
+        female_ci=(f_lo, f_hi),
+        male_thresh=male_lines[:2],
+        female_thresh=female_lines[:2],
+        title="HR vs LGE by Sex (RCS interaction)",
+    )
+
+    print("\nDone.")
