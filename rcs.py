@@ -316,50 +316,81 @@ def suggest_thresholds_from_curve(lge_grid, hr, ci_lo, ci_hi, min_hr=1.2, smooth
         if np.any(valid2):
             idx = int(np.where(valid2)[0][0])
             candidates.append(float(lge_grid[idx]))
+    # Final fallback: take the grid point with maximal smoothed HR
+    if not candidates:
+        try:
+            idx_max = int(np.nanargmax(hr_s))
+            if np.isfinite(hr_s[idx_max]):
+                candidates.append(float(lge_grid[idx_max]))
+        except Exception:
+            pass
     return candidates
 
 
 def aic_of_three_groups(df, time_col, event_col, cut1, cut2, lge_col, covariates=None):
-    tmp = df[[time_col, event_col, lge_col] + (covariates or [])].dropna().copy()
+    tmp_base = df[[time_col, event_col, lge_col]].copy().dropna()
     # Guard against invalid or degenerate cuts
     if not np.isfinite(cut1) or not np.isfinite(cut2) or cut2 <= cut1:
         raise ValueError("invalid cut points")
 
-    tmp["LGE_3g"] = pd.cut(
-        tmp[lge_col], bins=[-np.inf, cut1, cut2, np.inf], labels=["low", "mid", "high"]
+    tmp_base["LGE_3g"] = pd.cut(
+        tmp_base[lge_col], bins=[-np.inf, cut1, cut2, np.inf], labels=["low", "mid", "high"]
     )
 
     # Ensure all bins have data and reasonable sample sizes to avoid separation
-    counts = tmp["LGE_3g"].value_counts(dropna=False)
-    if (counts.get("mid", 0) < 3) or (counts.get("high", 0) < 3):
+    counts = tmp_base["LGE_3g"].value_counts(dropna=False)
+    if (counts.get("mid", 0) < 2) or (counts.get("high", 0) < 2):
         raise ValueError("insufficient samples in mid/high bins")
-    if tmp[event_col].nunique() < 2:
+    if tmp_base[event_col].nunique() < 2:
         raise ValueError("no event variation")
 
-    grp = pd.get_dummies(tmp["LGE_3g"], drop_first=True)  # columns: mid, high
+    grp = pd.get_dummies(tmp_base["LGE_3g"], drop_first=True)  # columns: mid, high
 
     # Skip combinations with near-complete separation in mid/high conditional on event
-    ev_mask = tmp[event_col].astype(bool).values
+    ev_mask = tmp_base[event_col].astype(bool).values
     for col in grp.columns:
         v1 = float(np.nanvar(grp.loc[ev_mask, col].values)) if ev_mask.any() else 0.0
         v0 = float(np.nanvar(grp.loc[~ev_mask, col].values)) if (~ev_mask).any() else 0.0
-        if v1 < 1e-6 or v0 < 1e-6:
+        if v1 < 1e-8 or v0 < 1e-8:
             raise ValueError("potential complete separation")
 
     X = grp
     if covariates:
-        X = pd.concat([X, tmp[covariates]], axis=1)
+        try:
+            cov_df = _numeric_covariates(df[covariates])
+            # Fill missing covariates with per-column medians to avoid row drops
+            cov_df = cov_df.apply(
+                lambda s: pd.to_numeric(s, errors="coerce").fillna(
+                    np.nanmedian(pd.to_numeric(s, errors="coerce").values)
+                ),
+                axis=0,
+            )
+            X = pd.concat([X, cov_df.loc[tmp_base.index]], axis=1)
+        except Exception:
+            pass
 
-    # Use ridge penalization to stabilize AIC under quasi-separation
-    cph = CoxPHFitter(penalizer=1.0)
-    cph.fit(
-        pd.concat([tmp[[time_col, event_col]], X], axis=1),
-        duration_col=time_col,
-        event_col=event_col,
-        show_progress=False,
-        robust=True,
-    )
-    return cph.AIC_
+    fit_df = pd.concat([tmp_base[[time_col, event_col]], X], axis=1)
+
+    # Use stronger ridge penalization and robust variance to stabilize AIC
+    cph = CoxPHFitter(penalizer=2.0)
+    try:
+        cph.fit(
+            fit_df,
+            duration_col=time_col,
+            event_col=event_col,
+            show_progress=False,
+            robust=True,
+        )
+    except Exception:
+        cph = CoxPHFitter(penalizer=5.0)
+        cph.fit(
+            fit_df,
+            duration_col=time_col,
+            event_col=event_col,
+            show_progress=False,
+            robust=True,
+        )
+    return float(cph.AIC_)
 
 
 def three_cut_grid_search_by_sex(
@@ -372,9 +403,8 @@ def three_cut_grid_search_by_sex(
     candidate_q=(20, 30, 40, 50, 60, 70, 80),
 ):
     out = {}
-    dat = (
-        df[[time_col, event_col, lge_col, sex_col] + (covariates or [])].dropna().copy()
-    )
+    # Only require essential columns here to keep candidate grid broad; covariates are handled inside AIC fit
+    dat = df[[time_col, event_col, lge_col, sex_col]].dropna().copy()
     dat[event_col] = (dat[event_col].astype(int) > 0).astype(int)
     dat["Sex_bin"] = dat[sex_col].astype(int)
 
@@ -391,6 +421,12 @@ def three_cut_grid_search_by_sex(
         if qs.size < 2:
             out[sex] = (np.nan, np.nan, np.nan)
             continue
+        try:
+            print(
+                f"[grid] {'Male' if sex==0 else 'Female'}: n={len(sub)}, events={int(sub[event_col].sum())}, unique_LGE={np.unique(vals).size}, qs={[f'{q:.2f}' for q in qs]}"
+            )
+        except Exception:
+            pass
         best = (np.nan, np.nan, np.inf)
         for i in range(len(qs)):
             for j in range(i + 1, len(qs)):
