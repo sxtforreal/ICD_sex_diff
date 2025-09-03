@@ -117,8 +117,38 @@ def _clean_design_matrix(dfX, verbose=True):
     if dup_cols:
         print(f"[clean] drop duplicate cols: {dup_cols}")
         X = X.drop(columns=dup_cols)
+    # Drop highly correlated columns to reduce ill-conditioning
+    if X.shape[1] >= 2:
+        try:
+            corr = X.fillna(0.0).corr().abs()
+            upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+            to_drop = [col for col in upper.columns if (upper[col] >= 0.995).any()]
+            if to_drop:
+                print(f"[clean] drop high-corr cols (|r|>=0.995): {to_drop}")
+                X = X.drop(columns=to_drop, errors="ignore")
+        except Exception:
+            pass
 
     return X
+
+
+def _drop_separation_features(X: pd.DataFrame, y: pd.Series, verbose: bool = True) -> pd.DataFrame:
+    """Drop features showing no variance within either event or non-event group (risk of separation)."""
+    try:
+        yy = pd.to_numeric(y, errors="coerce").fillna(0).astype(int).values.astype(bool)
+        if yy.sum() == 0 or (~yy).sum() == 0:
+            return X
+        to_drop = []
+        for col in X.columns:
+            v1 = float(np.nanvar(pd.to_numeric(X.loc[yy, col], errors="coerce").values))
+            v0 = float(np.nanvar(pd.to_numeric(X.loc[~yy, col], errors="coerce").values))
+            if v1 < 1e-10 or v0 < 1e-10:
+                to_drop.append(col)
+        if to_drop and verbose:
+            print(f"[clean] drop potential-separation cols: {to_drop}")
+        return X.drop(columns=to_drop, errors="ignore")
+    except Exception:
+        return X
 
 
 # ---------------------- 拟合 & 预测 ----------------------
@@ -156,17 +186,31 @@ def fit_cox_rcs_interaction(
         X = pd.concat([X, cov_num], axis=1)
 
     X_clean = _clean_design_matrix(X)
+    # Remove features likely to cause perfect separation
+    X_clean = _drop_separation_features(X_clean, dat.loc[X_clean.index, event_col])
     fit_df = pd.concat([dat[[time_col, event_col]].loc[X_clean.index], X_clean], axis=1)
 
-    cph = CoxPHFitter(penalizer=(penalizer if use_penalizer else 0.0))
-    cph.fit(
-        fit_df,
-        duration_col=time_col,
-        event_col=event_col,
-        show_progress=False,
-        robust=True,
-    )
-    return cph, X_clean.columns.tolist(), fit_df
+    # Progressive penalization to mitigate convergence/overflow
+    last_err = None
+    for pen in ([penalizer, 1.0, 5.0] if use_penalizer else [0.0, 1.0, 5.0]):
+        try:
+            cph = CoxPHFitter(penalizer=float(pen))
+            import warnings as _warn
+            with _warn.catch_warnings():
+                _warn.simplefilter("ignore")
+                cph.fit(
+                    fit_df,
+                    duration_col=time_col,
+                    event_col=event_col,
+                    show_progress=False,
+                    robust=True,
+                )
+            return cph, X_clean.columns.tolist(), fit_df
+        except Exception as e:
+            last_err = e
+            continue
+    # If all attempts failed, re-raise the last error
+    raise last_err
 
 
 def make_lge_grid(x, n=200):
@@ -266,24 +310,54 @@ def suggest_thresholds_from_curve(lge_grid, hr, ci_lo, ci_hi, min_hr=1.2, smooth
                 candidates.append(lge_grid[idx])
             if len(candidates) >= 2:
                 break
+    # Fallbacks: relax criteria if no candidates found
+    if not candidates:
+        valid2 = (hr_s > max(1.05, min_hr - 0.1)) & (lo_s > 1.0)
+        if np.any(valid2):
+            idx = int(np.where(valid2)[0][0])
+            candidates.append(float(lge_grid[idx]))
     return candidates
 
 
 def aic_of_three_groups(df, time_col, event_col, cut1, cut2, lge_col, covariates=None):
     tmp = df[[time_col, event_col, lge_col] + (covariates or [])].dropna().copy()
+    # Guard against invalid or degenerate cuts
+    if not np.isfinite(cut1) or not np.isfinite(cut2) or cut2 <= cut1:
+        raise ValueError("invalid cut points")
+
     tmp["LGE_3g"] = pd.cut(
         tmp[lge_col], bins=[-np.inf, cut1, cut2, np.inf], labels=["low", "mid", "high"]
     )
-    grp = pd.get_dummies(tmp["LGE_3g"], drop_first=True)  # mid, high
+
+    # Ensure all bins have data and reasonable sample sizes to avoid separation
+    counts = tmp["LGE_3g"].value_counts(dropna=False)
+    if (counts.get("mid", 0) < 3) or (counts.get("high", 0) < 3):
+        raise ValueError("insufficient samples in mid/high bins")
+    if tmp[event_col].nunique() < 2:
+        raise ValueError("no event variation")
+
+    grp = pd.get_dummies(tmp["LGE_3g"], drop_first=True)  # columns: mid, high
+
+    # Skip combinations with near-complete separation in mid/high conditional on event
+    ev_mask = tmp[event_col].astype(bool).values
+    for col in grp.columns:
+        v1 = float(np.nanvar(grp.loc[ev_mask, col].values)) if ev_mask.any() else 0.0
+        v0 = float(np.nanvar(grp.loc[~ev_mask, col].values)) if (~ev_mask).any() else 0.0
+        if v1 < 1e-6 or v0 < 1e-6:
+            raise ValueError("potential complete separation")
+
     X = grp
     if covariates:
         X = pd.concat([X, tmp[covariates]], axis=1)
-    cph = CoxPHFitter()
+
+    # Use ridge penalization to stabilize AIC under quasi-separation
+    cph = CoxPHFitter(penalizer=1.0)
     cph.fit(
         pd.concat([tmp[[time_col, event_col]], X], axis=1),
         duration_col=time_col,
         event_col=event_col,
         show_progress=False,
+        robust=True,
     )
     return cph.AIC_
 
@@ -309,7 +383,14 @@ def three_cut_grid_search_by_sex(
         if sub.empty or sub[event_col].sum() == 0:
             out[sex] = (np.nan, np.nan, np.nan)
             continue
-        qs = np.percentile(sub[lge_col].values, candidate_q)
+        vals = pd.to_numeric(sub[lge_col], errors="coerce").dropna().values
+        if vals.size < 5:
+            out[sex] = (np.nan, np.nan, np.nan)
+            continue
+        qs = np.unique(np.percentile(vals, candidate_q))
+        if qs.size < 2:
+            out[sex] = (np.nan, np.nan, np.nan)
+            continue
         best = (np.nan, np.nan, np.inf)
         for i in range(len(qs)):
             for j in range(i + 1, len(qs)):
@@ -438,23 +519,23 @@ if __name__ == "__main__":
                 except Exception:
                     cov_means[c] = 0.0
 
-    # 男性曲线
+    # 男性曲线（Sex_bin=0）
     m_hr, m_lo, m_hi, ref_val_m = hr_curve_with_ci(
         cph,
         feat_names,
         lge_grid,
-        sex_value=1,
+        sex_value=0,
         ref_value=None,
         df_rcs=df_rcs,
         knots=knots,
         covariates_means=cov_means,
     )
-    # 女性曲线
+    # 女性曲线（Sex_bin=1）
     f_hr, f_lo, f_hi, ref_val_f = hr_curve_with_ci(
         cph,
         feat_names,
         lge_grid,
-        sex_value=0,
+        sex_value=1,
         ref_value=None,
         df_rcs=df_rcs,
         knots=knots,
@@ -490,7 +571,7 @@ if __name__ == "__main__":
     )
     print("\n=== Three-group AIC-best thresholds ===")
     for sex, (c1, c2, aic) in tri_best.items():
-        tag = "Male" if sex == 1 else "Female"
+        tag = "Male" if sex == 0 else "Female"
         if np.isfinite(aic):
             print(f"{tag}: cut1={c1:.2f}, cut2={c2:.2f}, AIC={aic:.2f}")
         else:
@@ -498,13 +579,13 @@ if __name__ == "__main__":
 
     # 6) 绘图（带阈值竖线，图例保留两位小数）
     male_lines = male_thr_curve or [
-        tri_best.get(1, (np.nan, np.nan, np.nan))[0],
-        tri_best.get(1, (np.nan, np.nan, np.nan))[1],
+        tri_best.get(0, (np.nan, np.nan, np.nan))[0],
+        tri_best.get(0, (np.nan, np.nan, np.nan))[1],
     ]
     male_lines = [t for t in male_lines if t is not None and np.isfinite(t)]
     female_lines = female_thr_curve or [
-        tri_best.get(0, (np.nan, np.nan, np.nan))[0],
-        tri_best.get(0, (np.nan, np.nan, np.nan))[1],
+        tri_best.get(1, (np.nan, np.nan, np.nan))[0],
+        tri_best.get(1, (np.nan, np.nan, np.nan))[1],
     ]
     female_lines = [t for t in female_lines if t is not None and np.isfinite(t)]
 
