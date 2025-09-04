@@ -400,20 +400,30 @@ def plot_hr_curves(
     title="HR vs Marker (RCS + Female interaction)",
     xlabel="Marker",
 ):
+    male_color = "#1f77b4"
+    female_color = "#ff7f0e"
+
     plt.figure(figsize=(7.8, 5.0))
-    plt.plot(x_grid, male_curve, label="Male HR")
-    plt.fill_between(x_grid, male_ci[0], male_ci[1], alpha=0.25)
-    plt.plot(x_grid, female_curve, label="Female HR")
-    plt.fill_between(x_grid, female_ci[0], female_ci[1], alpha=0.25)
-    plt.axhline(1.0, linestyle="--", linewidth=1)
 
-    def add_vlines(ths, lab):
-        for t in ths or []:
-            plt.axvline(t, ls=":", lw=1.5)
-            plt.plot([], [], label=f"{lab} thr: {t:.2f}")  # 2 decimals
+    plt.plot(x_grid, male_curve, label="Male HR", color=male_color)
+    plt.fill_between(x_grid, male_ci[0], male_ci[1], alpha=0.25, color=male_color)
 
-    add_vlines(male_thresh, "Male")
-    add_vlines(female_thresh, "Female")
+    plt.plot(x_grid, female_curve, label="Female HR", color=female_color)
+    plt.fill_between(x_grid, female_ci[0], female_ci[1], alpha=0.25, color=female_color)
+
+    plt.axhline(1.0, linestyle="--", linewidth=1, color="gray")
+
+    def add_vlines(ths, lab, color):
+        if not ths:
+            return
+        for t in ths:
+            plt.axvline(t, ls=":", lw=1.5, color=color)
+        plt.plot([], [], ls=":", lw=1.5, color=color,
+                 label=f"{lab} thr: " + ", ".join(f"{t:.2f}" for t in ths))
+
+    add_vlines(male_thresh, "Male", male_color)
+    add_vlines(female_thresh, "Female", female_color)
+
     plt.xlabel(xlabel)
     plt.ylabel("Hazard Ratio")
     plt.title(title)
