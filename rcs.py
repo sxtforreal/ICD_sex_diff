@@ -13,7 +13,6 @@ from cox import load_dataframes
 def prepare_df_for_model(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Standardize NYHA
     if "NYHA Class" in df.columns:
         nyha = (
             df["NYHA Class"]
@@ -36,7 +35,6 @@ def prepare_df_for_model(df: pd.DataFrame) -> pd.DataFrame:
             "float64"
         )
 
-    # Nullable integer/float/boolean -> float64
     nullable_mask = df.dtypes.astype(str).str.contains(
         r"^(Int64|Float64|boolean)$", case=False
     )
@@ -45,6 +43,19 @@ def prepare_df_for_model(df: pd.DataFrame) -> pd.DataFrame:
         df[nullable_cols] = df[nullable_cols].apply(
             lambda s: pd.to_numeric(s, errors="coerce").astype("float64")
         )
+
+    if "PE_Time" in df.columns and "VT/VF/SCD" in df.columns:
+        n_neg = (df["PE_Time"] < 0).sum()
+        if n_neg:
+            print(f"[prepare] drop {n_neg} rows with negative PE_Time")
+        df = df[df["PE_Time"] >= 0].copy()
+
+        mask = (df["VT/VF/SCD"] == 1) & (df["PE_Time"] == 0)
+        n_zero = mask.sum()
+        if n_zero:
+            print(f"[prepare] bump {n_zero} rows with event=1 and PE_Time=0 to 1")
+        df.loc[mask, "PE_Time"] = 1
+
     return df
 
 
