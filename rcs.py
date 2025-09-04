@@ -1,18 +1,19 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from lifelines import CoxPHFitter
+from lifelines import CoxPHFitter, KaplanMeierFitter
+from lifelines.statistics import logrank_test
 from patsy import dmatrix
 from scipy.stats import chi2
 
 from cox import load_dataframes
 
 
-# ---------------------- 数据准备 ----------------------
+# ---------------------- Data preparation ----------------------
 def prepare_df_for_model(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # 统一 NYHA
+    # Standardize NYHA
     if "NYHA Class" in df.columns:
         nyha = (
             df["NYHA Class"]
@@ -35,7 +36,7 @@ def prepare_df_for_model(df: pd.DataFrame) -> pd.DataFrame:
             "float64"
         )
 
-    # 可空整型/浮点/布尔 -> float64
+    # Nullable integer/float/boolean -> float64
     nullable_mask = df.dtypes.astype(str).str.contains(
         r"^(Int64|Float64|boolean)$", case=False
     )
@@ -48,15 +49,16 @@ def prepare_df_for_model(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _dedup_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # 保留第一次出现的同名列
+    # Keep the first occurrence of duplicated column names
     return df.loc[:, ~df.columns.duplicated()].copy()
 
 
-# ---------------------- RCS 相关 ----------------------
+# ---------------------- RCS related ----------------------
 def build_rcs_basis(x, df_rcs=4, knots=None, lower_bound=None, upper_bound=None):
     """
-    自然三次样条基函数（不含截距）。注意：df_rcs 是样条的自由度（基函数数量），
-    若提供 knots（仅 interior knots），patsy 会忽略 df 参数。
+    Natural cubic spline basis (without intercept). Note: df_rcs is the
+    degrees of freedom (number of basis functions). If knots (interior knots
+    only) are provided, patsy will ignore the df parameter.
     """
     x = np.asarray(x, dtype=float)
     if knots is not None:
@@ -80,17 +82,17 @@ def choose_rcs_spec_from_quantiles(
     series, df_rcs=4, lb_q=0.0, ub_q=0.95, interior_q=None
 ):
     """
-    用分位数选择 interior knots 和边界（Harrell 建议的思路）：
-    - 边界默认 5% / 95% 分位
-    - interior knots：在 [lb, ub] 上按分位“等距”布点（数量 = df_rcs - 2）
-      若提供 interior_q（列表，取值在 (0,1)），则按给定分位数取。
-      例如 df_rcs=4 -> 2 个 interior knots -> 建议在 35% 与 65%。
+    Choose interior knots and bounds by quantiles (Harrell's recommendation):
+    - Bounds default to the 5% / 95% quantiles
+    - Interior knots: equally spaced by quantiles over [lb, ub]
+      (number = df_rcs - 2). If interior_q (list in (0,1)) is provided,
+      use it. For example, df_rcs=4 -> 2 interior knots -> suggest 35% and 65%.
     """
     s = pd.to_numeric(pd.Series(series).dropna(), errors="coerce")
     lb = float(s.quantile(lb_q))
     ub = float(s.quantile(ub_q))
     if not np.isfinite(lb) or not np.isfinite(ub) or ub <= lb:
-        # 兜底：给一个最小跨度
+        # Fallback: enforce a minimal span
         m = float(np.nanmean(s))
         span = max(1.0, abs(m) * 0.1, 0.1)
         lb, ub = m - span, m + span
@@ -102,23 +104,23 @@ def choose_rcs_spec_from_quantiles(
         if n_interior == 0:
             qs = []
         else:
-            # 在 [lb_q, ub_q] 之间“等距”取 n_interior 个分位（不含两端）
+            # Take n_interior quantiles equally spaced in [lb_q, ub_q] (excluding endpoints)
             qs = np.linspace(lb_q, ub_q, n_interior + 2)[1:-1].tolist()
-            # 特例修正：df=4 时更贴近惯例 35%/65%
+            # Special-case tweak: for df=4, use the conventional 35%/65%
             if df_rcs == 4:
                 qs = [0.35, 0.65]
 
     ks = [float(s.quantile(q)) for q in qs]
-    # 保证 knots 落在边界内部
+    # Ensure knots lie within bounds
     eps = 1e-10
     ks = [min(max(k, lb + eps), ub - eps) for k in ks]
     return ks, lb, ub
 
 
 def add_interactions(X_rcs: pd.DataFrame, sex_series, sex_col="Female"):
-    # 保证性别是 0/1
+    # Ensure sex is 0/1
     sex_bin = pd.Series(sex_series).astype(float)
-    # 若不是 0/1，尝试阈值化：>0 视为 1
+    # If not 0/1, thresholdize: values > 0 are treated as 1
     if not set(pd.unique(sex_bin.dropna())).issubset({0.0, 1.0}):
         sex_bin = (sex_bin > 0).astype(float)
     X_int = X_rcs.mul(sex_bin.values.reshape(-1, 1))
@@ -126,7 +128,7 @@ def add_interactions(X_rcs: pd.DataFrame, sex_series, sex_col="Female"):
     return X_int, sex_bin.astype(int)
 
 
-# ---------------------- 数据清理 ----------------------
+# ---------------------- Data cleaning ----------------------
 def _numeric_covariates(df_cov: pd.DataFrame) -> pd.DataFrame:
     if df_cov is None or df_cov.empty:
         return pd.DataFrame(index=df_cov.index if df_cov is not None else None)
@@ -136,7 +138,7 @@ def _numeric_covariates(df_cov: pd.DataFrame) -> pd.DataFrame:
     if not other.empty:
         other = pd.get_dummies(other, drop_first=True, dummy_na=False)
     X = pd.concat([num, boo, other], axis=1).apply(pd.to_numeric, errors="coerce")
-    # 去除常量列
+    # Drop constant columns
     nunique = X.nunique(dropna=False)
     const_cols = nunique[nunique <= 1].index.tolist()
     if const_cols:
@@ -151,7 +153,7 @@ def _clean_design_matrix(dfX, verbose=True):
     if verbose and bad_rows.sum() > 0:
         print(f"[clean] drop rows with non-finite values: {bad_rows.sum()}")
     X = X.loc[~bad_rows]
-    # 再次去掉常量列
+    # Drop constant columns again
     nunique = X.nunique(dropna=False)
     const_cols = nunique[nunique <= 1].index.tolist()
     if const_cols:
@@ -179,7 +181,7 @@ def _drop_separation_features(X: pd.DataFrame, y: pd.Series, verbose=True):
     return X2
 
 
-# ---------------------- 拟合 & 诊断 ----------------------
+# ---------------------- Fitting & diagnostics ----------------------
 def fit_cox_rcs_interaction(
     df,
     time_col,
@@ -209,7 +211,7 @@ def fit_cox_rcs_interaction(
         ks, lb, ub = knots, lower_bound, upper_bound
     print(f"[rcs] knots={ks}, bounds=({lb:.2f},{ub:.2f})")
 
-    # 设计矩阵
+    # Design matrix
     X_rcs = build_rcs_basis(
         dat[x_col].values, df_rcs=df_rcs, knots=ks, lower_bound=lb, upper_bound=ub
     )
@@ -250,34 +252,34 @@ def fit_cox_rcs_interaction(
 def test_nonlinearity_LRT(
     df, time_col, event_col, x_col, covariates, df_rcs, ks, lb, ub, penalizer=0.1
 ):
-    # 基础表
+    # Base table
     base = df[[time_col, event_col, x_col]].copy()
     if covariates:
         base = pd.concat([base, _numeric_covariates(df[covariates])], axis=1)
     base = base.dropna()
     base = _dedup_columns(base)
 
-    # 线性
+    # Linear model
     lin_df = base.rename(columns={x_col: "x"})
     lin_df[event_col] = lin_df[event_col].astype(int)
     cph_lin = CoxPHFitter(penalizer=penalizer)
     cph_lin.fit(lin_df, duration_col=time_col, event_col=event_col, robust=True)
 
-    # RCS —— 关键：对齐索引
+    # RCS - key: align indices
     rcs = build_rcs_basis(
         lin_df["x"].values, df_rcs=df_rcs, knots=ks, lower_bound=lb, upper_bound=ub
     )
-    rcs.index = lin_df.index  # ★★★ 对齐到 lin_df 的 index
+    rcs.index = lin_df.index  # Align to the index of lin_df
 
     others = lin_df.drop(columns=["x", time_col, event_col])
     rcs_df = pd.concat([lin_df[[time_col, event_col]], rcs, others], axis=1)
-    rcs_df = _dedup_columns(rcs_df)  # 保险
+    rcs_df = _dedup_columns(rcs_df)  # Safety: ensure unique columns
 
-    # 再跑 RCS 模型
+    # Fit the RCS model
     cph_rcs = CoxPHFitter(penalizer=penalizer)
     cph_rcs.fit(rcs_df, duration_col=time_col, event_col=event_col, robust=True)
 
-    # LRT
+    # Likelihood ratio test (nonlinearity)
     from scipy.stats import chi2
 
     LL_lin, LL_rcs = cph_lin.log_likelihood_, cph_rcs.log_likelihood_
@@ -288,7 +290,7 @@ def test_nonlinearity_LRT(
     return stat, p
 
 
-# ---------------------- 预测曲线 ----------------------
+# ---------------------- Predicted curves ----------------------
 def hr_curve_with_ci(
     cph,
     feature_names,
@@ -316,7 +318,7 @@ def hr_curve_with_ci(
         [basis_all, pd.Series([sex_value] * len(basis_all), name=sex_col), inter_all],
         axis=1,
     )
-    # 对于模型里存在、此处没给值的协变量，填均值（或 0）
+    # For model covariates not provided here, fill with means (or 0)
     extra_feats = [f for f in feature_names if f not in Xg.columns]
     means = covariates_means or {f: 0.0 for f in extra_feats}
     for f in extra_feats:
@@ -348,13 +350,14 @@ def hr_curve_with_ci(
     return hr, lo, hi, ref_value
 
 
-# ---------------------- 阈值与绘图 ----------------------
+# ---------------------- Thresholds and plotting ----------------------
 def suggest_thresholds_from_curve(
     x_grid, hr, ci_lo, ci_hi, min_hr=1.2, smooth=7, max_n=2
 ):
     """
-    返回最多两个“高风险起点”阈值：HR 平滑后 > min_hr 且下界 > 1 的区间的起点。
-    这便于 High/Med/Low 的三段式解释。
+    Return up to two "high-risk start" thresholds: the starting indices of
+    intervals where the smoothed HR > min_hr AND the lower CI > 1. This
+    supports a three-segment interpretation (High/Med/Low).
     """
 
     def moving_avg(a, w):
@@ -364,7 +367,7 @@ def suggest_thresholds_from_curve(
     lo_s = moving_avg(ci_lo, smooth)
     valid = (hr_s > min_hr) & (lo_s > 1.0)
 
-    # 找到 valid 的“岛屿”起点
+    # Find the start indices of contiguous "islands" of validity
     starts = []
     prev = False
     for i, v in enumerate(valid):
@@ -396,7 +399,7 @@ def plot_hr_curves(
     def add_vlines(ths, lab):
         for t in ths or []:
             plt.axvline(t, ls=":", lw=1.5)
-            plt.plot([], [], label=f"{lab} thr: {t:.2f}")  # 2 位小数（你的偏好）
+            plt.plot([], [], label=f"{lab} thr: {t:.2f}")  # 2 decimals
 
     add_vlines(male_thresh, "Male")
     add_vlines(female_thresh, "Female")
@@ -404,6 +407,93 @@ def plot_hr_curves(
     plt.ylabel("Hazard Ratio")
     plt.title(title)
     plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def km_plot_and_logrank(
+    df: pd.DataFrame,
+    time_col: str,
+    event_col: str,
+    x_col: str,
+    sex_col: str,
+    male_thresh=None,
+    female_thresh=None,
+    title_prefix: str = "KM by threshold",
+):
+    """
+    Plot Kaplan-Meier curves and perform logrank tests by sex using the
+    recommended thresholds. If a sex-specific threshold is missing or a group
+    is empty, that sex will be skipped.
+    """
+    dat = df[[time_col, event_col, x_col, sex_col]].copy()
+    dat = dat.dropna(subset=[time_col, event_col, x_col, sex_col])
+    dat = dat[dat[time_col] > 0].copy()
+    dat[event_col] = dat[event_col].astype(int)
+
+    def _first_thr(th):
+        if th is None:
+            return None
+        if isinstance(th, (list, tuple, np.ndarray)):
+            if len(th) == 0:
+                return None
+            return float(th[0])
+        try:
+            return float(th)
+        except Exception:
+            return None
+
+    thr_m = _first_thr(male_thresh)
+    thr_f = _first_thr(female_thresh)
+
+    sexes = []
+    if thr_m is not None:
+        sexes.append((0, thr_m, "Male"))
+    if thr_f is not None:
+        sexes.append((1, thr_f, "Female"))
+
+    if not sexes:
+        print("[KM] No thresholds provided; skipping KM plots.")
+        return
+
+    n = len(sexes)
+    fig, axes = plt.subplots(1, n, figsize=(7.5 * n, 5.2), sharey=True)
+    if n == 1:
+        axes = [axes]
+
+    for ax, (sex_value, thr, lab) in zip(axes, sexes):
+        sub = dat[dat[sex_col] == sex_value]
+        if sub.empty:
+            ax.set_title(f"{lab}: no data")
+            continue
+        low_mask = sub[x_col] < thr
+        high_mask = sub[x_col] >= thr
+
+        if low_mask.sum() == 0 or high_mask.sum() == 0:
+            ax.set_title(f"{lab}: group empty at thr={thr:.2f}")
+            continue
+
+        kmf_low = KaplanMeierFitter()
+        kmf_high = KaplanMeierFitter()
+
+        kmf_low.fit(sub[time_col][low_mask], event_observed=sub[event_col][low_mask], label=f"{lab} Low (<{thr:.2f})")
+        kmf_high.fit(sub[time_col][high_mask], event_observed=sub[event_col][high_mask], label=f"{lab} High (>={thr:.2f})")
+
+        kmf_low.plot(ax=ax, ci_show=True)
+        kmf_high.plot(ax=ax, ci_show=True)
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Survival probability")
+
+        res = logrank_test(
+            sub[time_col][low_mask],
+            sub[time_col][high_mask],
+            event_observed_A=sub[event_col][low_mask],
+            event_observed_B=sub[event_col][high_mask],
+        )
+        pval = res.p_value
+        ax.set_title(f"{title_prefix} - {lab} (thr={thr:.2f}, p={pval:.3g})")
+        ax.grid(True, alpha=0.3, linestyle=":")
+
     plt.tight_layout()
     plt.show()
 
@@ -431,7 +521,7 @@ if __name__ == "__main__":
         "MV Annular Diameter",
     ]
 
-    # knots / bounds：默认 5%~95%，df=4 -> interior 在 35%/65%
+    # knots / bounds: default 5%-95%; for df=4, interior at 35%/65%
     ks, lb, ub = choose_rcs_spec_from_quantiles(df[x_col], df_rcs=4)
 
     cph, feat_names, fit_df, spec = fit_cox_rcs_interaction(
@@ -448,7 +538,7 @@ if __name__ == "__main__":
     )
     print(cph.summary)
 
-    # 非线性检验（可选）
+    # Nonlinearity test (optional)
     _ = test_nonlinearity_LRT(
         df.dropna(subset=[time_col, event_col, x_col]),
         time_col,
@@ -463,7 +553,7 @@ if __name__ == "__main__":
 
     grid = np.linspace(spec["lb"], spec["ub"], 200)
 
-    # 用训练样本均值填充其他协变量（若有）
+    # Fill other covariates with training means (if any)
     cov_means = (
         fit_df[
             [
@@ -516,4 +606,16 @@ if __name__ == "__main__":
         female_thresh=female_thr,
         title="HR vs LGE (RCS + Female interaction)",
         xlabel="LGE Burden",
+    )
+
+    # KM plots and logrank tests by sex using recommended thresholds
+    km_plot_and_logrank(
+        df,
+        time_col=time_col,
+        event_col=event_col,
+        x_col=x_col,
+        sex_col=sex_col,
+        male_thresh=male_thr,
+        female_thresh=female_thr,
+        title_prefix="KM by LGE threshold",
     )
