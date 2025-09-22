@@ -436,7 +436,18 @@ def evaluate_two_stage_strategy(
     )
 
     # Time horizon = 75th percentile of observed times in training
-    t_hor = float(np.percentile(y_train["time"], 75)) if len(y_train) else 365.0
+    # Be robust to different sksurv structured array field names
+    def _get_surv_field_names(y_arr) -> Tuple[str, str]:
+        names = getattr(y_arr.dtype, "names", None)
+        if not names or len(names) < 2:
+            return "event", "time"
+        event_field = "event" if "event" in names else names[0]
+        time_candidates = [n for n in names if n != event_field]
+        time_field = "time" if "time" in names else time_candidates[0]
+        return event_field, time_field
+
+    evt_field, time_field = _get_surv_field_names(y_train)
+    t_hor = float(np.percentile(y_train[time_field], 75)) if len(y_train) else 365.0
     if not np.isfinite(t_hor) or t_hor <= 0:
         t_hor = 365.0
 
@@ -524,8 +535,9 @@ def evaluate_two_stage_strategy(
 
     # Evaluate C-index
     def _c_index(y, risk):
-        evt = y["event"].astype(bool)
-        tm = y["time"].astype(float)
+        e_field, t_field = _get_surv_field_names(y)
+        evt = y[e_field].astype(bool)
+        tm = y[t_field].astype(float)
         c = concordance_index_censored(evt, tm, risk)[0]
         return float(c)
 
