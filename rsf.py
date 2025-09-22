@@ -12,7 +12,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.inspection import permutation_importance
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 
-from sksurv.ensemble import RandomSurvivalForest
+from sksurv.linear_model import CoxPHSurvivalAnalysis
 from sksurv.metrics import concordance_index_censored
 from sksurv.util import Surv
 
@@ -106,7 +106,7 @@ def _plot_cindex_bars(metrics: Dict[str, float], output_dir: Optional[str]) -> N
     sns.barplot(x=labels, y=vals, hue=labels, ax=ax, palette="Set2", legend=False)
     ax.set_ylabel("C-index (test)")
     ax.set_ylim(0.0, 1.0)
-    ax.set_title("C-index comparison (RSF)")
+    ax.set_title("C-index comparison (CoxPH)")
     for i, v in enumerate(vals):
         if np.isfinite(v):
             ax.text(i, v + 0.02, f"{v:.3f}", ha="center", va="bottom", fontsize=10)
@@ -490,18 +490,14 @@ def _prepare_survival_xy(clean_df: pd.DataFrame,
     return X, y, feature_names
 
 
-def train_random_survival_forest(
+def train_coxph_model(
     clean_df: pd.DataFrame,
     test_size: float = 0.25,
     random_state: int = 42,
-    n_estimators: int = 500,
-    min_samples_split: int = 10,
-    min_samples_leaf: int = 5,
-    max_features: Optional[str] = "sqrt",
     output_dir: Optional[str] = None,
-) -> Tuple[RandomSurvivalForest, Dict[str, float], pd.Series]:
+) -> Tuple[CoxPHSurvivalAnalysis, Dict[str, float], pd.Series]:
     """
-    Train RSF on cleaned data and evaluate with concordance index on a hold-out test set.
+    Train CoxPH on cleaned data and evaluate with concordance index on a hold-out test set.
 
     Returns: (fitted model, metrics dict, feature_importances series)
     """
@@ -511,21 +507,19 @@ def train_random_survival_forest(
         X, y, test_size=test_size, random_state=random_state
     )
 
-    rsf = RandomSurvivalForest(
-        n_estimators=n_estimators,
-        min_samples_split=min_samples_split,
-        min_samples_leaf=min_samples_leaf,
-        max_features=max_features,
-        n_jobs=-1,
-        random_state=random_state,
-    )
-    rsf.fit(X_train, y_train)
+    model = CoxPHSurvivalAnalysis()
+    model.fit(X_train, y_train)
 
-    test_c_index = rsf.score(X_test, y_test)
-    # scikit-survival's RandomSurvivalForest does not implement feature_importances_.
+    # Use model's risk scores for C-index evaluation
+    try:
+        risk_scores = model.predict(X_test)
+    except Exception:
+        risk_scores = np.zeros(len(X_test), dtype=float)
+    e_field, t_field = _surv_field_names(y_test)
+    test_c_index = float(concordance_index_censored(y_test[e_field].astype(bool), y_test[t_field].astype(float), risk_scores)[0])
     # Use permutation importance on the hold-out set as a model-agnostic alternative.
     perm_result = permutation_importance(
-        rsf,
+        model,
         X_test,
         y_test,
         n_repeats=20,
@@ -549,7 +543,7 @@ def train_random_survival_forest(
         )
     except Exception:
         pass
-    return rsf, metrics, feat_imp
+    return model, metrics, feat_imp
 
 
 def _find_feature_groups(feature_names: List[str]) -> Tuple[List[str], List[str], Optional[str]]:
@@ -628,25 +622,39 @@ def _find_feature_groups(feature_names: List[str]) -> Tuple[List[str], List[str]
     return global_cols, local_cols, gating
 
 
-def _rsf_risk_at_time(model: RandomSurvivalForest, X: pd.DataFrame, t: float) -> np.ndarray:
-    """Risk score at time t as 1 - S(t)."""
+def _risk_at_time(model: object, X: pd.DataFrame, t: float) -> np.ndarray:
+    """Risk score at time t as 1 - S(t) when available; otherwise, scaled risk score.
+
+    For models supporting predict_survival_function (e.g., CoxPHSurvivalAnalysis), use 1 - S(t).
+    Fallback: use model.predict(X) and min-max scale to [0, 1] for comparability.
+    """
     if X.empty:
         return np.zeros(0, dtype=float)
+    # Preferred path: survival function available
     try:
-        surv = model.predict_survival_function(X)
-        s_at = np.array([sf(t) for sf in surv], dtype=float)
+        if hasattr(model, "predict_survival_function"):
+            surv = model.predict_survival_function(X)
+            s_at = np.array([sf(t) for sf in surv], dtype=float)
+            s_at = np.clip(s_at, 0.0, 1.0)
+            return 1.0 - s_at
     except Exception:
-        # Fallback: approximate using nearest available event time grid
-        times = getattr(model, "event_times_", None)
-        if times is None or len(times) == 0:
-            # As a last resort, use model.score ordering via leaf depth proxy (not ideal)
-            # Return zeros to avoid crashing
+        pass
+    # Fallback: use risk scores and scale to [0,1]
+    try:
+        scores = np.asarray(model.predict(X), dtype=float).ravel()
+        finite = np.isfinite(scores)
+        if not finite.any():
             return np.zeros(len(X), dtype=float)
-        idx = int(np.argmin(np.abs(times - float(t))))
-        surv = model.predict_survival_function(X)
-        s_at = np.array([sf(times[idx]) for sf in surv], dtype=float)
-    s_at = np.clip(s_at, 0.0, 1.0)
-    return 1.0 - s_at
+        s_min = float(np.nanmin(scores[finite]))
+        s_max = float(np.nanmax(scores[finite]))
+        if s_max > s_min:
+            scaled = (scores - s_min) / (s_max - s_min)
+        else:
+            scaled = np.zeros_like(scores)
+        scaled[~finite] = 0.0
+        return np.clip(scaled, 0.0, 1.0)
+    except Exception:
+        return np.zeros(len(X), dtype=float)
 
 
 def _surv_field_names(y_arr) -> Tuple[str, str]:
@@ -737,31 +745,24 @@ def _optimize_gate_quantiles(
             return None, None, {}
 
     # Fit inner models on X_tr
-    def _fit(X, y) -> Optional[RandomSurvivalForest]:
+    def _fit(X, y) -> Optional[CoxPHSurvivalAnalysis]:
         if X.shape[1] == 0:
             return None
-        rsf = RandomSurvivalForest(
-            n_estimators=500,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            max_features="sqrt",
-            n_jobs=-1,
-            random_state=random_state,
-        )
-        rsf.fit(X, y)
-        return rsf
+        model = CoxPHSurvivalAnalysis()
+        model.fit(X, y)
+        return model
 
     model_glob_in = _fit(X_tr[global_cols], y_tr) if have_global else None
     model_loc_in = _fit(X_tr[local_cols], y_tr) if have_local else None
 
     # Precompute validation risks
     risk_glob_val = (
-        _rsf_risk_at_time(model_glob_in, X_val[global_cols], time_horizon_days)
+        _risk_at_time(model_glob_in, X_val[global_cols], time_horizon_days)
         if model_glob_in is not None
         else np.zeros(len(X_val), dtype=float)
     )
     risk_loc_val = (
-        _rsf_risk_at_time(model_loc_in, X_val[local_cols], time_horizon_days)
+        _risk_at_time(model_loc_in, X_val[local_cols], time_horizon_days)
         if model_loc_in is not None
         else np.zeros(len(X_val), dtype=float)
     )
@@ -834,19 +835,12 @@ def analyze_benefit_subgroup(
 
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
-    def _fit(X, y) -> Optional[RandomSurvivalForest]:
+    def _fit(X, y) -> Optional[CoxPHSurvivalAnalysis]:
         if X.shape[1] == 0:
             return None
-        rsf = RandomSurvivalForest(
-            n_estimators=500,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            max_features="sqrt",
-            n_jobs=-1,
-            random_state=random_state,
-        )
-        rsf.fit(X, y)
-        return rsf
+        model = CoxPHSurvivalAnalysis()
+        model.fit(X, y)
+        return model
 
     for tr_idx, va_idx in kf.split(X_all):
         X_tr, X_va = X_all.iloc[tr_idx], X_all.iloc[va_idx]
@@ -865,12 +859,12 @@ def analyze_benefit_subgroup(
 
         # OOF risk predictions at t
         risk_gl = (
-            _rsf_risk_at_time(model_gl, X_va[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_va))
+            _risk_at_time(model_gl, X_va[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_va))
         )
         risk_lo = (
-            _rsf_risk_at_time(model_lo, X_va[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_va))
+            _risk_at_time(model_lo, X_va[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_va))
         )
-        risk_all = _rsf_risk_at_time(model_all, X_va, t_hor) if model_all is not None else np.zeros(len(X_va))
+        risk_all = _risk_at_time(model_all, X_va, t_hor) if model_all is not None else np.zeros(len(X_va))
 
         # Binary outcome at t with known mask
         y_bin, known = _binary_outcome_at_time(y_va, t_hor)
@@ -932,14 +926,7 @@ def analyze_benefit_subgroup(
             # Importance under ALL-features model, restricted to local features (conditional on globals)
             X_ben_all = X_all.loc[benefit_local, :]
             y_ben = y_all[benefit_local]
-            model_ben_all = RandomSurvivalForest(
-                n_estimators=500,
-                min_samples_split=10,
-                min_samples_leaf=5,
-                max_features="sqrt",
-                n_jobs=-1,
-                random_state=random_state,
-            )
+            model_ben_all = CoxPHSurvivalAnalysis()
             model_ben_all.fit(X_ben_all, y_ben)
             perm_all = permutation_importance(
                 model_ben_all,
@@ -967,14 +954,7 @@ def analyze_benefit_subgroup(
 
             # Also report local-only model importance within benefit subgroup (pure local effect)
             X_ben_loc = X_all.loc[benefit_local, local_cols]
-            model_ben_loc = RandomSurvivalForest(
-                n_estimators=500,
-                min_samples_split=10,
-                min_samples_leaf=5,
-                max_features="sqrt",
-                n_jobs=-1,
-                random_state=random_state,
-            )
+            model_ben_loc = CoxPHSurvivalAnalysis()
             model_ben_loc.fit(X_ben_loc, y_ben)
             perm_loc = permutation_importance(
                 model_ben_loc,
@@ -1094,20 +1074,13 @@ def evaluate_two_stage_strategy(
     if not np.isfinite(t_hor) or t_hor <= 0:
         t_hor = 365.0
 
-    # Train RSF models
-    def _fit(X, y) -> Optional[RandomSurvivalForest]:
+    # Train CoxPH models
+    def _fit(X, y) -> Optional[CoxPHSurvivalAnalysis]:
         if X.shape[1] == 0:
             return None
-        rsf = RandomSurvivalForest(
-            n_estimators=500,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            max_features="sqrt",
-            n_jobs=-1,
-            random_state=random_state,
-        )
-        rsf.fit(X, y)
-        return rsf
+        model = CoxPHSurvivalAnalysis()
+        model.fit(X, y)
+        return model
 
     model_all = _fit(X_train, y_train)
     model_global = _fit(X_train[global_cols], y_train) if have_global else None
@@ -1115,15 +1088,15 @@ def evaluate_two_stage_strategy(
 
     # Baseline risks at horizon
     risk_all = (
-        _rsf_risk_at_time(model_all, X_test, t_hor) if model_all is not None else np.zeros(len(X_test))
+        _risk_at_time(model_all, X_test, t_hor) if model_all is not None else np.zeros(len(X_test))
     )
     risk_glob = (
-        _rsf_risk_at_time(model_global, X_test[global_cols], t_hor)
+        _risk_at_time(model_global, X_test[global_cols], t_hor)
         if model_global is not None
         else np.zeros(len(X_test))
     )
     risk_loc = (
-        _rsf_risk_at_time(model_local, X_test[local_cols], t_hor)
+        _risk_at_time(model_local, X_test[local_cols], t_hor)
         if model_local is not None
         else np.zeros(len(X_test))
     )
@@ -1270,7 +1243,7 @@ def evaluate_two_stage_strategy(
     except Exception:
         pass
 
-    print("\nTwo-stage strategy evaluation:")
+    print("\nTwo-stage strategy evaluation (CoxPH):")
     print(f"- Gating feature: {metrics['gating_feature']}")
     if np.isfinite(metrics.get("q_low", np.nan)) and np.isfinite(metrics.get("q_high", np.nan)):
         print(
@@ -1284,9 +1257,9 @@ def evaluate_two_stage_strategy(
             f"- Zone counts (low/mid/high): {metrics['n_zone_low']}/{metrics['n_zone_mid']}/{metrics['n_zone_high']} of {metrics['n_test']}"
         )
     print("- C-index baselines and two-stage (test):")
-    print(f"  * All-features RSF:     {metrics['c_index_all']:.4f}")
-    print(f"  * Global-only RSF:      {metrics['c_index_global_only']:.4f}")
-    print(f"  * Local-only RSF:       {metrics['c_index_local_only']:.4f}")
+    print(f"  * All-features CoxPH:   {metrics['c_index_all']:.4f}")
+    print(f"  * Global-only CoxPH:    {metrics['c_index_global_only']:.4f}")
+    print(f"  * Local-only CoxPH:     {metrics['c_index_local_only']:.4f}")
     print(f"  * Two-stage (g->l mid): {metrics['c_index_two_stage']:.4f}")
 
     # Visualizations for two-stage
@@ -1332,19 +1305,12 @@ def _compute_oof_three_model_risks(
 
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
-    def _fit(Xtr, ytr) -> Optional[RandomSurvivalForest]:
+    def _fit(Xtr, ytr) -> Optional[CoxPHSurvivalAnalysis]:
         if Xtr.shape[1] == 0:
             return None
-        rsf = RandomSurvivalForest(
-            n_estimators=500,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            max_features="sqrt",
-            n_jobs=-1,
-            random_state=random_state,
-        )
-        rsf.fit(Xtr, ytr)
-        return rsf
+        model = CoxPHSurvivalAnalysis()
+        model.fit(Xtr, ytr)
+        return model
 
     t_values: List[float] = []
     for tr_idx, va_idx in kf.split(X):
@@ -1364,9 +1330,9 @@ def _compute_oof_three_model_risks(
         model_all = _fit(X_tr, y_tr)
 
         # Predict risks on fold-val
-        risk_gl = _rsf_risk_at_time(model_gl, X_va[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_va))
-        risk_lo = _rsf_risk_at_time(model_lo, X_va[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_va))
-        risk_all = _rsf_risk_at_time(model_all, X_va, t_hor) if model_all is not None else np.zeros(len(X_va))
+        risk_gl = _risk_at_time(model_gl, X_va[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_va))
+        risk_lo = _risk_at_time(model_lo, X_va[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_va))
+        risk_all = _risk_at_time(model_all, X_va, t_hor) if model_all is not None else np.zeros(len(X_va))
 
         # Binary outcomes and known mask at t
         y_bin, known = _binary_outcome_at_time(y_va, t_hor)
@@ -1394,7 +1360,7 @@ def evaluate_three_model_grouping_and_rule(
     output_dir: Optional[str] = None,
 ) -> Dict[str, object]:
     """
-    Stage-1: Compare three RSF models (Global-only, Local-only, All-features) per patient.
+    Stage-1: Compare three CoxPH models (Global-only, Local-only, All-features) per patient.
     - Use OOF risks on the training set to assign each patient to the best-performing model
       (by minimal squared error at a fixed time horizon).
     - Learn an interpretable three-zone rule based on a single gating feature to predict the
@@ -1453,20 +1419,13 @@ def evaluate_three_model_grouping_and_rule(
     if q_high_grid is None:
         q_high_grid = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
 
-    # Train RSF models on full training for test-time inference
-    def _fit(X, y) -> Optional[RandomSurvivalForest]:
+    # Train CoxPH models on full training for test-time inference
+    def _fit(X, y) -> Optional[CoxPHSurvivalAnalysis]:
         if X.shape[1] == 0:
             return None
-        rsf = RandomSurvivalForest(
-            n_estimators=500,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            max_features="sqrt",
-            n_jobs=-1,
-            random_state=random_state,
-        )
-        rsf.fit(X, y)
-        return rsf
+        model = CoxPHSurvivalAnalysis()
+        model.fit(X, y)
+        return model
 
     # Fixed horizon for test evaluation = 75th percentile of train times
     e_field, t_field = _surv_field_names(y_train)
@@ -1479,9 +1438,9 @@ def evaluate_three_model_grouping_and_rule(
     model_lo = _fit(X_train[local_cols], y_train)
 
     # Precompute test risks
-    risk_all_te = _rsf_risk_at_time(model_all, X_test, t_hor) if model_all is not None else np.zeros(len(X_test))
-    risk_gl_te = _rsf_risk_at_time(model_gl, X_test[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_test))
-    risk_lo_te = _rsf_risk_at_time(model_lo, X_test[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_test))
+    risk_all_te = _risk_at_time(model_all, X_test, t_hor) if model_all is not None else np.zeros(len(X_test))
+    risk_gl_te = _risk_at_time(model_gl, X_test[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_test))
+    risk_lo_te = _risk_at_time(model_lo, X_test[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_test))
 
     # Helper for C-index
     def _c_index(y_arr, risk_scores) -> float:
@@ -1615,9 +1574,9 @@ def evaluate_three_model_grouping_and_rule(
         f"- Zone counts (low/mid/high): {out['n_zone_low_test']}/{out['n_zone_mid_test']}/{out['n_zone_high_test']} of {out['n_test']}"
     )
     print("- C-index baselines and rule:")
-    print(f"  * All-features RSF:     {out['c_index_all']:.4f}")
-    print(f"  * Global-only RSF:      {out['c_index_global_only']:.4f}")
-    print(f"  * Local-only RSF:       {out['c_index_local_only']:.4f}")
+    print(f"  * All-features CoxPH:   {out['c_index_all']:.4f}")
+    print(f"  * Global-only CoxPH:    {out['c_index_global_only']:.4f}")
+    print(f"  * Local-only CoxPH:     {out['c_index_local_only']:.4f}")
     print(f"  * Rule (3-zone select): {out['c_index_rule']:.4f}")
 
     # Optional visuals
@@ -1665,8 +1624,8 @@ def evaluate_three_model_grouping_and_rule(
 
 def main():
     clean_df = load_dataframes()
-    figs_dir = os.path.join("figures", "rsf")
-    model, metrics, feat_imp = train_random_survival_forest(clean_df, output_dir=figs_dir)
+    figs_dir = os.path.join("figures", "coxph")
+    model, metrics, feat_imp = train_coxph_model(clean_df, output_dir=figs_dir)
     print(f"Test C-index: {metrics['test_c_index']:.4f}")
     print("Top feature importances:")
     topn = 15 if len(feat_imp) >= 15 else len(feat_imp)
