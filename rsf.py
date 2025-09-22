@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import os
 
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import train_test_split, GridSearchCV, KFold
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -409,6 +409,30 @@ def _rsf_risk_at_time(model: RandomSurvivalForest, X: pd.DataFrame, t: float) ->
     return 1.0 - s_at
 
 
+def _surv_field_names(y_arr) -> Tuple[str, str]:
+    names = getattr(y_arr.dtype, "names", None)
+    if not names or len(names) < 2:
+        return "event", "time"
+    event_field = "event" if "event" in names else names[0]
+    time_candidates = [n for n in names if n != event_field]
+    time_field = "time" if "time" in names else time_candidates[0]
+    return event_field, time_field
+
+
+def _binary_outcome_at_time(y_arr, t: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns (y_bin, known_mask) at time t.
+    y_bin = 1 if event occurred by t, else 0 if survival past t is observed.
+    If censored before t, label is unknown (known_mask = False).
+    """
+    e_field, tm_field = _surv_field_names(y_arr)
+    evt = y_arr[e_field].astype(bool)
+    tm = y_arr[tm_field].astype(float)
+    known = (evt & (tm <= t)) | ((~evt) & (tm > t))
+    y_bin = np.where(evt & (tm <= t), 1.0, 0.0)
+    return y_bin, known
+
+
 def _optimize_gate_quantiles(
     X_train: pd.DataFrame,
     y_train: np.ndarray,
@@ -529,6 +553,159 @@ def _optimize_gate_quantiles(
 
     info: Dict[str, float] = {"tried": float(tried), "best_c_index_val": float(best_score)}
     return best_pair[0], best_pair[1], info
+
+
+def analyze_benefit_subgroup(
+    clean_df: pd.DataFrame,
+    n_splits: int = 5,
+    random_state: int = 42,
+    percent_for_time: float = 0.75,
+    margin: float = 0.0,
+    topk_local_importance: int = 12,
+) -> Dict[str, object]:
+    """
+    Identify patients who benefit from local features and assess local-feature importance in that subgroup.
+
+    Approach:
+    - Generate out-of-fold risks at a fold-specific time horizon t (percentile of train times).
+    - Define per-sample benefit label by squared-error improvement at t.
+    - Evaluate OOF C-index in benefit vs non-benefit groups (local vs global risks).
+    - Fit local-only model on benefit subgroup and report permutation importances.
+    """
+    X_all, y_all, feature_names = _prepare_survival_xy(clean_df)
+    global_cols, local_cols, _ = _find_feature_groups(feature_names)
+    have_global = len(global_cols) > 0
+    have_local = len(local_cols) > 0
+    n = len(X_all)
+    if n == 0 or not (have_global and have_local):
+        print("Benefit analysis skipped: insufficient data or feature groups not found.")
+        return {
+            "n": int(n),
+            "have_global": have_global,
+            "have_local": have_local,
+        }
+
+    risk_glob_oof = np.full(n, np.nan, dtype=float)
+    risk_loc_oof = np.full(n, np.nan, dtype=float)
+    y_bin_oof = np.full(n, np.nan, dtype=float)
+    known_oof = np.zeros(n, dtype=bool)
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+
+    def _fit(X, y) -> Optional[RandomSurvivalForest]:
+        if X.shape[1] == 0:
+            return None
+        rsf = RandomSurvivalForest(
+            n_estimators=500,
+            min_samples_split=10,
+            min_samples_leaf=5,
+            max_features="sqrt",
+            n_jobs=-1,
+            random_state=random_state,
+        )
+        rsf.fit(X, y)
+        return rsf
+
+    for tr_idx, va_idx in kf.split(X_all):
+        X_tr, X_va = X_all.iloc[tr_idx], X_all.iloc[va_idx]
+        y_tr, y_va = y_all[tr_idx], y_all[va_idx]
+
+        # Fold-specific time horizon
+        e_field, t_field = _surv_field_names(y_tr)
+        t_hor = float(np.percentile(y_tr[t_field], percent_for_time * 100.0)) if len(y_tr) else 365.0
+        if not np.isfinite(t_hor) or t_hor <= 0:
+            t_hor = 365.0
+
+        # Train models
+        model_gl = _fit(X_tr[global_cols], y_tr) if have_global else None
+        model_lo = _fit(X_tr[local_cols], y_tr) if have_local else None
+
+        # OOF risk predictions at t
+        risk_gl = (
+            _rsf_risk_at_time(model_gl, X_va[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_va))
+        )
+        risk_lo = (
+            _rsf_risk_at_time(model_lo, X_va[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_va))
+        )
+
+        # Binary outcome at t with known mask
+        y_bin, known = _binary_outcome_at_time(y_va, t_hor)
+
+        # Store
+        risk_glob_oof[va_idx] = risk_gl
+        risk_loc_oof[va_idx] = risk_lo
+        y_bin_oof[va_idx] = y_bin
+        known_oof[va_idx] = known
+
+    # Define benefit by squared-error improvement with optional margin
+    err_gl = (risk_glob_oof - y_bin_oof) ** 2
+    err_lo = (risk_loc_oof - y_bin_oof) ** 2
+    benefit_mask = (known_oof) & np.isfinite(err_gl) & np.isfinite(err_lo) & (err_gl - err_lo > margin)
+    nonbenefit_mask = (known_oof) & np.isfinite(err_gl) & np.isfinite(err_lo) & ~(err_gl - err_lo > margin)
+
+    # C-index within groups using OOF risks
+    def _c_index(y, risk):
+        e_field, t_field = _surv_field_names(y)
+        evt = y[e_field].astype(bool)
+        tm = y[t_field].astype(float)
+        return float(concordance_index_censored(evt, tm, risk)[0])
+
+    metrics: Dict[str, object] = {
+        "n": int(n),
+        "n_labeled": int(known_oof.sum()),
+        "n_benefit": int(benefit_mask.sum()),
+        "n_nonbenefit": int(nonbenefit_mask.sum()),
+    }
+
+    if benefit_mask.sum() > 1:
+        metrics["c_index_local_in_benefit"] = _c_index(y_all[benefit_mask], risk_loc_oof[benefit_mask])
+        metrics["c_index_global_in_benefit"] = _c_index(y_all[benefit_mask], risk_glob_oof[benefit_mask])
+    if nonbenefit_mask.sum() > 1:
+        metrics["c_index_local_in_nonbenefit"] = _c_index(y_all[nonbenefit_mask], risk_loc_oof[nonbenefit_mask])
+        metrics["c_index_global_in_nonbenefit"] = _c_index(y_all[nonbenefit_mask], risk_glob_oof[nonbenefit_mask])
+
+    # Train local-only model on benefit subgroup and compute permutation importance
+    try:
+        if benefit_mask.sum() >= 10:
+            X_ben = X_all.loc[benefit_mask, local_cols]
+            y_ben = y_all[benefit_mask]
+            model_ben = RandomSurvivalForest(
+                n_estimators=500,
+                min_samples_split=10,
+                min_samples_leaf=5,
+                max_features="sqrt",
+                n_jobs=-1,
+                random_state=random_state,
+            )
+            model_ben.fit(X_ben, y_ben)
+            perm = permutation_importance(
+                model_ben,
+                X_ben,
+                y_ben,
+                n_repeats=20,
+                random_state=random_state,
+                n_jobs=-1,
+            )
+            fi = pd.Series(perm.importances_mean, index=local_cols).sort_values(ascending=False)
+            metrics["local_feature_importance_in_benefit"] = fi.head(topk_local_importance)
+            print("\nBenefit subgroup: local feature importance (top):")
+            print(metrics["local_feature_importance_in_benefit"])
+    except Exception:
+        pass
+
+    print("\nBenefit subgroup analysis:")
+    print(f"- Labeled at t: {metrics['n_labeled']} / {metrics['n']}")
+    print(f"- Benefit / Non-benefit: {metrics['n_benefit']} / {metrics['n_nonbenefit']}")
+    if "c_index_local_in_benefit" in metrics:
+        print(
+            f"- C-index in BENEFIT: local={metrics['c_index_local_in_benefit']:.4f}, global={metrics['c_index_global_in_benefit']:.4f}"
+        )
+    if "c_index_local_in_nonbenefit" in metrics:
+        print(
+            f"- C-index in NON-BENEFIT: local={metrics['c_index_local_in_nonbenefit']:.4f}, global={metrics['c_index_global_in_nonbenefit']:.4f}"
+        )
+
+    return metrics
 
 
 def evaluate_two_stage_strategy(
@@ -765,6 +942,9 @@ def main():
         clean_df,
         optimize_thresholds=True,
     )
+
+    # Analyze benefit subgroup and local-feature importance within it
+    _ = analyze_benefit_subgroup(clean_df)
 
 
 if __name__ == "__main__":
