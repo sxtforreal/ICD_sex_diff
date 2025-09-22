@@ -330,6 +330,255 @@ def conversion_and_imputation(df, features, labels):
     return imputed_X
 
 
+def search_best_gating_feature_by_cv(
+    clean_df: pd.DataFrame,
+    q_low_grid: Optional[List[float]] = None,
+    q_high_grid: Optional[List[float]] = None,
+    min_gap: float = 0.10,
+    n_splits: int = 5,
+    n_repeats: int = 5,
+    random_state: int = 42,
+    output_dir: Optional[str] = None,
+    topk_report: int = 10,
+) -> Dict[str, object]:
+    """
+    Find a single gating feature and two thresholds (low/high quantiles) that best separate
+    the three best-model groups (Global/Local/All) using repeated KFold CV on the full data.
+
+    Steps:
+    - Compute OOF risks for Global/Local/All lifelines CoxPH models on the full dataset
+      and derive per-sample best model labels (0=Global,1=Local,2=All) via event-based rule.
+    - For each numeric feature, evaluate quantile threshold pairs on train folds and score
+      validation accuracy using majority label mapping per zone (low/mid/high).
+    - Select the feature and (q_low, q_high) with highest mean CV accuracy.
+    - Compute final thresholds on all data using the selected quantiles, generate visuals,
+      and return a summary including per-sample zones and predicted labels.
+    """
+    # Prepare X/y and feature names
+    X_all, y_all, feature_names = _prepare_survival_xy(clean_df)
+    global_cols, local_cols, _ = _find_feature_groups(feature_names)
+    have_global = len(global_cols) > 0
+    have_local = len(local_cols) > 0
+    if not (have_global and have_local):
+        print("Gating search skipped: missing global or local feature groups.")
+        return {"have_global": have_global, "have_local": have_local}
+
+    # Build modeling DataFrame for OOF assignment
+    df_model = pd.concat([
+        clean_df[["PE_Time", "VT/VF/SCD"]].reset_index(drop=True),
+        X_all.reset_index(drop=True),
+    ], axis=1)
+
+    # OOF risks for assignment on the full data
+    risk_gl_oof, risk_lo_oof, risk_all_oof = _compute_oof_three_risks_lifelines(
+        df_model, global_cols, local_cols, time_col="PE_Time", event_col="VT/VF/SCD", n_splits=n_splits, random_state=random_state
+    )
+    evt = df_model["VT/VF/SCD"].values.astype(int)
+    risks_stack = np.vstack([risk_gl_oof, risk_lo_oof, risk_all_oof])
+    best_idx = np.zeros(len(df_model), dtype=int)
+    best_idx[evt == 1] = np.argmax(risks_stack[:, evt == 1], axis=0)
+    best_idx[evt == 0] = np.argmin(risks_stack[:, evt == 0], axis=0)
+
+    # Candidate features are all numeric columns in X_all
+    candidate_features = list(X_all.columns)
+    n = len(df_model)
+    valid_label_mask = (best_idx >= 0) & (best_idx <= 2)
+
+    # Threshold grids
+    if q_low_grid is None:
+        q_low_grid = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
+    if q_high_grid is None:
+        q_high_grid = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+
+    # CV loop over features
+    rng_seeds = [int(random_state + r) for r in range(max(1, int(n_repeats)))]
+    feat_results: List[Dict[str, object]] = []
+
+    for f in candidate_features:
+        x = X_all[f].astype(float).values
+        finite = np.isfinite(x) & valid_label_mask
+        if finite.sum() < max(30, n_splits):
+            continue
+
+        best_score = -np.inf
+        best_q = (np.nan, np.nan)
+
+        # Repeated KFold
+        for seed in rng_seeds:
+            kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+            for tr_idx, va_idx in kf.split(x):
+                tr_mask = finite & np.isin(np.arange(n), tr_idx)
+                va_mask = finite & np.isin(np.arange(n), va_idx)
+                if tr_mask.sum() == 0 or va_mask.sum() == 0:
+                    continue
+                x_tr, y_tr = x[tr_mask], best_idx[tr_mask]
+                x_va, y_va = x[va_mask], best_idx[va_mask]
+
+                # Evaluate grid of quantiles on training fold
+                for ql in q_low_grid:
+                    for qh in q_high_grid:
+                        if qh - ql < min_gap:
+                            continue
+                        try:
+                            thr_l = float(np.nanquantile(x_tr, ql))
+                            thr_h = float(np.nanquantile(x_tr, qh))
+                        except Exception:
+                            continue
+                        if not np.isfinite(thr_l) or not np.isfinite(thr_h) or thr_l >= thr_h:
+                            continue
+
+                        # Zones on training
+                        z_low_tr = x_tr < thr_l
+                        z_high_tr = x_tr >= thr_h
+                        z_mid_tr = ~(z_low_tr | z_high_tr)
+
+                        # Majority mapping per zone
+                        z2m: Dict[str, int] = {}
+                        acc_parts = []
+                        for name, m in ("low", z_low_tr), ("mid", z_mid_tr), ("high", z_high_tr):
+                            if m.sum() == 0:
+                                continue
+                            labels = y_tr[m]
+                            vals, counts = np.unique(labels, return_counts=True)
+                            maj = int(vals[np.argmax(counts)])
+                            z2m[name] = maj
+                            acc_parts.append((labels == maj).mean())
+                        if len(acc_parts) == 0:
+                            continue
+
+                        # Validation accuracy
+                        z_low_va = x_va < thr_l
+                        z_high_va = x_va >= thr_h
+                        z_mid_va = ~(z_low_va | z_high_va)
+                        y_pred = np.full_like(y_va, fill_value=0)
+                        if "low" in z2m:
+                            y_pred[z_low_va] = z2m["low"]
+                        if "mid" in z2m:
+                            y_pred[z_mid_va] = z2m["mid"]
+                        if "high" in z2m:
+                            y_pred[z_high_va] = z2m["high"]
+                        acc = float((y_pred == y_va).mean())
+
+                        if acc > best_score + 1e-12:
+                            best_score = acc
+                            best_q = (ql, qh)
+
+        if np.isfinite(best_score) and best_score > -np.inf and np.isfinite(best_q[0]) and np.isfinite(best_q[1]):
+            feat_results.append({
+                "feature": f,
+                "cv_acc": float(best_score),
+                "q_low": float(best_q[0]),
+                "q_high": float(best_q[1]),
+                "n_finite": int(finite.sum()),
+            })
+
+    if len(feat_results) == 0:
+        print("No valid features for gating search.")
+        return {
+            "have_global": have_global,
+            "have_local": have_local,
+            "n_features": int(len(candidate_features)),
+            "n_valid_features": 0,
+        }
+
+    # Select best feature by CV accuracy
+    feat_results.sort(key=lambda d: d.get("cv_acc", -np.inf), reverse=True)
+    best = feat_results[0]
+    best_feature: str = str(best["feature"])
+    ql_sel = float(best["q_low"])  # type: ignore
+    qh_sel = float(best["q_high"])  # type: ignore
+
+    # Compute final thresholds on all data
+    x_full = X_all[best_feature].astype(float).values
+    thr_low = float(np.nanquantile(x_full, ql_sel))
+    thr_high = float(np.nanquantile(x_full, qh_sel))
+
+    # Majority mapping per zone on all finite samples
+    finite_full = np.isfinite(x_full) & valid_label_mask
+    z_low = x_full < thr_low
+    z_high = x_full >= thr_high
+    z_mid = ~(z_low | z_high)
+
+    mapping: Dict[str, int] = {}
+    comp_counts: Dict[str, Dict[str, int]] = {"low": {}, "mid": {}, "high": {}}
+    for name, m in ("low", z_low), ("mid", z_mid), ("high", z_high):
+        mm = m & finite_full
+        if mm.sum() == 0:
+            continue
+        labels = best_idx[mm]
+        vals, counts = np.unique(labels, return_counts=True)
+        maj = int(vals[np.argmax(counts)])
+        mapping[name] = maj
+        # counts per class for stacked bar
+        cc: Dict[str, int] = {}
+        for v, c in zip(vals, counts):
+            cc[{0: "Global", 1: "Local", 2: "All"}.get(int(v), str(int(v)))] = int(c)
+        comp_counts[name] = cc
+
+    # Predicted labels on all samples by the rule
+    y_pred_rule = np.zeros(n, dtype=int)
+    y_pred_rule[z_low] = int(mapping.get("low", 0))
+    y_pred_rule[z_mid] = int(mapping.get("mid", 0))
+    y_pred_rule[z_high] = int(mapping.get("high", 0))
+
+    # Overall agreement with OOF best labels (not a test score, just descriptive)
+    overall_acc = float((y_pred_rule[finite_full] == best_idx[finite_full]).mean()) if finite_full.any() else float("nan")
+
+    # Visualizations
+    try:
+        if output_dir:
+            _ensure_dir(output_dir)
+            # Save top-k feature summary
+            topk = min(topk_report, len(feat_results))
+            pd.DataFrame(feat_results[:topk]).to_csv(os.path.join(output_dir, "gating_search_topk.csv"), index=False)
+    except Exception:
+        pass
+
+    try:
+        _plot_gating_hist_by_best(
+            gate_values=x_full,
+            best_idx=best_idx,
+            thr_low=thr_low,
+            thr_high=thr_high,
+            label=str(best_feature),
+            output_dir=output_dir,
+            filename="gating_best_feature_hist.png",
+        )
+        _plot_zone_best_model_stack(comp_counts, output_dir, filename="gating_zone_composition.png")
+    except Exception:
+        pass
+
+    # Package outputs
+    human_mapping = {k: ["Global", "Local", "All"][int(v)] for k, v in mapping.items()}
+    result: Dict[str, object] = {
+        "selected_feature": best_feature,
+        "q_low": ql_sel,
+        "q_high": qh_sel,
+        "thr_low": float(thr_low),
+        "thr_high": float(thr_high),
+        "zone_to_model": human_mapping,
+        "overall_agreement": overall_acc,
+        "n_samples": int(n),
+        "counts": {
+            "Global": int((best_idx == 0).sum()),
+            "Local": int((best_idx == 1).sum()),
+            "All": int((best_idx == 2).sum()),
+        },
+        "topk": feat_results[: min(topk_report, len(feat_results))],
+        "best_idx": [int(v) for v in best_idx.tolist()],
+        "pred_labels_by_rule": [int(v) for v in y_pred_rule.tolist()],
+    }
+
+    print("\n=== Gating feature search (three-group separation) ===")
+    print(f"- Selected feature: {result['selected_feature']}")
+    print(f"- Quantiles (q_low, q_high): ({result['q_low']:.2f}, {result['q_high']:.2f})")
+    print(f"- Thresholds (low, high): ({result['thr_low']:.5g}, {result['thr_high']:.5g})")
+    print(f"- Zone -> Model mapping: low->{human_mapping.get('low','?')}, mid->{human_mapping.get('mid','?')}, high->{human_mapping.get('high','?')}")
+    print(f"- Agreement with OOF best labels (all data): {overall_acc:.4f}")
+
+    return result
+
+
 def load_dataframes() -> pd.DataFrame:
     base = "/home/sunx/data/aiiih/projects/sunx/projects/ICD"
     icd = pd.read_excel(os.path.join(base, "LGE granularity.xlsx"), sheet_name="ICD")
@@ -2260,6 +2509,15 @@ def main():
     _ = evaluate_three_model_assignment_and_classifier(
         clean_df,
         output_dir=figs_dir,
+    )
+    # Run gating feature search on all data (repeated CV on full dataset)
+    figs_dir2 = os.path.join("figures", "gating_feature_search")
+    _ = search_best_gating_feature_by_cv(
+        clean_df,
+        n_splits=5,
+        n_repeats=5,
+        random_state=42,
+        output_dir=figs_dir2,
     )
 
 
