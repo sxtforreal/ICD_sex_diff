@@ -102,7 +102,8 @@ def _plot_cindex_bars(metrics: Dict[str, float], output_dir: Optional[str]) -> N
     ]
     vals = [float(metrics.get(k, np.nan)) for k in keys]
     fig, ax = plt.subplots(figsize=(6.5, 4.2))
-    sns.barplot(x=labels, y=vals, ax=ax, palette="Set2")
+    # Avoid seaborn deprecation of palette without hue
+    sns.barplot(x=labels, y=vals, hue=labels, ax=ax, palette="Set2", legend=False)
     ax.set_ylabel("C-index (test)")
     ax.set_ylim(0.0, 1.0)
     ax.set_title("C-index comparison (RSF)")
@@ -142,13 +143,119 @@ def _plot_zone_counts(metrics: Dict[str, float], output_dir: Optional[str]) -> N
     fig, ax = plt.subplots(figsize=(5.8, 4.0))
     labels = ["Low", "Mid", "High"]
     vals = [n_low, n_mid, n_high]
-    sns.barplot(x=labels, y=vals, ax=ax, palette=["#4daf4a", "#377eb8", "#e41a1c"])
+    sns.barplot(
+        x=labels,
+        y=vals,
+        hue=labels,
+        ax=ax,
+        palette=["#4daf4a", "#377eb8", "#e41a1c"],
+        legend=False,
+    )
     ax.set_ylabel("Count (test)")
     ax.set_title("Zone counts by gating thresholds")
     for i, v in enumerate(vals):
         ax.text(i, v + max(1, 0.02 * max(vals)), str(v), ha="center", va="bottom")
     fig.tight_layout()
     _save_fig(fig, output_dir, "zone_counts.png")
+
+
+def _plot_cindex_bars_generic(
+    labels: List[str], vals: List[float], title: str, output_dir: Optional[str], filename: str
+) -> None:
+    fig, ax = plt.subplots(figsize=(6.8, 4.4))
+    sns.barplot(x=labels, y=vals, hue=labels, ax=ax, palette="Set2", legend=False)
+    ax.set_ylabel("C-index (test)")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title(title)
+    for i, v in enumerate(vals):
+        if np.isfinite(v):
+            ax.text(i, v + 0.02, f"{v:.3f}", ha="center", va="bottom", fontsize=10)
+    fig.tight_layout()
+    _save_fig(fig, output_dir, filename)
+
+
+def _plot_gating_hist_by_best(
+    gate_values: np.ndarray,
+    best_idx: np.ndarray,
+    thr_low: float,
+    thr_high: float,
+    label: str,
+    output_dir: Optional[str],
+    filename: str = "gating_by_best_hist.png",
+) -> None:
+    if gate_values is None or len(gate_values) == 0:
+        return
+    if best_idx is None or len(best_idx) != len(gate_values):
+        return
+    mask = np.isfinite(gate_values) & (best_idx >= 0)
+    if not mask.any():
+        return
+    df = pd.DataFrame({
+        "gate": gate_values[mask],
+        "best": best_idx[mask].astype(int),
+    })
+    mapping = {0: "Global", 1: "Local", 2: "All"}
+    try:
+        df["best_label"] = df["best"].map(mapping)
+    except Exception:
+        df["best_label"] = df["best"].astype(str)
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    sns.histplot(
+        data=df,
+        x="gate",
+        hue="best_label",
+        bins=30,
+        element="step",
+        stat="count",
+        common_norm=False,
+        palette="Set2",
+        ax=ax,
+    )
+    if np.isfinite(thr_low):
+        ax.axvline(thr_low, ls=":", lw=2, color="#f58518", label=f"low thr = {thr_low:.3g}")
+    if np.isfinite(thr_high):
+        ax.axvline(thr_high, ls=":", lw=2, color="#e45756", label=f"high thr = {thr_high:.3g}")
+    ax.set_title(f"Gating distribution by best model ({label})")
+    ax.set_xlabel(label)
+    ax.legend()
+    fig.tight_layout()
+    _save_fig(fig, output_dir, filename)
+
+
+def _plot_zone_best_model_stack(
+    counts_per_zone: Dict[str, Dict[str, int]], output_dir: Optional[str], filename: str = "zone_best_model_stack.png"
+) -> None:
+    # counts_per_zone: {"low": {"Global": n, "Local": n, "All": n}, ...}
+    zones = ["Low", "Mid", "High"]
+    keys_norm = {"Low": "low", "Mid": "mid", "High": "high"}
+    models = ["Global", "Local", "All"]
+    data = []
+    for z in zones:
+        zkey = keys_norm[z]
+        sub = counts_per_zone.get(zkey, {})
+        total = float(sum(int(sub.get(m, 0)) for m in models))
+        if total <= 0:
+            data.append([0.0, 0.0, 0.0])
+        else:
+            data.append([int(sub.get(m, 0)) / total for m in models])
+
+    fig, ax = plt.subplots(figsize=(6.8, 4.6))
+    bottoms = np.zeros(len(zones))
+    colors = {"Global": "#4daf4a", "Local": "#377eb8", "All": "#e41a1c"}
+    for i, m in enumerate(models):
+        vals = [row[i] for row in data]
+        ax.bar(zones, vals, bottom=bottoms, color=colors.get(m, None), label=m)
+        bottoms += np.array(vals)
+        # annotate
+        for xi, v, b in zip(range(len(zones)), vals, bottoms):
+            if v > 0.02:
+                ax.text(xi, b - v / 2.0, f"{int(round(v*100))}%", ha="center", va="center", color="white")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("Proportion within zone")
+    ax.set_title("Best model composition by zone (train, OOF)")
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    _save_fig(fig, output_dir, filename)
 
 
 def conversion_and_imputation(df, features, labels):
@@ -1515,14 +1622,41 @@ def evaluate_three_model_grouping_and_rule(
 
     # Optional visuals
     try:
-        _plot_gating_hist(gate_train, float(out["thr_low"]), float(out["thr_high"]), label=str(gate_label), output_dir=output_dir)
-        # Reuse zone counts plot by remapping keys
-        tmp_metrics = {
-            "n_zone_low": out["n_zone_low_test"],
-            "n_zone_mid": out["n_zone_mid_test"],
-            "n_zone_high": out["n_zone_high_test"],
-        }
-        _plot_zone_counts(tmp_metrics, output_dir)
+        # 1) Gating histogram colored by best model (train, OOF best)
+        _plot_gating_hist_by_best(
+            gate_train,
+            best_idx_tr,
+            float(out["thr_low"]),
+            float(out["thr_high"]),
+            label=str(gate_label),
+            output_dir=output_dir,
+        )
+        # 2) Zone-wise composition (train)
+        thr_l_v = float(out["thr_low"])
+        thr_h_v = float(out["thr_high"])
+        z_low_tr = gate_train < thr_l_v
+        z_high_tr = gate_train >= thr_h_v
+        z_mid_tr = ~(z_low_tr | z_high_tr)
+        mapping = {0: "Global", 1: "Local", 2: "All"}
+        comp_counts: Dict[str, Dict[str, int]] = {"low": {}, "mid": {}, "high": {}}
+        for name, mask in ("low", z_low_tr), ("mid", z_mid_tr), ("high", z_high_tr):
+            m = mask & valid_tr
+            sub = best_idx_tr[m]
+            cc: Dict[str, int] = {}
+            if len(sub) > 0:
+                vals, counts = np.unique(sub, return_counts=True)
+                for v, c in zip(vals, counts):
+                    cc[mapping.get(int(v), str(int(v)))] = int(c)
+            comp_counts[name] = cc
+        _plot_zone_best_model_stack(comp_counts, output_dir)
+        # 3) C-index comparison including Rule
+        _plot_cindex_bars_generic(
+            labels=["All", "Global", "Local", "Rule"],
+            vals=[out["c_index_all"], out["c_index_global_only"], out["c_index_local_only"], out["c_index_rule"]],
+            title="C-index comparison: All vs Global vs Local vs Rule",
+            output_dir=output_dir,
+            filename="cindex_all_global_local_rule.png",
+        )
     except Exception:
         pass
 
