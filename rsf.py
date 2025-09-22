@@ -312,6 +312,276 @@ def train_random_survival_forest(
     return rsf, metrics, feat_imp
 
 
+def _find_feature_groups(feature_names: List[str]) -> Tuple[List[str], List[str], Optional[str]]:
+    """
+    Heuristically split features into global vs local (bull's-eye 17 segments) groups
+    and pick a gating feature (overall scar burden) if available.
+
+    Returns: (global_cols, local_cols, gating_feature_name_or_None)
+    """
+    names = list(feature_names)
+    lower = [n.lower() for n in names]
+
+    def has(substr: str) -> List[str]:
+        s = substr.lower()
+        return [names[i] for i, n in enumerate(lower) if s in n]
+
+    # Local/bull's-eye patterns (17 segments + apical cap + RV insertion)
+    local_patterns = [
+        "lge_basal",
+        "lge_mid ",
+        "lge_mid",
+        "lge_apical",
+        "lge_apical cap",
+        "rv insertion",
+        "lge_rv insertion",
+        "anterolateral",
+        "inferolateral",
+        "inferosept",
+        "anterior sept",
+        "inferior",
+        "septum",
+        "lateral",
+    ]
+    local_cols_set = set()
+    for p in local_patterns:
+        for c in has(p):
+            local_cols_set.add(c)
+    # Global patterns
+    global_cols_set = set()
+    for p in [
+        "lge_lge burden 5sd",
+        "lge burden 5sd",
+        "lge_extent",
+        "extent (1;",
+        "circumural",
+        "ring-like",
+        "lvef",
+        "nyha class",
+    ]:
+        for c in has(p):
+            global_cols_set.add(c)
+
+    # Avoid overlap
+    local_cols = [c for c in names if c in local_cols_set]
+    global_cols = [c for c in names if c in global_cols_set and c not in local_cols_set]
+
+    # Choose gating feature: prefer explicit scar burden
+    priorities = [
+        "LGE_LGE Burden 5SD",
+        "LGE Burden 5SD",
+        "LGE_Extent (1; subendocardial, 2; mid mural, 3; epicardial, 4; transmural; 5 circumural)",
+    ]
+    gating = None
+    for p in priorities:
+        if p in names:
+            gating = p
+            break
+    if gating is None:
+        # Try relaxed search
+        for p in ["burden", "extent", "circumural", "ring-like"]:
+            hits = has(p)
+            if hits:
+                gating = hits[0]
+                break
+
+    return global_cols, local_cols, gating
+
+
+def _rsf_risk_at_time(model: RandomSurvivalForest, X: pd.DataFrame, t: float) -> np.ndarray:
+    """Risk score at time t as 1 - S(t)."""
+    if X.empty:
+        return np.zeros(0, dtype=float)
+    try:
+        surv = model.predict_survival_function(X)
+        s_at = np.array([sf(t) for sf in surv], dtype=float)
+    except Exception:
+        # Fallback: approximate using nearest available event time grid
+        times = getattr(model, "event_times_", None)
+        if times is None or len(times) == 0:
+            # As a last resort, use model.score ordering via leaf depth proxy (not ideal)
+            # Return zeros to avoid crashing
+            return np.zeros(len(X), dtype=float)
+        idx = int(np.argmin(np.abs(times - float(t))))
+        surv = model.predict_survival_function(X)
+        s_at = np.array([sf(times[idx]) for sf in surv], dtype=float)
+    s_at = np.clip(s_at, 0.0, 1.0)
+    return 1.0 - s_at
+
+
+def evaluate_two_stage_strategy(
+    clean_df: pd.DataFrame,
+    test_size: float = 0.25,
+    random_state: int = 42,
+    q_low: float = 0.40,
+    q_high: float = 0.75,
+) -> Dict[str, float]:
+    """
+    Validate a two-stage decision strategy:
+    1) Inspect global features first with a gating feature and quantile thresholds.
+    2) For mid-range cases, defer to local (17-segment) features.
+
+    Returns a metrics dict including C-index for baselines and the two-stage approach.
+    """
+    # Prepare dataset
+    X_all, y_all, feature_names = _prepare_survival_xy(clean_df)
+    global_cols, local_cols, gating = _find_feature_groups(feature_names)
+
+    # Safety checks
+    have_global = len(global_cols) > 0
+    have_local = len(local_cols) > 0
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_all, y_all, test_size=test_size, random_state=random_state
+    )
+
+    # Time horizon = 75th percentile of observed times in training
+    t_hor = float(np.percentile(y_train["time"], 75)) if len(y_train) else 365.0
+    if not np.isfinite(t_hor) or t_hor <= 0:
+        t_hor = 365.0
+
+    # Train RSF models
+    def _fit(X, y) -> Optional[RandomSurvivalForest]:
+        if X.shape[1] == 0:
+            return None
+        rsf = RandomSurvivalForest(
+            n_estimators=500,
+            min_samples_split=10,
+            min_samples_leaf=5,
+            max_features="sqrt",
+            n_jobs=-1,
+            random_state=random_state,
+        )
+        rsf.fit(X, y)
+        return rsf
+
+    model_all = _fit(X_train, y_train)
+    model_global = _fit(X_train[global_cols], y_train) if have_global else None
+    model_local = _fit(X_train[local_cols], y_train) if have_local else None
+
+    # Baseline risks at horizon
+    risk_all = (
+        _rsf_risk_at_time(model_all, X_test, t_hor) if model_all is not None else np.zeros(len(X_test))
+    )
+    risk_glob = (
+        _rsf_risk_at_time(model_global, X_test[global_cols], t_hor)
+        if model_global is not None
+        else np.zeros(len(X_test))
+    )
+    risk_loc = (
+        _rsf_risk_at_time(model_local, X_test[local_cols], t_hor)
+        if model_local is not None
+        else np.zeros(len(X_test))
+    )
+
+    # Two-stage gating setup
+    # Obtain gating values (prefer explicit gating feature, else derive from local sum)
+    if gating is not None and gating in X_all.columns:
+        gate_train_vals = X_train[gating].astype(float).values
+        gate_test_vals = X_test[gating].astype(float).values
+    else:
+        # Fallback: sum of local signals as a proxy for overall burden
+        if have_local:
+            gate_train_vals = X_train[local_cols].astype(float).sum(axis=1).values
+            gate_test_vals = X_test[local_cols].astype(float).sum(axis=1).values
+            gating = "(sum of local segments)"
+        else:
+            # No gating available -> degenerate to global risk
+            gate_train_vals = np.zeros(len(X_train), dtype=float)
+            gate_test_vals = np.zeros(len(X_test), dtype=float)
+            gating = None
+
+    if gating is not None:
+        thr_low = float(np.nanquantile(gate_train_vals, q_low))
+        thr_high = float(np.nanquantile(gate_train_vals, q_high))
+        if not np.isfinite(thr_low):
+            thr_low = float(np.nanmedian(gate_train_vals))
+        if not np.isfinite(thr_high):
+            thr_high = float(np.nanmedian(gate_train_vals))
+        if thr_low >= thr_high:
+            # Enforce separation
+            thr_low, thr_high = float(np.nanpercentile(gate_train_vals, 40)), float(
+                np.nanpercentile(gate_train_vals, 75)
+            )
+
+        # Combine risks per zone
+        zone_high = gate_test_vals >= thr_high
+        zone_low = gate_test_vals < thr_low
+        zone_mid = ~(zone_high | zone_low)
+
+        risk_two_stage = np.zeros(len(X_test), dtype=float)
+        # High burden: rely on global risk (must-implant logic)
+        risk_two_stage[zone_high] = risk_glob[zone_high]
+        # Low burden: rely on global risk (generally safe)
+        risk_two_stage[zone_low] = risk_glob[zone_low]
+        # Mid zone: defer to local risk to avoid unnecessary ICD where possible
+        risk_two_stage[zone_mid] = risk_loc[zone_mid]
+    else:
+        # No gating -> fall back to global risk
+        thr_low = thr_high = np.nan
+        zone_high = zone_low = zone_mid = np.zeros(len(X_test), dtype=bool)
+        risk_two_stage = risk_glob.copy()
+
+    # Evaluate C-index
+    def _c_index(y, risk):
+        evt = y["event"].astype(bool)
+        tm = y["time"].astype(float)
+        c = concordance_index_censored(evt, tm, risk)[0]
+        return float(c)
+
+    metrics = {
+        "c_index_all": _c_index(y_test, risk_all) if model_all is not None else np.nan,
+        "c_index_global_only": _c_index(y_test, risk_glob) if model_global is not None else np.nan,
+        "c_index_local_only": _c_index(y_test, risk_loc) if model_local is not None else np.nan,
+        "c_index_two_stage": _c_index(y_test, risk_two_stage),
+        "time_horizon_days": t_hor,
+        "gating_feature": gating if gating is not None else "<none>",
+        "thr_low": thr_low,
+        "thr_high": thr_high,
+        "n_zone_low": int(zone_low.sum()) if gating is not None else 0,
+        "n_zone_mid": int(zone_mid.sum()) if gating is not None else 0,
+        "n_zone_high": int(zone_high.sum()) if gating is not None else 0,
+        "n_test": int(len(X_test)),
+    }
+
+    # Also return top permutation importances (optional, compact)
+    try:
+        if model_global is not None:
+            perm_glob = permutation_importance(
+                model_global, X_test[global_cols], y_test, n_repeats=10, random_state=random_state, n_jobs=-1
+            )
+            fi_glob = pd.Series(perm_glob.importances_mean, index=global_cols).sort_values(ascending=False)
+            topg = fi_glob.head(8)
+            print("Global features (top 8 by permutation importance):")
+            print(topg)
+        if model_local is not None:
+            perm_loc = permutation_importance(
+                model_local, X_test[local_cols], y_test, n_repeats=10, random_state=random_state, n_jobs=-1
+            )
+            fi_loc = pd.Series(perm_loc.importances_mean, index=local_cols).sort_values(ascending=False)
+            topl = fi_loc.head(8)
+            print("Local features (top 8 by permutation importance):")
+            print(topl)
+    except Exception:
+        pass
+
+    print("\nTwo-stage strategy evaluation:")
+    print(f"- Gating feature: {metrics['gating_feature']}")
+    print(f"- Thresholds: low={metrics['thr_low']:.4g}, high={metrics['thr_high']:.4g}")
+    print(f"- Time horizon (days): {metrics['time_horizon_days']:.1f}")
+    if gating is not None:
+        print(
+            f"- Zone counts (low/mid/high): {metrics['n_zone_low']}/{metrics['n_zone_mid']}/{metrics['n_zone_high']} of {metrics['n_test']}"
+        )
+    print("- C-index baselines and two-stage (test):")
+    print(f"  * All-features RSF:     {metrics['c_index_all']:.4f}")
+    print(f"  * Global-only RSF:      {metrics['c_index_global_only']:.4f}")
+    print(f"  * Local-only RSF:       {metrics['c_index_local_only']:.4f}")
+    print(f"  * Two-stage (g->l mid): {metrics['c_index_two_stage']:.4f}")
+
+    return metrics
+
+
 def main():
     clean_df = load_dataframes()
     model, metrics, feat_imp = train_random_survival_forest(clean_df)
@@ -319,6 +589,9 @@ def main():
     print("Top feature importances:")
     topn = 15 if len(feat_imp) >= 15 else len(feat_imp)
     print(feat_imp.head(topn))
+
+    # Validate the global-first, local-then hypothesis
+    _ = evaluate_two_stage_strategy(clean_df)
 
 
 if __name__ == "__main__":
