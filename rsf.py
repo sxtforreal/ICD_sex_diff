@@ -509,28 +509,40 @@ def train_coxph_model(
         X, y, test_size=test_size, random_state=random_state
     )
 
-    model = CoxPHSurvivalAnalysis()
-    model.fit(X_train, y_train)
+    model = _fit_coxph_clean(X_train, y_train)
 
     # Use model's risk scores for C-index evaluation
     try:
-        risk_scores = model.predict(X_test)
+        if model is not None:
+            X_test_use = X_test
+            try:
+                feature_names_in = getattr(model, "feature_names_in_", None)
+                if feature_names_in is not None:
+                    X_test_use = X_test.loc[:, list(feature_names_in)]
+            except Exception:
+                X_test_use = X_test
+            risk_scores = model.predict(X_test_use)
+        else:
+            risk_scores = np.zeros(len(X_test), dtype=float)
     except Exception:
         risk_scores = np.zeros(len(X_test), dtype=float)
     e_field, t_field = _surv_field_names(y_test)
     test_c_index = float(concordance_index_censored(y_test[e_field].astype(bool), y_test[t_field].astype(float), risk_scores)[0])
     # Use permutation importance on the hold-out set as a model-agnostic alternative.
-    perm_result = permutation_importance(
-        model,
-        X_test,
-        y_test,
-        n_repeats=20,
-        random_state=random_state,
-        n_jobs=-1,
-    )
-    feat_imp = pd.Series(perm_result.importances_mean, index=feature_names).sort_values(
-        ascending=False
-    )
+    if model is not None:
+        perm_result = permutation_importance(
+            model,
+            X_test,
+            y_test,
+            n_repeats=20,
+            random_state=random_state,
+            n_jobs=-1,
+        )
+        feat_imp = pd.Series(perm_result.importances_mean, index=feature_names).sort_values(
+            ascending=False
+        )
+    else:
+        feat_imp = pd.Series(dtype=float)
     metrics = {"test_c_index": float(test_c_index)}
     # Visualization: feature importance
     try:
@@ -632,10 +644,18 @@ def _risk_at_time(model: object, X: pd.DataFrame, t: float) -> np.ndarray:
     """
     if X.empty:
         return np.zeros(0, dtype=float)
+    # Align to training features if available
+    X_use = X
+    try:
+        feature_names_in = getattr(model, "feature_names_in_", None)
+        if feature_names_in is not None:
+            X_use = X.loc[:, list(feature_names_in)]
+    except Exception:
+        X_use = X
     # Preferred path: survival function available
     try:
         if hasattr(model, "predict_survival_function"):
-            surv = model.predict_survival_function(X)
+            surv = model.predict_survival_function(X_use)
             s_at = np.array([sf(t) for sf in surv], dtype=float)
             s_at = np.clip(s_at, 0.0, 1.0)
             return 1.0 - s_at
@@ -643,7 +663,7 @@ def _risk_at_time(model: object, X: pd.DataFrame, t: float) -> np.ndarray:
         pass
     # Fallback: use risk scores and scale to [0,1]
     try:
-        scores = np.asarray(model.predict(X), dtype=float).ravel()
+        scores = np.asarray(model.predict(X_use), dtype=float).ravel()
         finite = np.isfinite(scores)
         if not finite.any():
             return np.zeros(len(X), dtype=float)
@@ -667,6 +687,49 @@ def _surv_field_names(y_arr) -> Tuple[str, str]:
     time_candidates = [n for n in names if n != event_field]
     time_field = "time" if "time" in names else time_candidates[0]
     return event_field, time_field
+
+
+def _clean_X_for_cox(X: pd.DataFrame) -> pd.DataFrame:
+    """Make design matrix numeric, finite, and reasonably conditioned for CoxPH.
+
+    - Coerces non-numeric columns to numeric (invalid parsed as NaN)
+    - Replaces inf/-inf with NaN, fills NaNs with column median (or 0.0 if median invalid)
+    - Drops columns with all-NaN
+    - Drops near-constant columns (std <= 1e-12)
+    """
+    Xc = X.copy()
+    for col in Xc.columns:
+        if not np.issubdtype(Xc[col].dtype, np.number):
+            Xc[col] = pd.to_numeric(Xc[col], errors="coerce")
+    Xc = Xc.replace([np.inf, -np.inf], np.nan)
+    if Xc.shape[1] > 0:
+        all_nan_cols = Xc.columns[Xc.isnull().all()].tolist()
+        if all_nan_cols:
+            Xc = Xc.drop(columns=all_nan_cols)
+    for col in Xc.columns:
+        if Xc[col].isnull().any():
+            med = Xc[col].median()
+            if not np.isfinite(med):
+                med = 0.0
+            Xc[col] = Xc[col].fillna(med)
+    if Xc.shape[1] > 0:
+        try:
+            std = Xc.std(ddof=0)
+            keep_cols = std[std > 1e-12].index.tolist()
+            Xc = Xc[keep_cols] if len(keep_cols) > 0 else Xc.iloc[:, :0]
+        except Exception:
+            pass
+    return Xc
+
+
+def _fit_coxph_clean(X: pd.DataFrame, y: np.ndarray) -> Optional[CoxPHSurvivalAnalysis]:
+    """Fit CoxPH with defensive cleaning. Returns None if not feasible."""
+    Xc = _clean_X_for_cox(X)
+    if Xc.shape[0] < 2 or Xc.shape[1] == 0:
+        return None
+    model = CoxPHSurvivalAnalysis()
+    model.fit(Xc, y)
+    return model
 
 
 def _binary_outcome_at_time(y_arr, t: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -748,11 +811,7 @@ def _optimize_gate_quantiles(
 
     # Fit inner models on X_tr
     def _fit(X, y) -> Optional[CoxPHSurvivalAnalysis]:
-        if X.shape[1] == 0:
-            return None
-        model = CoxPHSurvivalAnalysis()
-        model.fit(X, y)
-        return model
+        return _fit_coxph_clean(X, y)
 
     model_glob_in = _fit(X_tr[global_cols], y_tr) if have_global else None
     model_loc_in = _fit(X_tr[local_cols], y_tr) if have_local else None
@@ -838,11 +897,7 @@ def analyze_benefit_subgroup(
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
     def _fit(X, y) -> Optional[CoxPHSurvivalAnalysis]:
-        if X.shape[1] == 0:
-            return None
-        model = CoxPHSurvivalAnalysis()
-        model.fit(X, y)
-        return model
+        return _fit_coxph_clean(X, y)
 
     for tr_idx, va_idx in kf.split(X_all):
         X_tr, X_va = X_all.iloc[tr_idx], X_all.iloc[va_idx]
@@ -928,17 +983,19 @@ def analyze_benefit_subgroup(
             # Importance under ALL-features model, restricted to local features (conditional on globals)
             X_ben_all = X_all.loc[benefit_local, :]
             y_ben = y_all[benefit_local]
-            model_ben_all = CoxPHSurvivalAnalysis()
-            model_ben_all.fit(X_ben_all, y_ben)
-            perm_all = permutation_importance(
-                model_ben_all,
-                X_ben_all,
-                y_ben,
-                n_repeats=20,
-                random_state=random_state,
-                n_jobs=-1,
-            )
-            fi_all = pd.Series(perm_all.importances_mean, index=X_ben_all.columns).sort_values(ascending=False)
+            model_ben_all = _fit_coxph_clean(X_ben_all, y_ben)
+            if model_ben_all is not None:
+                perm_all = permutation_importance(
+                    model_ben_all,
+                    X_ben_all,
+                    y_ben,
+                    n_repeats=20,
+                    random_state=random_state,
+                    n_jobs=-1,
+                )
+                fi_all = pd.Series(perm_all.importances_mean, index=X_ben_all.columns).sort_values(ascending=False)
+            else:
+                fi_all = pd.Series(dtype=float)
             fi_local_cond = fi_all[fi_all.index.isin(local_cols)].sort_values(ascending=False)
             metrics["local_feature_importance_in_benefit_conditional"] = fi_local_cond.head(topk_local_importance)
             try:
@@ -956,17 +1013,19 @@ def analyze_benefit_subgroup(
 
             # Also report local-only model importance within benefit subgroup (pure local effect)
             X_ben_loc = X_all.loc[benefit_local, local_cols]
-            model_ben_loc = CoxPHSurvivalAnalysis()
-            model_ben_loc.fit(X_ben_loc, y_ben)
-            perm_loc = permutation_importance(
-                model_ben_loc,
-                X_ben_loc,
-                y_ben,
-                n_repeats=20,
-                random_state=random_state,
-                n_jobs=-1,
-            )
-            fi_loc = pd.Series(perm_loc.importances_mean, index=local_cols).sort_values(ascending=False)
+            model_ben_loc = _fit_coxph_clean(X_ben_loc, y_ben)
+            if model_ben_loc is not None:
+                perm_loc = permutation_importance(
+                    model_ben_loc,
+                    X_ben_loc,
+                    y_ben,
+                    n_repeats=20,
+                    random_state=random_state,
+                    n_jobs=-1,
+                )
+                fi_loc = pd.Series(perm_loc.importances_mean, index=local_cols).sort_values(ascending=False)
+            else:
+                fi_loc = pd.Series(dtype=float)
             metrics["local_feature_importance_in_benefit_localOnly"] = fi_loc.head(topk_local_importance)
             try:
                 _plot_series_barh(
@@ -1078,11 +1137,7 @@ def evaluate_two_stage_strategy(
 
     # Train CoxPH models
     def _fit(X, y) -> Optional[CoxPHSurvivalAnalysis]:
-        if X.shape[1] == 0:
-            return None
-        model = CoxPHSurvivalAnalysis()
-        model.fit(X, y)
-        return model
+        return _fit_coxph_clean(X, y)
 
     model_all = _fit(X_train, y_train)
     model_global = _fit(X_train[global_cols], y_train) if have_global else None
@@ -1308,11 +1363,7 @@ def _compute_oof_three_model_risks(
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
     def _fit(Xtr, ytr) -> Optional[CoxPHSurvivalAnalysis]:
-        if Xtr.shape[1] == 0:
-            return None
-        model = CoxPHSurvivalAnalysis()
-        model.fit(Xtr, ytr)
-        return model
+        return _fit_coxph_clean(Xtr, ytr)
 
     t_values: List[float] = []
     for tr_idx, va_idx in kf.split(X):
@@ -1423,11 +1474,7 @@ def evaluate_three_model_grouping_and_rule(
 
     # Train CoxPH models on full training for test-time inference
     def _fit(X, y) -> Optional[CoxPHSurvivalAnalysis]:
-        if X.shape[1] == 0:
-            return None
-        model = CoxPHSurvivalAnalysis()
-        model.fit(X, y)
-        return model
+        return _fit_coxph_clean(X, y)
 
     # Fixed horizon for test evaluation = 75th percentile of train times
     e_field, t_field = _surv_field_names(y_train)
@@ -1674,11 +1721,7 @@ def train_assignment_classifier_and_tableone(
 
     # Train CoxPH models on full training
     def _fit(X, y):
-        if X.shape[1] == 0:
-            return None
-        m = CoxPHSurvivalAnalysis()
-        m.fit(X, y)
-        return m
+        return _fit_coxph_clean(X, y)
 
     model_all = _fit(X_train, y_train)
     model_gl = _fit(X_train[global_cols], y_train) if have_global else None
