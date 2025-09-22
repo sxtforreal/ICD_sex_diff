@@ -290,9 +290,13 @@ def conversion_and_imputation(df, features, labels):
     exist_bin = [c for c in binary_cols if c in df.columns]
     for c in exist_bin:
         if df[c].dtype == "object":
-            df[c] = df[c].replace(
+            _tmp = df[c].replace(
                 {"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0}
             )
+            try:
+                df[c] = _tmp.infer_objects(copy=False)
+            except Exception:
+                df[c] = _tmp
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # Imputation on feature matrix
