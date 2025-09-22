@@ -587,6 +587,7 @@ def analyze_benefit_subgroup(
 
     risk_glob_oof = np.full(n, np.nan, dtype=float)
     risk_loc_oof = np.full(n, np.nan, dtype=float)
+    risk_all_oof = np.full(n, np.nan, dtype=float)
     y_bin_oof = np.full(n, np.nan, dtype=float)
     known_oof = np.zeros(n, dtype=bool)
 
@@ -619,6 +620,7 @@ def analyze_benefit_subgroup(
         # Train models
         model_gl = _fit(X_tr[global_cols], y_tr) if have_global else None
         model_lo = _fit(X_tr[local_cols], y_tr) if have_local else None
+        model_all = _fit(X_tr, y_tr)
 
         # OOF risk predictions at t
         risk_gl = (
@@ -627,6 +629,7 @@ def analyze_benefit_subgroup(
         risk_lo = (
             _rsf_risk_at_time(model_lo, X_va[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_va))
         )
+        risk_all = _rsf_risk_at_time(model_all, X_va, t_hor) if model_all is not None else np.zeros(len(X_va))
 
         # Binary outcome at t with known mask
         y_bin, known = _binary_outcome_at_time(y_va, t_hor)
@@ -634,14 +637,28 @@ def analyze_benefit_subgroup(
         # Store
         risk_glob_oof[va_idx] = risk_gl
         risk_loc_oof[va_idx] = risk_lo
+        risk_all_oof[va_idx] = risk_all
         y_bin_oof[va_idx] = y_bin
         known_oof[va_idx] = known
 
     # Define benefit by squared-error improvement with optional margin
     err_gl = (risk_glob_oof - y_bin_oof) ** 2
     err_lo = (risk_loc_oof - y_bin_oof) ** 2
-    benefit_mask = (known_oof) & np.isfinite(err_gl) & np.isfinite(err_lo) & (err_gl - err_lo > margin)
-    nonbenefit_mask = (known_oof) & np.isfinite(err_gl) & np.isfinite(err_lo) & ~(err_gl - err_lo > margin)
+    err_all = (risk_all_oof - y_bin_oof) ** 2
+
+    valid = known_oof & np.isfinite(err_gl) & np.isfinite(err_lo) & np.isfinite(err_all)
+    # Benefit definitions (incremental):
+    benefit_local = valid & (err_gl - err_all > margin)  # Adding local to global helps
+    benefit_global = valid & (err_lo - err_all > margin)  # Adding global to local helps
+    # Best-of-three winner per sample
+    best_idx = np.full(len(X_all), -1, dtype=int)
+    if valid.any():
+        triple = np.vstack([err_gl[valid], err_lo[valid], err_all[valid]])  # rows: G, L, A
+        best = np.argmin(triple, axis=0)
+        best_idx[np.where(valid)[0]] = best
+    best_g = best_idx == 0
+    best_l = best_idx == 1
+    best_a = best_idx == 2
 
     # C-index within groups using OOF risks
     def _c_index(y, risk):
@@ -653,23 +670,28 @@ def analyze_benefit_subgroup(
     metrics: Dict[str, object] = {
         "n": int(n),
         "n_labeled": int(known_oof.sum()),
-        "n_benefit": int(benefit_mask.sum()),
-        "n_nonbenefit": int(nonbenefit_mask.sum()),
+        "n_valid": int(valid.sum()),
+        "n_benefit_local": int(benefit_local.sum()),
+        "n_benefit_global": int(benefit_global.sum()),
+        "n_best_global": int((valid & best_g).sum()),
+        "n_best_local": int((valid & best_l).sum()),
+        "n_best_all": int((valid & best_a).sum()),
     }
 
-    if benefit_mask.sum() > 1:
-        metrics["c_index_local_in_benefit"] = _c_index(y_all[benefit_mask], risk_loc_oof[benefit_mask])
-        metrics["c_index_global_in_benefit"] = _c_index(y_all[benefit_mask], risk_glob_oof[benefit_mask])
-    if nonbenefit_mask.sum() > 1:
-        metrics["c_index_local_in_nonbenefit"] = _c_index(y_all[nonbenefit_mask], risk_loc_oof[nonbenefit_mask])
-        metrics["c_index_global_in_nonbenefit"] = _c_index(y_all[nonbenefit_mask], risk_glob_oof[nonbenefit_mask])
+    if benefit_local.sum() > 1:
+        metrics["c_index_global_in_benefitLocal"] = _c_index(y_all[benefit_local], risk_glob_oof[benefit_local])
+        metrics["c_index_all_in_benefitLocal"] = _c_index(y_all[benefit_local], risk_all_oof[benefit_local])
+    if benefit_global.sum() > 1:
+        metrics["c_index_local_in_benefitGlobal"] = _c_index(y_all[benefit_global], risk_loc_oof[benefit_global])
+        metrics["c_index_all_in_benefitGlobal"] = _c_index(y_all[benefit_global], risk_all_oof[benefit_global])
 
     # Train local-only model on benefit subgroup and compute permutation importance
     try:
-        if benefit_mask.sum() >= 10:
-            X_ben = X_all.loc[benefit_mask, local_cols]
-            y_ben = y_all[benefit_mask]
-            model_ben = RandomSurvivalForest(
+        if benefit_local.sum() >= 10:
+            # Importance under ALL-features model, restricted to local features (conditional on globals)
+            X_ben_all = X_all.loc[benefit_local, :]
+            y_ben = y_all[benefit_local]
+            model_ben_all = RandomSurvivalForest(
                 n_estimators=500,
                 min_samples_split=10,
                 min_samples_leaf=5,
@@ -677,32 +699,60 @@ def analyze_benefit_subgroup(
                 n_jobs=-1,
                 random_state=random_state,
             )
-            model_ben.fit(X_ben, y_ben)
-            perm = permutation_importance(
-                model_ben,
-                X_ben,
+            model_ben_all.fit(X_ben_all, y_ben)
+            perm_all = permutation_importance(
+                model_ben_all,
+                X_ben_all,
                 y_ben,
                 n_repeats=20,
                 random_state=random_state,
                 n_jobs=-1,
             )
-            fi = pd.Series(perm.importances_mean, index=local_cols).sort_values(ascending=False)
-            metrics["local_feature_importance_in_benefit"] = fi.head(topk_local_importance)
-            print("\nBenefit subgroup: local feature importance (top):")
-            print(metrics["local_feature_importance_in_benefit"])
+            fi_all = pd.Series(perm_all.importances_mean, index=X_ben_all.columns).sort_values(ascending=False)
+            fi_local_cond = fi_all[fi_all.index.isin(local_cols)].sort_values(ascending=False)
+            metrics["local_feature_importance_in_benefit_conditional"] = fi_local_cond.head(topk_local_importance)
+
+            # Also report local-only model importance within benefit subgroup (pure local effect)
+            X_ben_loc = X_all.loc[benefit_local, local_cols]
+            model_ben_loc = RandomSurvivalForest(
+                n_estimators=500,
+                min_samples_split=10,
+                min_samples_leaf=5,
+                max_features="sqrt",
+                n_jobs=-1,
+                random_state=random_state,
+            )
+            model_ben_loc.fit(X_ben_loc, y_ben)
+            perm_loc = permutation_importance(
+                model_ben_loc,
+                X_ben_loc,
+                y_ben,
+                n_repeats=20,
+                random_state=random_state,
+                n_jobs=-1,
+            )
+            fi_loc = pd.Series(perm_loc.importances_mean, index=local_cols).sort_values(ascending=False)
+            metrics["local_feature_importance_in_benefit_localOnly"] = fi_loc.head(topk_local_importance)
+
+            print("\nBenefit subgroup (A better than G): local feature importance (conditional on globals, top):")
+            print(metrics["local_feature_importance_in_benefit_conditional"])
+            print("\nBenefit subgroup: local-only model feature importance (top):")
+            print(metrics["local_feature_importance_in_benefit_localOnly"])
     except Exception:
         pass
 
     print("\nBenefit subgroup analysis:")
-    print(f"- Labeled at t: {metrics['n_labeled']} / {metrics['n']}")
-    print(f"- Benefit / Non-benefit: {metrics['n_benefit']} / {metrics['n_nonbenefit']}")
-    if "c_index_local_in_benefit" in metrics:
+    print(f"- Labeled at t: {metrics['n_labeled']} / {metrics['n']} (valid={metrics['n_valid']})")
+    print(f"- Benefit (A better than G): {metrics['n_benefit_local']}")
+    print(f"- Benefit (A better than L): {metrics['n_benefit_global']}")
+    print(f"- Best model counts [G/L/A]: {metrics['n_best_global']} / {metrics['n_best_local']} / {metrics['n_best_all']}")
+    if "c_index_global_in_benefitLocal" in metrics:
         print(
-            f"- C-index in BENEFIT: local={metrics['c_index_local_in_benefit']:.4f}, global={metrics['c_index_global_in_benefit']:.4f}"
+            f"- C-index in BENEFIT(A>G): all={metrics['c_index_all_in_benefitLocal']:.4f}, global={metrics['c_index_global_in_benefitLocal']:.4f}"
         )
-    if "c_index_local_in_nonbenefit" in metrics:
+    if "c_index_local_in_benefitGlobal" in metrics:
         print(
-            f"- C-index in NON-BENEFIT: local={metrics['c_index_local_in_nonbenefit']:.4f}, global={metrics['c_index_global_in_nonbenefit']:.4f}"
+            f"- C-index in BENEFIT(A>L): all={metrics['c_index_all_in_benefitGlobal']:.4f}, local={metrics['c_index_local_in_benefitGlobal']:.4f}"
         )
 
     return metrics
