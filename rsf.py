@@ -17,6 +17,8 @@ from sklearn.metrics import accuracy_score, f1_score, classification_report, con
 from sksurv.linear_model import CoxPHSurvivalAnalysis
 from sksurv.metrics import concordance_index_censored
 from sksurv.util import Surv
+from lifelines import CoxPHFitter
+from lifelines.utils import concordance_index
 
 try:
     from missingpy import MissForest
@@ -797,6 +799,256 @@ def _sanitize_cox_features_matrix(
         pass
 
     return Xs
+
+
+def _fit_cox_lifelines(
+    train_df: pd.DataFrame, feature_cols: List[str], time_col: str, event_col: str
+) -> Optional[CoxPHFitter]:
+    """Fit CoxPH via lifelines with sanitization to avoid singularities/overflows."""
+    if train_df is None or len(train_df) == 0 or not feature_cols:
+        return None
+    # Sanitize feature matrix
+    X_sanitized = _sanitize_cox_features_matrix(train_df[feature_cols], corr_threshold=0.995, verbose=False)
+    kept_features = list(X_sanitized.columns)
+    if len(kept_features) == 0:
+        return None
+    df_fit = pd.concat(
+        [
+            train_df[[time_col, event_col]].reset_index(drop=True),
+            X_sanitized.reset_index(drop=True),
+        ],
+        axis=1,
+    )
+    cph = CoxPHFitter(penalizer=0.1, l1_ratio=0.0)
+    try:
+        cph.fit(df_fit, duration_col=time_col, event_col=event_col, robust=True)
+        return cph
+    except Exception:
+        # Retry with stronger sanitization and regularization
+        X_sanitized2 = _sanitize_cox_features_matrix(train_df[feature_cols], corr_threshold=0.95, verbose=False)
+        if X_sanitized2.shape[1] == 0:
+            return None
+        df_fit2 = pd.concat(
+            [
+                train_df[[time_col, event_col]].reset_index(drop=True),
+                X_sanitized2.reset_index(drop=True),
+            ],
+            axis=1,
+        )
+        try:
+            cph2 = CoxPHFitter(penalizer=1.0, l1_ratio=0.0)
+            cph2.fit(df_fit2, duration_col=time_col, event_col=event_col, robust=True)
+            return cph2
+        except Exception:
+            return None
+
+
+def _predict_risk_lifelines(model: CoxPHFitter, df: pd.DataFrame) -> np.ndarray:
+    if model is None or df is None or len(df) == 0:
+        return np.zeros(0, dtype=float)
+    try:
+        model_features = list(model.params_.index)
+        X = df.copy()
+        for c in model_features:
+            if c not in X.columns:
+                X[c] = 0.0
+        X = X[model_features]
+        risk = model.predict_partial_hazard(X).values.reshape(-1)
+        risk = np.asarray(risk, dtype=float)
+        risk[~np.isfinite(risk)] = 0.0
+        return risk
+    except Exception:
+        return np.zeros(len(df), dtype=float)
+
+
+def _compute_oof_three_risks_lifelines(
+    df: pd.DataFrame,
+    global_cols: List[str],
+    local_cols: List[str],
+    time_col: str,
+    event_col: str,
+    n_splits: int = 5,
+    random_state: int = 42,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Out-of-fold risk scores for Global/Local/All CoxPH (lifelines)."""
+    n = len(df)
+    risk_glob = np.full(n, np.nan, dtype=float)
+    risk_loc = np.full(n, np.nan, dtype=float)
+    risk_all = np.full(n, np.nan, dtype=float)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+
+    all_feature_cols = [c for c in df.columns if c not in [time_col, event_col, "MRN", "ICD"]]
+
+    for tr_idx, va_idx in kf.split(df):
+        tr = df.iloc[tr_idx]
+        va = df.iloc[va_idx]
+
+        # Fit three models on fold-train
+        model_gl = _fit_cox_lifelines(tr, [c for c in global_cols if c in tr.columns], time_col, event_col) if len(global_cols) > 0 else None
+        model_lo = _fit_cox_lifelines(tr, [c for c in local_cols if c in tr.columns], time_col, event_col) if len(local_cols) > 0 else None
+        model_all = _fit_cox_lifelines(tr, [c for c in all_feature_cols if c in tr.columns], time_col, event_col)
+
+        # Predict risks on fold-val
+        risk_gl = _predict_risk_lifelines(model_gl, va) if model_gl is not None else np.zeros(len(va))
+        risk_lo = _predict_risk_lifelines(model_lo, va) if model_lo is not None else np.zeros(len(va))
+        risk_al = _predict_risk_lifelines(model_all, va) if model_all is not None else np.zeros(len(va))
+
+        risk_glob[va_idx] = risk_gl
+        risk_loc[va_idx] = risk_lo
+        risk_all[va_idx] = risk_al
+
+    # Replace any residual NaNs with 0
+    for arr in (risk_glob, risk_loc, risk_all):
+        mask = ~np.isfinite(arr)
+        if mask.any():
+            arr[mask] = 0.0
+    return risk_glob, risk_loc, risk_all
+
+
+def evaluate_three_model_assignment_and_classifier(
+    clean_df: pd.DataFrame,
+    test_size: float = 0.25,
+    random_state: int = 42,
+    output_dir: Optional[str] = None,
+) -> Dict[str, object]:
+    """Lifelines CoxPH for three feature sets (Global/Local/All),
+    assign per-patient best model without fixed horizon, and train a classifier to predict the assignment.
+
+    Assignment rule per patient i:
+      - if event_i == 1: choose model with highest predicted risk
+      - if event_i == 0: choose model with lowest predicted risk
+    """
+    df = clean_df.copy()
+    # Ensure basic dtypes
+    df["VT/VF/SCD"] = pd.to_numeric(df["VT/VF/SCD"], errors="coerce").fillna(0).astype(int)
+    df["PE_Time"] = pd.to_numeric(df["PE_Time"], errors="coerce").fillna(0).astype(float)
+    df = df.dropna(subset=["PE_Time"]).copy()
+
+    # Feature groups
+    X_all, y_all, feature_names = _prepare_survival_xy(df)
+    global_cols, local_cols, _ = _find_feature_groups(feature_names)
+    have_global = len(global_cols) > 0
+    have_local = len(local_cols) > 0
+    if not (have_global and have_local):
+        print("Three-model assignment skipped: missing global or local feature groups.")
+        return {"have_global": have_global, "have_local": have_local}
+
+    # Build a modeling DataFrame for lifelines containing all features
+    feat_all_cols = [c for c in feature_names]
+    df_model = pd.concat([
+        df[["PE_Time", "VT/VF/SCD"]].reset_index(drop=True),
+        X_all[feat_all_cols].reset_index(drop=True)
+    ], axis=1)
+
+    # OOF risks on full data (for assignment labels)
+    risk_gl_oof, risk_lo_oof, risk_all_oof = _compute_oof_three_risks_lifelines(
+        df_model, global_cols, local_cols, time_col="PE_Time", event_col="VT/VF/SCD", n_splits=5, random_state=random_state
+    )
+
+    evt = df_model["VT/VF/SCD"].values.astype(int)
+    # Choose per-sample best model among 0=Global, 1=Local, 2=All
+    risks_stack = np.vstack([risk_gl_oof, risk_lo_oof, risk_all_oof])  # shape (3, n)
+    best_idx = np.zeros(len(df_model), dtype=int)
+    # Event -> argmax risk; No-event -> argmin risk
+    best_idx[evt == 1] = np.argmax(risks_stack[:, evt == 1], axis=0)
+    best_idx[evt == 0] = np.argmin(risks_stack[:, evt == 0], axis=0)
+
+    # Train/test split for classifier and evaluation
+    tr_idx, te_idx = train_test_split(
+        np.arange(len(df_model)), test_size=test_size, random_state=random_state, stratify=evt
+    )
+    tr_df = df_model.iloc[tr_idx].copy()
+    te_df = df_model.iloc[te_idx].copy()
+    y_tr_assign = best_idx[tr_idx]
+    y_te_assign = best_idx[te_idx]
+
+    # Fit three lifelines Cox models on training set for test-time metrics
+    model_gl = _fit_cox_lifelines(tr_df, [c for c in global_cols if c in tr_df.columns], time_col="PE_Time", event_col="VT/VF/SCD")
+    model_lo = _fit_cox_lifelines(tr_df, [c for c in local_cols if c in tr_df.columns], time_col="PE_Time", event_col="VT/VF/SCD")
+    feat_all_cols_tr = [c for c in feat_all_cols if c in tr_df.columns]
+    model_all = _fit_cox_lifelines(tr_df, feat_all_cols_tr, time_col="PE_Time", event_col="VT/VF/SCD")
+
+    risk_gl_te = _predict_risk_lifelines(model_gl, te_df)
+    risk_lo_te = _predict_risk_lifelines(model_lo, te_df)
+    risk_all_te = _predict_risk_lifelines(model_all, te_df)
+
+    # Test-set C-index for three models
+    cidx_gl = concordance_index(te_df["PE_Time"].values, -risk_gl_te, te_df["VT/VF/SCD"].values)
+    cidx_lo = concordance_index(te_df["PE_Time"].values, -risk_lo_te, te_df["VT/VF/SCD"].values)
+    cidx_all = concordance_index(te_df["PE_Time"].values, -risk_all_te, te_df["VT/VF/SCD"].values)
+
+    # Train classifier to predict assignment label (0=Global,1=Local,2=All)
+    from sklearn.pipeline import Pipeline as SkPipeline
+    from sklearn.preprocessing import StandardScaler as SkStandardScaler
+    clf = SkPipeline([
+        ("scaler", SkStandardScaler()),
+        ("clf", LogisticRegression(multi_class="multinomial", solver="lbfgs", max_iter=2000)),
+    ])
+    X_tr_cls = tr_df.drop(columns=["PE_Time", "VT/VF/SCD"], errors="ignore")
+    X_te_cls = te_df.drop(columns=["PE_Time", "VT/VF/SCD"], errors="ignore")
+    clf.fit(X_tr_cls, y_tr_assign)
+    y_pred = clf.predict(X_te_cls)
+    acc = float(accuracy_score(y_te_assign, y_pred))
+    f1_macro = float(f1_score(y_te_assign, y_pred, average="macro"))
+
+    print("\nThree-model assignment via lifelines CoxPH:")
+    print(f"- Global cols: {len(global_cols)}, Local cols: {len(local_cols)}, All cols: {len(feat_all_cols)}")
+    print(f"- Test C-index | Global: {cidx_gl:.4f} | Local: {cidx_lo:.4f} | All: {cidx_all:.4f}")
+    print(f"- Assignment classifier | Acc: {acc:.4f} | F1-macro: {f1_macro:.4f}")
+    try:
+        print(classification_report(y_te_assign, y_pred, target_names=["Global","Local","All"]))
+    except Exception:
+        pass
+
+    # Visualize classifier top coefficients per class
+    try:
+        lr = clf.named_steps.get("clf")
+        if lr is not None and hasattr(lr, "coef_"):
+            coef = lr.coef_
+            feat = X_tr_cls.columns.to_list()
+            coef_df = pd.DataFrame(coef, columns=feat, index=["Global","Local","All"]).T
+            if output_dir:
+                _ensure_dir(output_dir)
+                coef_df.to_csv(os.path.join(output_dir, "assignment_lifelines_coef.csv"))
+            topk = 15
+            for cls in ["Global","Local","All"]:
+                ser = coef_df[cls].abs().sort_values(ascending=False).head(topk)
+                _plot_series_barh(
+                    ser,
+                    topn=len(ser),
+                    title=f"Assignment classifier top features for {cls}",
+                    xlabel="|coefficient|",
+                    output_dir=output_dir,
+                    filename=f"assignment_lifelines_top_{cls.lower()}.png",
+                    color="#2ca02c" if cls=="Global" else ("#ff7f0e" if cls=="Local" else "#1f77b4"),
+                )
+    except Exception:
+        pass
+
+    # Counts plot of assigned groups
+    try:
+        counts = pd.Series({"Global": int((best_idx==0).sum()), "Local": int((best_idx==1).sum()), "All": int((best_idx==2).sum())})
+        _plot_series_barh(
+            counts,
+            topn=len(counts),
+            title="Assigned best model counts (OOF)",
+            xlabel="Count",
+            output_dir=output_dir,
+            filename="assignment_lifelines_counts.png",
+            color="#9467bd",
+        )
+    except Exception:
+        pass
+
+    return {
+        "c_index_global": float(cidx_gl),
+        "c_index_local": float(cidx_lo),
+        "c_index_all": float(cidx_all),
+        "accuracy": acc,
+        "macro_f1": f1_macro,
+        "n_train": int(len(tr_df)),
+        "n_test": int(len(te_df)),
+    }
 
 
 def _clean_X_for_cox(X: pd.DataFrame) -> pd.DataFrame:
@@ -2004,31 +2256,8 @@ def train_assignment_classifier_and_tableone(
 
 def main():
     clean_df = load_dataframes()
-    figs_dir = os.path.join("figures", "coxph")
-    model, metrics, feat_imp = train_coxph_model(clean_df, output_dir=figs_dir)
-    print(f"Test C-index: {metrics['test_c_index']:.4f}")
-    print("Top feature importances:")
-    topn = 15 if len(feat_imp) >= 15 else len(feat_imp)
-    print(feat_imp.head(topn))
-
-    # Validate the global-first, local-then hypothesis
-    _ = evaluate_two_stage_strategy(
-        clean_df,
-        optimize_thresholds=True,
-        output_dir=figs_dir,
-    )
-
-    # Analyze benefit subgroup and local-feature importance within it
-    _ = analyze_benefit_subgroup(clean_df, output_dir=figs_dir)
-
-    # Stage-1: best-of-three grouping and rule learning/evaluation
-    _ = evaluate_three_model_grouping_and_rule(
-        clean_df,
-        output_dir=figs_dir,
-    )
-
-    # Stage-1 enhanced: train assignment classifier and produce TableOne
-    _ = train_assignment_classifier_and_tableone(
+    figs_dir = os.path.join("figures", "coxph_lifelines_three_model")
+    _ = evaluate_three_model_assignment_and_classifier(
         clean_df,
         output_dir=figs_dir,
     )
