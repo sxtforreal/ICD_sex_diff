@@ -232,3 +232,83 @@ def load_dataframes() -> pd.DataFrame:
     return clean_df
 
 
+def _prepare_survival_xy(clean_df: pd.DataFrame,
+                         drop_cols: Optional[List[str]] = None) -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+    """
+    Prepare X and y for survival modeling from cleaned data.
+
+    Expects columns: "VT/VF/SCD" (event, 0/1) and "PE_Time" (time in days).
+    """
+    if drop_cols is None:
+        drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
+
+    df = clean_df.copy()
+    df = df.dropna(subset=["PE_Time"])  # ensure valid times
+    if not np.issubdtype(df["PE_Time"].dtype, np.number):
+        df["PE_Time"] = pd.to_numeric(df["PE_Time"], errors="coerce")
+        df = df.dropna(subset=["PE_Time"])
+
+    df["VT/VF/SCD"] = df["VT/VF/SCD"].fillna(0).astype(int).astype(bool)
+
+    X = df.drop(columns=drop_cols, errors="ignore")
+    # Defensive: coerce any non-numeric leftovers
+    non_numeric = X.select_dtypes(exclude=[np.number]).columns.tolist()
+    if non_numeric:
+        X[non_numeric] = X[non_numeric].apply(pd.to_numeric, errors="coerce")
+        for col in non_numeric:
+            if X[col].isnull().any():
+                X[col] = X[col].fillna(X[col].median())
+
+    feature_names = X.columns.tolist()
+    y = Surv.from_dataframe(event="VT/VF/SCD", time="PE_Time", data=df)
+    return X, y, feature_names
+
+
+def train_random_survival_forest(
+    clean_df: pd.DataFrame,
+    test_size: float = 0.25,
+    random_state: int = 42,
+    n_estimators: int = 500,
+    min_samples_split: int = 10,
+    min_samples_leaf: int = 5,
+    max_features: Optional[str] = "sqrt",
+) -> Tuple[RandomSurvivalForest, Dict[str, float], pd.Series]:
+    """
+    Train RSF on cleaned data and evaluate with concordance index on a hold-out test set.
+
+    Returns: (fitted model, metrics dict, feature_importances series)
+    """
+    X, y, feature_names = _prepare_survival_xy(clean_df)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state
+    )
+
+    rsf = RandomSurvivalForest(
+        n_estimators=n_estimators,
+        min_samples_split=min_samples_split,
+        min_samples_leaf=min_samples_leaf,
+        max_features=max_features,
+        n_jobs=-1,
+        random_state=random_state,
+    )
+    rsf.fit(X_train, y_train)
+
+    test_c_index = rsf.score(X_test, y_test)
+    feat_imp = pd.Series(rsf.feature_importances_, index=feature_names).sort_values(ascending=False)
+    metrics = {"test_c_index": float(test_c_index)}
+    return rsf, metrics, feat_imp
+
+
+def main():
+    clean_df = load_dataframes()
+    model, metrics, feat_imp = train_random_survival_forest(clean_df)
+    print(f"Test C-index: {metrics['test_c_index']:.4f}")
+    print("Top feature importances:")
+    topn = 15 if len(feat_imp) >= 15 else len(feat_imp)
+    print(feat_imp.head(topn))
+
+
+if __name__ == "__main__":
+    main()
+
