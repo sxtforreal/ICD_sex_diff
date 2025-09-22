@@ -2,6 +2,8 @@ from typing import List, Tuple, Optional, Dict
 import numpy as np
 import pandas as pd
 import os
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from sklearn.model_selection import train_test_split, GridSearchCV, KFold
 from sklearn.preprocessing import OneHotEncoder
@@ -37,6 +39,116 @@ def impute_misforest(X, random_seed):
         scaler.inverse_transform(X_imputed_scaled), columns=X.columns, index=X.index
     )
     return X_imputed_unscaled
+
+
+def _ensure_dir(path: Optional[str]) -> None:
+    if path is None:
+        return
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _save_fig(fig: plt.Figure, output_dir: Optional[str], filename: str) -> None:
+    if output_dir:
+        _ensure_dir(output_dir)
+        try:
+            fig.savefig(os.path.join(output_dir, filename), dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            return
+        except Exception:
+            pass
+    # Fallback to on-screen display
+    try:
+        fig.tight_layout()
+    except Exception:
+        pass
+    plt.show()
+
+
+def _plot_series_barh(
+    series: pd.Series,
+    topn: int,
+    title: str,
+    xlabel: str,
+    output_dir: Optional[str],
+    filename: str,
+    color: str = "#1f77b4",
+) -> None:
+    ser = series.dropna()
+    if len(ser) == 0:
+        return
+    ser = ser.sort_values(ascending=True)
+    if topn is not None and topn > 0 and len(ser) > topn:
+        ser = ser.iloc[-topn:]
+    fig, ax = plt.subplots(figsize=(7.5, max(3.0, 0.35 * len(ser))))
+    ax.barh(range(len(ser)), ser.values, color=color)
+    ax.set_yticks(range(len(ser)))
+    ax.set_yticklabels(ser.index)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    fig.tight_layout()
+    _save_fig(fig, output_dir, filename)
+
+
+def _plot_cindex_bars(metrics: Dict[str, float], output_dir: Optional[str]) -> None:
+    labels = ["All", "Global", "Local", "Two-stage"]
+    keys = [
+        "c_index_all",
+        "c_index_global_only",
+        "c_index_local_only",
+        "c_index_two_stage",
+    ]
+    vals = [float(metrics.get(k, np.nan)) for k in keys]
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    sns.barplot(x=labels, y=vals, ax=ax, palette="Set2")
+    ax.set_ylabel("C-index (test)")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title("C-index comparison (RSF)")
+    for i, v in enumerate(vals):
+        if np.isfinite(v):
+            ax.text(i, v + 0.02, f"{v:.3f}", ha="center", va="bottom", fontsize=10)
+    fig.tight_layout()
+    _save_fig(fig, output_dir, "cindex_comparison.png")
+
+
+def _plot_gating_hist(
+    values: np.ndarray,
+    thr_low: float,
+    thr_high: float,
+    label: str,
+    output_dir: Optional[str],
+) -> None:
+    if values is None or len(values) == 0 or not np.isfinite(thr_low) or not np.isfinite(thr_high):
+        return
+    fig, ax = plt.subplots(figsize=(6.8, 4.2))
+    sns.histplot(values, kde=False, bins=30, color="#4c78a8", ax=ax)
+    ax.axvline(thr_low, ls=":", lw=2, color="#f58518", label=f"low thr = {thr_low:.3g}")
+    ax.axvline(thr_high, ls=":", lw=2, color="#e45756", label=f"high thr = {thr_high:.3g}")
+    ax.set_title(f"Gating distribution ({label})")
+    ax.set_xlabel(label)
+    ax.legend()
+    fig.tight_layout()
+    _save_fig(fig, output_dir, "gating_distribution.png")
+
+
+def _plot_zone_counts(metrics: Dict[str, float], output_dir: Optional[str]) -> None:
+    n_low = int(metrics.get("n_zone_low", 0))
+    n_mid = int(metrics.get("n_zone_mid", 0))
+    n_high = int(metrics.get("n_zone_high", 0))
+    if (n_low + n_mid + n_high) == 0:
+        return
+    fig, ax = plt.subplots(figsize=(5.8, 4.0))
+    labels = ["Low", "Mid", "High"]
+    vals = [n_low, n_mid, n_high]
+    sns.barplot(x=labels, y=vals, ax=ax, palette=["#4daf4a", "#377eb8", "#e41a1c"])
+    ax.set_ylabel("Count (test)")
+    ax.set_title("Zone counts by gating thresholds")
+    for i, v in enumerate(vals):
+        ax.text(i, v + max(1, 0.02 * max(vals)), str(v), ha="center", va="bottom")
+    fig.tight_layout()
+    _save_fig(fig, output_dir, "zone_counts.png")
 
 
 def conversion_and_imputation(df, features, labels):
@@ -279,6 +391,7 @@ def train_random_survival_forest(
     min_samples_split: int = 10,
     min_samples_leaf: int = 5,
     max_features: Optional[str] = "sqrt",
+    output_dir: Optional[str] = None,
 ) -> Tuple[RandomSurvivalForest, Dict[str, float], pd.Series]:
     """
     Train RSF on cleaned data and evaluate with concordance index on a hold-out test set.
@@ -316,6 +429,19 @@ def train_random_survival_forest(
         ascending=False
     )
     metrics = {"test_c_index": float(test_c_index)}
+    # Visualization: feature importance
+    try:
+        _plot_series_barh(
+            feat_imp,
+            topn=min(20, len(feat_imp)),
+            title="Permutation importance (test)",
+            xlabel="Importance (mean)",
+            output_dir=output_dir,
+            filename="feature_importance.png",
+            color="#2ca02c",
+        )
+    except Exception:
+        pass
     return rsf, metrics, feat_imp
 
 
@@ -569,6 +695,7 @@ def analyze_benefit_subgroup(
     percent_for_time: float = 0.75,
     margin: float = 0.0,
     topk_local_importance: int = 12,
+    output_dir: Optional[str] = None,
 ) -> Dict[str, object]:
     """
     Identify patients who benefit from local features and assess local-feature importance in that subgroup.
@@ -718,6 +845,18 @@ def analyze_benefit_subgroup(
             fi_all = pd.Series(perm_all.importances_mean, index=X_ben_all.columns).sort_values(ascending=False)
             fi_local_cond = fi_all[fi_all.index.isin(local_cols)].sort_values(ascending=False)
             metrics["local_feature_importance_in_benefit_conditional"] = fi_local_cond.head(topk_local_importance)
+            try:
+                _plot_series_barh(
+                    fi_local_cond,
+                    topn=topk_local_importance,
+                    title="Benefit (A>G): Local features (conditional)",
+                    xlabel="Importance (mean)",
+                    output_dir=output_dir,
+                    filename="benefit_local_conditional_importance.png",
+                    color="#1f77b4",
+                )
+            except Exception:
+                pass
 
             # Also report local-only model importance within benefit subgroup (pure local effect)
             X_ben_loc = X_all.loc[benefit_local, local_cols]
@@ -740,6 +879,18 @@ def analyze_benefit_subgroup(
             )
             fi_loc = pd.Series(perm_loc.importances_mean, index=local_cols).sort_values(ascending=False)
             metrics["local_feature_importance_in_benefit_localOnly"] = fi_loc.head(topk_local_importance)
+            try:
+                _plot_series_barh(
+                    fi_loc,
+                    topn=topk_local_importance,
+                    title="Benefit (A>G): Local-only model importance",
+                    xlabel="Importance (mean)",
+                    output_dir=output_dir,
+                    filename="benefit_local_only_importance.png",
+                    color="#ff7f0e",
+                )
+            except Exception:
+                pass
 
             print("\nBenefit subgroup (A better than G): local feature importance (conditional on globals, top):")
             print(metrics["local_feature_importance_in_benefit_conditional"])
@@ -762,6 +913,29 @@ def analyze_benefit_subgroup(
             f"- C-index in BENEFIT(A>L): all={metrics['c_index_all_in_benefitGlobal']:.4f}, local={metrics['c_index_local_in_benefitGlobal']:.4f}"
         )
 
+    # Counts visualization
+    try:
+        counts = pd.Series(
+            {
+                "Benefit(A>G)": metrics.get("n_benefit_local", 0),
+                "Benefit(A>L)": metrics.get("n_benefit_global", 0),
+                "Best=Global": metrics.get("n_best_global", 0),
+                "Best=Local": metrics.get("n_best_local", 0),
+                "Best=All": metrics.get("n_best_all", 0),
+            }
+        )
+        _plot_series_barh(
+            counts,
+            topn=len(counts),
+            title="Benefit subgroup counts",
+            xlabel="Count",
+            output_dir=output_dir,
+            filename="benefit_counts.png",
+            color="#2ca02c",
+        )
+    except Exception:
+        pass
+
     return metrics
 
 
@@ -776,6 +950,7 @@ def evaluate_two_stage_strategy(
     q_high_grid: Optional[List[float]] = None,
     min_gap: float = 0.10,
     inner_val_size: float = 0.33,
+    output_dir: Optional[str] = None,
 ) -> Dict[str, float]:
     """
     Validate a two-stage decision strategy:
@@ -953,6 +1128,18 @@ def evaluate_two_stage_strategy(
             topg = fi_glob.head(8)
             print("Global features (top 8 by permutation importance):")
             print(topg)
+            try:
+                _plot_series_barh(
+                    fi_glob,
+                    topn=15,
+                    title="Global features (perm importance)",
+                    xlabel="Importance (mean)",
+                    output_dir=output_dir,
+                    filename="global_perm_importance.png",
+                    color="#9467bd",
+                )
+            except Exception:
+                pass
         if model_local is not None:
             perm_loc = permutation_importance(
                 model_local, X_test[local_cols], y_test, n_repeats=10, random_state=random_state, n_jobs=-1
@@ -961,6 +1148,18 @@ def evaluate_two_stage_strategy(
             topl = fi_loc.head(8)
             print("Local features (top 8 by permutation importance):")
             print(topl)
+            try:
+                _plot_series_barh(
+                    fi_loc,
+                    topn=15,
+                    title="Local features (perm importance)",
+                    xlabel="Importance (mean)",
+                    output_dir=output_dir,
+                    filename="local_perm_importance.png",
+                    color="#8c564b",
+                )
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -983,12 +1182,25 @@ def evaluate_two_stage_strategy(
     print(f"  * Local-only RSF:       {metrics['c_index_local_only']:.4f}")
     print(f"  * Two-stage (g->l mid): {metrics['c_index_two_stage']:.4f}")
 
+    # Visualizations for two-stage
+    try:
+        _plot_cindex_bars(metrics, output_dir)
+    except Exception:
+        pass
+    try:
+        if gating is not None:
+            _plot_gating_hist(gate_train_vals, thr_low, thr_high, label=str(gating), output_dir=output_dir)
+            _plot_zone_counts(metrics, output_dir)
+    except Exception:
+        pass
+
     return metrics
 
 
 def main():
     clean_df = load_dataframes()
-    model, metrics, feat_imp = train_random_survival_forest(clean_df)
+    figs_dir = os.path.join("figures", "rsf")
+    model, metrics, feat_imp = train_random_survival_forest(clean_df, output_dir=figs_dir)
     print(f"Test C-index: {metrics['test_c_index']:.4f}")
     print("Top feature importances:")
     topn = 15 if len(feat_imp) >= 15 else len(feat_imp)
@@ -998,10 +1210,11 @@ def main():
     _ = evaluate_two_stage_strategy(
         clean_df,
         optimize_thresholds=True,
+        output_dir=figs_dir,
     )
 
     # Analyze benefit subgroup and local-feature importance within it
-    _ = analyze_benefit_subgroup(clean_df)
+    _ = analyze_benefit_subgroup(clean_df, output_dir=figs_dir)
 
 
 if __name__ == "__main__":
