@@ -469,7 +469,7 @@ def _prepare_survival_xy(clean_df: pd.DataFrame,
 
     df = clean_df.copy()
     df = df.dropna(subset=["PE_Time"])  # ensure valid times
-    if not np.issubdtype(df["PE_Time"].dtype, np.number):
+    if not pd.api.types.is_numeric_dtype(df["PE_Time"]):
         df["PE_Time"] = pd.to_numeric(df["PE_Time"], errors="coerce")
         df = df.dropna(subset=["PE_Time"])
 
@@ -480,13 +480,25 @@ def _prepare_survival_xy(clean_df: pd.DataFrame,
 
     X = df.drop(columns=drop_cols, errors="ignore")
     # Defensive: coerce any non-numeric leftovers
-    non_numeric = X.select_dtypes(exclude=[np.number]).columns.tolist()
+    non_numeric = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])]
     if non_numeric:
         X[non_numeric] = X[non_numeric].apply(pd.to_numeric, errors="coerce")
         for col in non_numeric:
             if X[col].isnull().any():
                 X[col] = X[col].fillna(X[col].median())
 
+    # Ensure all features are plain float64 to avoid pandas extension dtypes
+    try:
+        X = X.astype(float)
+    except Exception:
+        # Fallback: convert columns individually
+        for c in X.columns:
+            try:
+                X[c] = X[c].astype(float)
+            except Exception:
+                X[c] = pd.to_numeric(X[c], errors="coerce").astype(float)
+                if X[c].isnull().any():
+                    X[c] = X[c].fillna(X[c].median())
     feature_names = X.columns.tolist()
     y = Surv.from_dataframe(event="VT/VF/SCD", time="PE_Time", data=df)
     return X, y, feature_names
@@ -699,7 +711,7 @@ def _clean_X_for_cox(X: pd.DataFrame) -> pd.DataFrame:
     """
     Xc = X.copy()
     for col in Xc.columns:
-        if not np.issubdtype(Xc[col].dtype, np.number):
+        if not pd.api.types.is_numeric_dtype(Xc[col]):
             Xc[col] = pd.to_numeric(Xc[col], errors="coerce")
     Xc = Xc.replace([np.inf, -np.inf], np.nan)
     if Xc.shape[1] > 0:
@@ -719,6 +731,15 @@ def _clean_X_for_cox(X: pd.DataFrame) -> pd.DataFrame:
             Xc = Xc[keep_cols] if len(keep_cols) > 0 else Xc.iloc[:, :0]
         except Exception:
             pass
+    # Final cast to float64 to ensure compatibility with scikit-survival/sklearn
+    try:
+        Xc = Xc.astype(float)
+    except Exception:
+        for c in Xc.columns:
+            try:
+                Xc[c] = Xc[c].astype(float)
+            except Exception:
+                Xc[c] = pd.to_numeric(Xc[c], errors="coerce").astype(float).fillna(0.0)
     return Xc
 
 
