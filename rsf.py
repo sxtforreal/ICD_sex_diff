@@ -409,12 +409,139 @@ def _rsf_risk_at_time(model: RandomSurvivalForest, X: pd.DataFrame, t: float) ->
     return 1.0 - s_at
 
 
+def _optimize_gate_quantiles(
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    global_cols: List[str],
+    local_cols: List[str],
+    gating: Optional[str],
+    random_state: int,
+    time_horizon_days: float,
+    q_low_grid: Optional[List[float]] = None,
+    q_high_grid: Optional[List[float]] = None,
+    min_gap: float = 0.10,
+    inner_val_size: float = 0.33,
+) -> Tuple[Optional[float], Optional[float], Dict[str, float]]:
+    """
+    Choose (q_low, q_high) by maximizing validation C-index on an inner split of the training set.
+
+    Returns (best_q_low, best_q_high, info_dict). If not applicable, returns (None, None, {}).
+    """
+    # Basic availability checks
+    have_global = len(global_cols) > 0
+    have_local = len(local_cols) > 0
+    if gating is None and not have_local:
+        return None, None, {}
+
+    # Default grids
+    if q_low_grid is None:
+        q_low_grid = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+    if q_high_grid is None:
+        q_high_grid = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+
+    # Inner split for threshold tuning
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train, y_train, test_size=inner_val_size, random_state=random_state + 1
+    )
+
+    # Helper: robust field names for y
+    def _get_surv_field_names(y_arr) -> Tuple[str, str]:
+        names = getattr(y_arr.dtype, "names", None)
+        if not names or len(names) < 2:
+            return "event", "time"
+        event_field = "event" if "event" in names else names[0]
+        time_candidates = [n for n in names if n != event_field]
+        time_field = "time" if "time" in names else time_candidates[0]
+        return event_field, time_field
+
+    def _c_index(y, risk):
+        e_field, t_field = _get_surv_field_names(y)
+        evt = y[e_field].astype(bool)
+        tm = y[t_field].astype(float)
+        c = concordance_index_censored(evt, tm, risk)[0]
+        return float(c)
+
+    # Prepare gating values
+    if gating is not None and gating in X_tr.columns and gating in X_val.columns:
+        gate_tr_vals = X_tr[gating].astype(float).values
+        gate_val_vals = X_val[gating].astype(float).values
+    else:
+        if have_local:
+            gate_tr_vals = X_tr[local_cols].astype(float).sum(axis=1).values
+            gate_val_vals = X_val[local_cols].astype(float).sum(axis=1).values
+        else:
+            return None, None, {}
+
+    # Fit inner models on X_tr
+    def _fit(X, y) -> Optional[RandomSurvivalForest]:
+        if X.shape[1] == 0:
+            return None
+        rsf = RandomSurvivalForest(
+            n_estimators=500,
+            min_samples_split=10,
+            min_samples_leaf=5,
+            max_features="sqrt",
+            n_jobs=-1,
+            random_state=random_state,
+        )
+        rsf.fit(X, y)
+        return rsf
+
+    model_glob_in = _fit(X_tr[global_cols], y_tr) if have_global else None
+    model_loc_in = _fit(X_tr[local_cols], y_tr) if have_local else None
+
+    # Precompute validation risks
+    risk_glob_val = (
+        _rsf_risk_at_time(model_glob_in, X_val[global_cols], time_horizon_days)
+        if model_glob_in is not None
+        else np.zeros(len(X_val), dtype=float)
+    )
+    risk_loc_val = (
+        _rsf_risk_at_time(model_loc_in, X_val[local_cols], time_horizon_days)
+        if model_loc_in is not None
+        else np.zeros(len(X_val), dtype=float)
+    )
+
+    # Grid search
+    best_score = -np.inf
+    best_pair: Tuple[Optional[float], Optional[float]] = (None, None)
+    tried = 0
+    for ql in q_low_grid:
+        for qh in q_high_grid:
+            if qh - ql < min_gap:
+                continue
+            thr_l = float(np.nanquantile(gate_tr_vals, ql))
+            thr_h = float(np.nanquantile(gate_tr_vals, qh))
+            if not np.isfinite(thr_l) or not np.isfinite(thr_h) or thr_l >= thr_h:
+                continue
+            zone_high = gate_val_vals >= thr_h
+            zone_low = gate_val_vals < thr_l
+            zone_mid = ~(zone_high | zone_low)
+            risk_two = np.zeros(len(X_val), dtype=float)
+            risk_two[zone_high] = risk_glob_val[zone_high]
+            risk_two[zone_low] = risk_glob_val[zone_low]
+            risk_two[zone_mid] = risk_loc_val[zone_mid]
+            score = _c_index(y_val, risk_two)
+            tried += 1
+            if score > best_score:
+                best_score = score
+                best_pair = (ql, qh)
+
+    info: Dict[str, float] = {"tried": float(tried), "best_c_index_val": float(best_score)}
+    return best_pair[0], best_pair[1], info
+
+
 def evaluate_two_stage_strategy(
     clean_df: pd.DataFrame,
     test_size: float = 0.25,
     random_state: int = 42,
     q_low: float = 0.40,
     q_high: float = 0.75,
+    optimize_thresholds: bool = False,
+    q_low_grid: Optional[List[float]] = None,
+    q_high_grid: Optional[List[float]] = None,
+    min_gap: float = 0.10,
+    inner_val_size: float = 0.33,
 ) -> Dict[str, float]:
     """
     Validate a two-stage decision strategy:
@@ -502,15 +629,39 @@ def evaluate_two_stage_strategy(
             gate_test_vals = np.zeros(len(X_test), dtype=float)
             gating = None
 
+    selected_q_low = np.nan
+    selected_q_high = np.nan
     if gating is not None:
-        thr_low = float(np.nanquantile(gate_train_vals, q_low))
-        thr_high = float(np.nanquantile(gate_train_vals, q_high))
+        if optimize_thresholds:
+            ql_opt, qh_opt, _info = _optimize_gate_quantiles(
+                X_train,
+                y_train,
+                global_cols,
+                local_cols,
+                gating,
+                random_state,
+                t_hor,
+                q_low_grid=q_low_grid,
+                q_high_grid=q_high_grid,
+                min_gap=min_gap,
+                inner_val_size=inner_val_size,
+            )
+            if ql_opt is not None and qh_opt is not None:
+                selected_q_low = float(ql_opt)
+                selected_q_high = float(qh_opt)
+        # Fallback to provided q_low/q_high if no optimized pair
+        if not np.isfinite(selected_q_low) or not np.isfinite(selected_q_high):
+            selected_q_low = float(q_low)
+            selected_q_high = float(q_high)
+
+        thr_low = float(np.nanquantile(gate_train_vals, selected_q_low))
+        thr_high = float(np.nanquantile(gate_train_vals, selected_q_high))
         if not np.isfinite(thr_low):
             thr_low = float(np.nanmedian(gate_train_vals))
         if not np.isfinite(thr_high):
             thr_high = float(np.nanmedian(gate_train_vals))
         if thr_low >= thr_high:
-            # Enforce separation
+            # Enforce separation via fixed percentiles if degenerate
             thr_low, thr_high = float(np.nanpercentile(gate_train_vals, 40)), float(
                 np.nanpercentile(gate_train_vals, 75)
             )
@@ -550,6 +701,8 @@ def evaluate_two_stage_strategy(
         "gating_feature": gating if gating is not None else "<none>",
         "thr_low": thr_low,
         "thr_high": thr_high,
+        "q_low": float(selected_q_low) if np.isfinite(selected_q_low) else np.nan,
+        "q_high": float(selected_q_high) if np.isfinite(selected_q_high) else np.nan,
         "n_zone_low": int(zone_low.sum()) if gating is not None else 0,
         "n_zone_mid": int(zone_mid.sum()) if gating is not None else 0,
         "n_zone_high": int(zone_high.sum()) if gating is not None else 0,
@@ -579,7 +732,12 @@ def evaluate_two_stage_strategy(
 
     print("\nTwo-stage strategy evaluation:")
     print(f"- Gating feature: {metrics['gating_feature']}")
-    print(f"- Thresholds: low={metrics['thr_low']:.4g}, high={metrics['thr_high']:.4g}")
+    if np.isfinite(metrics.get("q_low", np.nan)) and np.isfinite(metrics.get("q_high", np.nan)):
+        print(
+            f"- Thresholds: low={metrics['thr_low']:.4g} (q={metrics['q_low']:.2f}), high={metrics['thr_high']:.4g} (q={metrics['q_high']:.2f})"
+        )
+    else:
+        print(f"- Thresholds: low={metrics['thr_low']:.4g}, high={metrics['thr_high']:.4g}")
     print(f"- Time horizon (days): {metrics['time_horizon_days']:.1f}")
     if gating is not None:
         print(
@@ -603,7 +761,10 @@ def main():
     print(feat_imp.head(topn))
 
     # Validate the global-first, local-then hypothesis
-    _ = evaluate_two_stage_strategy(clean_df)
+    _ = evaluate_two_stage_strategy(
+        clean_df,
+        optimize_thresholds=True,
+    )
 
 
 if __name__ == "__main__":
