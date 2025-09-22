@@ -1197,6 +1197,338 @@ def evaluate_two_stage_strategy(
     return metrics
 
 
+def _compute_oof_three_model_risks(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    global_cols: List[str],
+    local_cols: List[str],
+    n_splits: int,
+    random_state: int,
+    percent_for_time: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """
+    Compute out-of-fold risk scores at a fold-specific time horizon t for three models:
+    - Global-only
+    - Local-only
+    - All-features
+
+    Returns: (risk_glob_oof, risk_loc_oof, risk_all_oof, y_bin_oof, known_oof, t_mean)
+    where y_bin_oof and known_oof are defined at the fold-specific t for each fold,
+    collected into global arrays; t_mean is the average horizon across folds.
+    """
+    n = len(X)
+    risk_glob_oof = np.full(n, np.nan, dtype=float)
+    risk_loc_oof = np.full(n, np.nan, dtype=float)
+    risk_all_oof = np.full(n, np.nan, dtype=float)
+    y_bin_oof = np.full(n, np.nan, dtype=float)
+    known_oof = np.zeros(n, dtype=bool)
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+
+    def _fit(Xtr, ytr) -> Optional[RandomSurvivalForest]:
+        if Xtr.shape[1] == 0:
+            return None
+        rsf = RandomSurvivalForest(
+            n_estimators=500,
+            min_samples_split=10,
+            min_samples_leaf=5,
+            max_features="sqrt",
+            n_jobs=-1,
+            random_state=random_state,
+        )
+        rsf.fit(Xtr, ytr)
+        return rsf
+
+    t_values: List[float] = []
+    for tr_idx, va_idx in kf.split(X):
+        X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
+        y_tr, y_va = y[tr_idx], y[va_idx]
+
+        # Fold-specific horizon
+        e_field, t_field = _surv_field_names(y_tr)
+        t_hor = float(np.percentile(y_tr[t_field], percent_for_time * 100.0)) if len(y_tr) else 365.0
+        if not np.isfinite(t_hor) or t_hor <= 0:
+            t_hor = 365.0
+        t_values.append(t_hor)
+
+        # Train models on fold-train
+        model_gl = _fit(X_tr[global_cols], y_tr) if len(global_cols) > 0 else None
+        model_lo = _fit(X_tr[local_cols], y_tr) if len(local_cols) > 0 else None
+        model_all = _fit(X_tr, y_tr)
+
+        # Predict risks on fold-val
+        risk_gl = _rsf_risk_at_time(model_gl, X_va[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_va))
+        risk_lo = _rsf_risk_at_time(model_lo, X_va[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_va))
+        risk_all = _rsf_risk_at_time(model_all, X_va, t_hor) if model_all is not None else np.zeros(len(X_va))
+
+        # Binary outcomes and known mask at t
+        y_bin, known = _binary_outcome_at_time(y_va, t_hor)
+
+        # Store OOF
+        risk_glob_oof[va_idx] = risk_gl
+        risk_loc_oof[va_idx] = risk_lo
+        risk_all_oof[va_idx] = risk_all
+        y_bin_oof[va_idx] = y_bin
+        known_oof[va_idx] = known
+
+    t_mean = float(np.nanmean(np.asarray(t_values))) if len(t_values) > 0 else 365.0
+    return risk_glob_oof, risk_loc_oof, risk_all_oof, y_bin_oof, known_oof, t_mean
+
+
+def evaluate_three_model_grouping_and_rule(
+    clean_df: pd.DataFrame,
+    test_size: float = 0.25,
+    random_state: int = 42,
+    n_splits_oof: int = 5,
+    percent_for_time: float = 0.75,
+    q_low_grid: Optional[List[float]] = None,
+    q_high_grid: Optional[List[float]] = None,
+    min_gap: float = 0.10,
+    output_dir: Optional[str] = None,
+) -> Dict[str, object]:
+    """
+    Stage-1: Compare three RSF models (Global-only, Local-only, All-features) per patient.
+    - Use OOF risks on the training set to assign each patient to the best-performing model
+      (by minimal squared error at a fixed time horizon).
+    - Learn an interpretable three-zone rule based on a single gating feature to predict the
+      best model group (Low/Mid/High zones -> mapped to one of {Global, Local, All}).
+    - Evaluate this rule on a held-out test set by selecting the model per patient and
+      computing C-index.
+
+    Returns a dict with thresholds, zone mapping, counts, and C-index metrics.
+    """
+    # Prep data and feature groups
+    X_all, y_all, feature_names = _prepare_survival_xy(clean_df)
+    global_cols, local_cols, gating = _find_feature_groups(feature_names)
+    have_global = len(global_cols) > 0
+    have_local = len(local_cols) > 0
+    if not (have_global and have_local):
+        print("Three-model evaluation skipped: missing global or local feature groups.")
+        return {
+            "have_global": have_global,
+            "have_local": have_local,
+        }
+
+    # Split train/test once
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_all, y_all, test_size=test_size, random_state=random_state
+    )
+
+    # OOF on training to determine best-of-three group labels
+    risk_gl_tr, risk_lo_tr, risk_all_tr, ybin_tr, known_tr, t_mean = _compute_oof_three_model_risks(
+        X_train, y_train, global_cols, local_cols, n_splits_oof, random_state, percent_for_time
+    )
+
+    # Define best model per training sample (only where known)
+    err_gl = (risk_gl_tr - ybin_tr) ** 2
+    err_lo = (risk_lo_tr - ybin_tr) ** 2
+    err_all = (risk_all_tr - ybin_tr) ** 2
+    valid_tr = known_tr & np.isfinite(err_gl) & np.isfinite(err_lo) & np.isfinite(err_all)
+    best_idx_tr = np.full(len(X_train), -1, dtype=int)
+    if valid_tr.any():
+        triple = np.vstack([err_gl[valid_tr], err_lo[valid_tr], err_all[valid_tr]])
+        best = np.argmin(triple, axis=0)  # 0=Global, 1=Local, 2=All
+        best_idx_tr[np.where(valid_tr)[0]] = best
+
+    # Pick gating values (prefer explicit gating feature)
+    if gating is not None and gating in X_train.columns:
+        gate_train = X_train[gating].astype(float).values
+        gate_test = X_test[gating].astype(float).values
+        gate_label = str(gating)
+    else:
+        gate_label = "(sum of local segments)"
+        gate_train = X_train[local_cols].astype(float).sum(axis=1).values
+        gate_test = X_test[local_cols].astype(float).sum(axis=1).values
+
+    # Threshold grids
+    if q_low_grid is None:
+        q_low_grid = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
+    if q_high_grid is None:
+        q_high_grid = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+
+    # Train RSF models on full training for test-time inference
+    def _fit(X, y) -> Optional[RandomSurvivalForest]:
+        if X.shape[1] == 0:
+            return None
+        rsf = RandomSurvivalForest(
+            n_estimators=500,
+            min_samples_split=10,
+            min_samples_leaf=5,
+            max_features="sqrt",
+            n_jobs=-1,
+            random_state=random_state,
+        )
+        rsf.fit(X, y)
+        return rsf
+
+    # Fixed horizon for test evaluation = 75th percentile of train times
+    e_field, t_field = _surv_field_names(y_train)
+    t_hor = float(np.percentile(y_train[t_field], percent_for_time * 100.0)) if len(y_train) else 365.0
+    if not np.isfinite(t_hor) or t_hor <= 0:
+        t_hor = 365.0
+
+    model_all = _fit(X_train, y_train)
+    model_gl = _fit(X_train[global_cols], y_train)
+    model_lo = _fit(X_train[local_cols], y_train)
+
+    # Precompute test risks
+    risk_all_te = _rsf_risk_at_time(model_all, X_test, t_hor) if model_all is not None else np.zeros(len(X_test))
+    risk_gl_te = _rsf_risk_at_time(model_gl, X_test[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_test))
+    risk_lo_te = _rsf_risk_at_time(model_lo, X_test[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_test))
+
+    # Helper for C-index
+    def _c_index(y_arr, risk_scores) -> float:
+        e_name, t_name = _surv_field_names(y_arr)
+        evt = y_arr[e_name].astype(bool)
+        tm = y_arr[t_name].astype(float)
+        return float(concordance_index_censored(evt, tm, risk_scores)[0])
+
+    # Optimize thresholds by maximizing OOF C-index of rule-applied risks on training
+    best_val_c = -np.inf
+    best_thr_low = np.nan
+    best_thr_high = np.nan
+    best_zone_to_model: Dict[str, int] = {}
+
+    # Build OOF risks dict for convenience (training time horizon varies per fold, so
+    # we will evaluate rule quality using classification agreement to best_idx_tr first,
+    # then break ties by OOF C-index constructed at fold horizons approximately by
+    # using risk_all_tr as a proxy when needed.)
+    # Primary score: classification accuracy of zone -> best model on valid_tr samples.
+    for ql in q_low_grid:
+        for qh in q_high_grid:
+            if qh - ql < min_gap:
+                continue
+            thr_l = float(np.nanquantile(gate_train, ql))
+            thr_h = float(np.nanquantile(gate_train, qh))
+            if not np.isfinite(thr_l) or not np.isfinite(thr_h) or thr_l >= thr_h:
+                continue
+
+            zone_low = gate_train < thr_l
+            zone_high = gate_train >= thr_h
+            zone_mid = ~(zone_low | zone_high)
+
+            # Majority label in each zone among valid training samples
+            z2m: Dict[str, int] = {}
+            acc_parts = []
+            for name, mask in ("low", zone_low), ("mid", zone_mid), ("high", zone_high):
+                m = mask & valid_tr
+                if m.sum() == 0:
+                    # Fallback to Global if zone empty
+                    z2m[name] = 0
+                    continue
+                labels = best_idx_tr[m]
+                # majority vote among {0,1,2}
+                vals, counts = np.unique(labels, return_counts=True)
+                maj = int(vals[np.argmax(counts)])
+                z2m[name] = maj
+                acc_parts.append((labels == maj).mean())
+
+            # Primary score: mean per-zone accuracy where zone has data
+            if len(acc_parts) == 0:
+                continue
+            score_primary = float(np.mean(acc_parts))
+
+            # Secondary (tie-breaker): OOF pseudo C-index by composing per-zone chosen risks
+            # We approximate by mixing the three OOF risks using the same mapping and evaluate
+            # concordance against original survival times at varying fold horizons; since OOF
+            # was computed with fold-specific horizons for y_bin, use a crude proxy here by
+            # ranking capability measured via Kendall-like concordance on available finite values.
+            # To keep robust and simple, we will not overfit this tie-breaker.
+            score_secondary = score_primary  # identical fallback
+
+            if (score_primary > best_val_c + 1e-12) or (
+                abs(score_primary - best_val_c) <= 1e-12 and score_secondary > best_val_c
+            ):
+                best_val_c = score_primary
+                best_thr_low = thr_l
+                best_thr_high = thr_h
+                best_zone_to_model = dict(z2m)
+
+    if not np.isfinite(best_thr_low) or not np.isfinite(best_thr_high):
+        # Fallback to fixed percentiles
+        best_thr_low = float(np.nanpercentile(gate_train, 40))
+        best_thr_high = float(np.nanpercentile(gate_train, 75))
+        best_zone_to_model = {"low": 0, "mid": 2, "high": 0}  # heuristic: global, all, global
+
+    # Apply rule on test set to pick model per patient
+    zone_low_te = gate_test < best_thr_low
+    zone_high_te = gate_test >= best_thr_high
+    zone_mid_te = ~(zone_low_te | zone_high_te)
+
+    # Map chosen model index per zone to risk arrays
+    # 0 -> global, 1 -> local, 2 -> all
+    rule_risk_te = np.zeros(len(X_test), dtype=float)
+    for name, mask in ("low", zone_low_te), ("mid", zone_mid_te), ("high", zone_high_te):
+        chosen = int(best_zone_to_model.get(name, 0))
+        if chosen == 0:
+            rule_risk_te[mask] = risk_gl_te[mask]
+        elif chosen == 1:
+            rule_risk_te[mask] = risk_lo_te[mask]
+        else:
+            rule_risk_te[mask] = risk_all_te[mask]
+
+    # Metrics on test
+    cidx_all = _c_index(y_test, risk_all_te)
+    cidx_gl = _c_index(y_test, risk_gl_te)
+    cidx_lo = _c_index(y_test, risk_lo_te)
+    cidx_rule = _c_index(y_test, rule_risk_te)
+
+    # Package results
+    mapping_human = {
+        "low": ["Global", "Local", "All"][int(best_zone_to_model.get("low", 0))],
+        "mid": ["Global", "Local", "All"][int(best_zone_to_model.get("mid", 0))],
+        "high": ["Global", "Local", "All"][int(best_zone_to_model.get("high", 0))],
+    }
+    out: Dict[str, object] = {
+        "gating_feature": gate_label,
+        "thr_low": float(best_thr_low),
+        "thr_high": float(best_thr_high),
+        "zone_mapping": mapping_human,
+        "n_zone_low_test": int(zone_low_te.sum()),
+        "n_zone_mid_test": int(zone_mid_te.sum()),
+        "n_zone_high_test": int(zone_high_te.sum()),
+        "time_horizon_days": float(t_hor),
+        "c_index_all": float(cidx_all),
+        "c_index_global_only": float(cidx_gl),
+        "c_index_local_only": float(cidx_lo),
+        "c_index_rule": float(cidx_rule),
+        "n_test": int(len(X_test)),
+        "n_train_valid_for_grouping": int(valid_tr.sum()),
+        "t_mean_oof": float(t_mean),
+    }
+
+    print("\nThree-model grouping and rule-based selection (test):")
+    print(f"- Gating feature: {out['gating_feature']}")
+    print(
+        f"- Thresholds: low={out['thr_low']:.4g}, high={out['thr_high']:.4g}; zone mapping = "
+        f"low->{mapping_human['low']}, mid->{mapping_human['mid']}, high->{mapping_human['high']}"
+    )
+    print(f"- Time horizon (days): {out['time_horizon_days']:.1f}")
+    print(
+        f"- Zone counts (low/mid/high): {out['n_zone_low_test']}/{out['n_zone_mid_test']}/{out['n_zone_high_test']} of {out['n_test']}"
+    )
+    print("- C-index baselines and rule:")
+    print(f"  * All-features RSF:     {out['c_index_all']:.4f}")
+    print(f"  * Global-only RSF:      {out['c_index_global_only']:.4f}")
+    print(f"  * Local-only RSF:       {out['c_index_local_only']:.4f}")
+    print(f"  * Rule (3-zone select): {out['c_index_rule']:.4f}")
+
+    # Optional visuals
+    try:
+        _plot_gating_hist(gate_train, float(out["thr_low"]), float(out["thr_high"]), label=str(gate_label), output_dir=output_dir)
+        # Reuse zone counts plot by remapping keys
+        tmp_metrics = {
+            "n_zone_low": out["n_zone_low_test"],
+            "n_zone_mid": out["n_zone_mid_test"],
+            "n_zone_high": out["n_zone_high_test"],
+        }
+        _plot_zone_counts(tmp_metrics, output_dir)
+    except Exception:
+        pass
+
+    return out
+
+
 def main():
     clean_df = load_dataframes()
     figs_dir = os.path.join("figures", "rsf")
@@ -1215,6 +1547,12 @@ def main():
 
     # Analyze benefit subgroup and local-feature importance within it
     _ = analyze_benefit_subgroup(clean_df, output_dir=figs_dir)
+
+    # Stage-1: best-of-three grouping and rule learning/evaluation
+    _ = evaluate_three_model_grouping_and_rule(
+        clean_df,
+        output_dir=figs_dir,
+    )
 
 
 if __name__ == "__main__":
