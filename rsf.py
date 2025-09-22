@@ -546,17 +546,24 @@ def train_coxph_model(
     test_c_index = float(concordance_index_censored(y_test[e_field].astype(bool), y_test[t_field].astype(float), risk_scores)[0])
     # Use permutation importance on the hold-out set as a model-agnostic alternative.
     if model is not None:
-        perm_result = permutation_importance(
-            model,
-            X_test,
-            y_test,
-            n_repeats=20,
-            random_state=random_state,
-            n_jobs=-1,
-        )
-        feat_imp = pd.Series(perm_result.importances_mean, index=feature_names).sort_values(
-            ascending=False
-        )
+        try:
+            names_in = _model_feature_names(model)
+            if names_in is None:
+                names_in = list(X_train.columns)
+            X_pi = _align_X_to_model(model, X_test)
+            perm_result = permutation_importance(
+                model,
+                X_pi,
+                y_test,
+                n_repeats=20,
+                random_state=random_state,
+                n_jobs=-1,
+            )
+            feat_imp = pd.Series(perm_result.importances_mean, index=names_in).sort_values(
+                ascending=False
+            )
+        except Exception:
+            feat_imp = pd.Series(dtype=float)
     else:
         feat_imp = pd.Series(dtype=float)
     metrics = {"test_c_index": float(test_c_index)}
@@ -661,13 +668,7 @@ def _risk_at_time(model: object, X: pd.DataFrame, t: float) -> np.ndarray:
     if X.empty:
         return np.zeros(0, dtype=float)
     # Align to training features if available
-    X_use = X
-    try:
-        feature_names_in = getattr(model, "feature_names_in_", None)
-        if feature_names_in is not None:
-            X_use = X.loc[:, list(feature_names_in)]
-    except Exception:
-        X_use = X
+    X_use = _align_X_to_model(model, X)
     # Preferred path: survival function available
     try:
         if hasattr(model, "predict_survival_function"):
@@ -703,6 +704,99 @@ def _surv_field_names(y_arr) -> Tuple[str, str]:
     time_candidates = [n for n in names if n != event_field]
     time_field = "time" if "time" in names else time_candidates[0]
     return event_field, time_field
+
+
+def _model_feature_names(model) -> Optional[List[str]]:
+    """Best-effort to extract trained feature names from estimator or pipeline."""
+    names = getattr(model, "feature_names_in_", None)
+    if names is not None:
+        try:
+            return list(names)
+        except Exception:
+            pass
+    try:
+        steps = getattr(model, "named_steps", None)
+        if isinstance(steps, dict):
+            # Common last-step name
+            last = steps.get("coxph") or steps.get("final") or steps.get(list(steps.keys())[-1])
+            if last is not None:
+                last_names = getattr(last, "feature_names_in_", None)
+                if last_names is not None:
+                    return list(last_names)
+    except Exception:
+        pass
+    return None
+
+
+def _align_X_to_model(model, X: pd.DataFrame) -> pd.DataFrame:
+    """Align columns and order of X to match the model's trained features.
+
+    - Adds any missing trained columns as zeros
+    - Drops extra columns
+    - Orders columns exactly as trained
+    """
+    names = _model_feature_names(model)
+    if not names:
+        return X
+    Z = X.copy()
+    for c in names:
+        if c not in Z.columns:
+            Z[c] = 0.0
+    try:
+        Z = Z.loc[:, names]
+    except Exception:
+        # Fallback: keep intersection only, in the learned order
+        keep = [c for c in names if c in Z.columns]
+        Z = Z[keep]
+    return Z
+
+
+def _sanitize_cox_features_matrix(
+    X: pd.DataFrame, corr_threshold: float = 0.995, verbose: bool = False
+) -> pd.DataFrame:
+    """Drop constant, duplicate, and highly correlated columns to stabilize Cox fitting."""
+    Xs = X.copy()
+    for c in Xs.columns:
+        if not pd.api.types.is_numeric_dtype(Xs[c]):
+            Xs[c] = pd.to_numeric(Xs[c], errors="coerce")
+
+    # Drop columns with all missing or only one unique non-nan value
+    nunique = Xs.nunique(dropna=True)
+    constant_cols = nunique[nunique <= 1].index.tolist()
+    if constant_cols and verbose:
+        print(f"[Cox] drop constant/no-info cols: {constant_cols}")
+    Xs = Xs.drop(columns=constant_cols, errors="ignore")
+
+    if Xs.shape[1] == 0:
+        return Xs
+
+    # Remove exactly duplicated columns
+    try:
+        X_filled = Xs.fillna(0.0)
+        duplicated_mask = X_filled.T.duplicated(keep="first")
+        if duplicated_mask.any():
+            dup_cols = Xs.columns[duplicated_mask.values].tolist()
+            if verbose:
+                print(f"[Cox] drop duplicated cols: {dup_cols}")
+            Xs = Xs.loc[:, ~duplicated_mask.values]
+    except Exception:
+        pass
+
+    if Xs.shape[1] <= 1:
+        return Xs
+
+    # Remove highly correlated columns (keep the first in order)
+    try:
+        corr = Xs.fillna(0.0).corr().abs()
+        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        to_drop = [col for col in upper.columns if (upper[col] >= corr_threshold).any()]
+        if to_drop and verbose:
+            print(f"[Cox] drop high-corr cols (|r|>={corr_threshold}): {to_drop}")
+        Xs = Xs.drop(columns=to_drop, errors="ignore")
+    except Exception:
+        pass
+
+    return Xs
 
 
 def _clean_X_for_cox(X: pd.DataFrame) -> pd.DataFrame:
@@ -744,17 +838,37 @@ def _clean_X_for_cox(X: pd.DataFrame) -> pd.DataFrame:
                 Xc[c] = Xc[c].astype(float)
             except Exception:
                 Xc[c] = pd.to_numeric(Xc[c], errors="coerce").astype(float).fillna(0.0)
+    # Additional sanitization: drop constant/duplicate/highly-correlated columns
+    Xc = _sanitize_cox_features_matrix(Xc, corr_threshold=0.995, verbose=False)
     return Xc
 
 
-def _fit_coxph_clean(X: pd.DataFrame, y: np.ndarray) -> Optional[CoxPHSurvivalAnalysis]:
-    """Fit CoxPH with defensive cleaning. Returns None if not feasible."""
+def _fit_coxph_clean(X: pd.DataFrame, y: np.ndarray) -> Optional[object]:
+    """Fit CoxPH with defensive cleaning and scaling. Returns a pipeline or None."""
     Xc = _clean_X_for_cox(X)
     if Xc.shape[0] < 2 or Xc.shape[1] == 0:
         return None
-    model = CoxPHSurvivalAnalysis()
-    model.fit(Xc, y)
-    return model
+    from sklearn.pipeline import Pipeline as SkPipeline
+    from sklearn.preprocessing import StandardScaler as SkStandardScaler
+
+    # Use scaling to prevent exp overflow in risk computations
+    pipe = SkPipeline([
+        ("scaler", SkStandardScaler()),
+        ("coxph", CoxPHSurvivalAnalysis()),
+    ])
+    try:
+        pipe.fit(Xc, y)
+        return pipe
+    except Exception:
+        # Retry with stricter sanitization threshold
+        Xc2 = _sanitize_cox_features_matrix(Xc, corr_threshold=0.95, verbose=False)
+        if Xc2.shape[1] == 0:
+            return None
+        try:
+            pipe.fit(Xc2, y)
+            return pipe
+        except Exception:
+            return None
 
 
 def _binary_outcome_at_time(y_arr, t: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -835,7 +949,7 @@ def _optimize_gate_quantiles(
             return None, None, {}
 
     # Fit inner models on X_tr
-    def _fit(X, y) -> Optional[CoxPHSurvivalAnalysis]:
+    def _fit(X, y) -> Optional[object]:
         return _fit_coxph_clean(X, y)
 
     model_glob_in = _fit(X_tr[global_cols], y_tr) if have_global else None
@@ -921,7 +1035,7 @@ def analyze_benefit_subgroup(
 
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
-    def _fit(X, y) -> Optional[CoxPHSurvivalAnalysis]:
+    def _fit(X, y) -> Optional[object]:
         return _fit_coxph_clean(X, y)
 
     for tr_idx, va_idx in kf.split(X_all):
@@ -1010,15 +1124,20 @@ def analyze_benefit_subgroup(
             y_ben = y_all[benefit_local]
             model_ben_all = _fit_coxph_clean(X_ben_all, y_ben)
             if model_ben_all is not None:
-                perm_all = permutation_importance(
-                    model_ben_all,
-                    X_ben_all,
-                    y_ben,
-                    n_repeats=20,
-                    random_state=random_state,
-                    n_jobs=-1,
-                )
-                fi_all = pd.Series(perm_all.importances_mean, index=X_ben_all.columns).sort_values(ascending=False)
+                try:
+                    X_pi_all = _align_X_to_model(model_ben_all, X_ben_all)
+                    names_all = _model_feature_names(model_ben_all) or list(X_pi_all.columns)
+                    perm_all = permutation_importance(
+                        model_ben_all,
+                        X_pi_all,
+                        y_ben,
+                        n_repeats=20,
+                        random_state=random_state,
+                        n_jobs=-1,
+                    )
+                    fi_all = pd.Series(perm_all.importances_mean, index=names_all).sort_values(ascending=False)
+                except Exception:
+                    fi_all = pd.Series(dtype=float)
             else:
                 fi_all = pd.Series(dtype=float)
             fi_local_cond = fi_all[fi_all.index.isin(local_cols)].sort_values(ascending=False)
@@ -1040,15 +1159,20 @@ def analyze_benefit_subgroup(
             X_ben_loc = X_all.loc[benefit_local, local_cols]
             model_ben_loc = _fit_coxph_clean(X_ben_loc, y_ben)
             if model_ben_loc is not None:
-                perm_loc = permutation_importance(
-                    model_ben_loc,
-                    X_ben_loc,
-                    y_ben,
-                    n_repeats=20,
-                    random_state=random_state,
-                    n_jobs=-1,
-                )
-                fi_loc = pd.Series(perm_loc.importances_mean, index=local_cols).sort_values(ascending=False)
+                try:
+                    X_pi_loc = _align_X_to_model(model_ben_loc, X_ben_loc)
+                    names_loc = _model_feature_names(model_ben_loc) or list(X_pi_loc.columns)
+                    perm_loc = permutation_importance(
+                        model_ben_loc,
+                        X_pi_loc,
+                        y_ben,
+                        n_repeats=20,
+                        random_state=random_state,
+                        n_jobs=-1,
+                    )
+                    fi_loc = pd.Series(perm_loc.importances_mean, index=names_loc).sort_values(ascending=False)
+                except Exception:
+                    fi_loc = pd.Series(dtype=float)
             else:
                 fi_loc = pd.Series(dtype=float)
             metrics["local_feature_importance_in_benefit_localOnly"] = fi_loc.head(topk_local_importance)
@@ -1161,7 +1285,7 @@ def evaluate_two_stage_strategy(
         t_hor = 365.0
 
     # Train CoxPH models
-    def _fit(X, y) -> Optional[CoxPHSurvivalAnalysis]:
+    def _fit(X, y) -> Optional[object]:
         return _fit_coxph_clean(X, y)
 
     model_all = _fit(X_train, y_train)
@@ -1169,19 +1293,9 @@ def evaluate_two_stage_strategy(
     model_local = _fit(X_train[local_cols], y_train) if have_local else None
 
     # Baseline risks at horizon
-    risk_all = (
-        _risk_at_time(model_all, X_test, t_hor) if model_all is not None else np.zeros(len(X_test))
-    )
-    risk_glob = (
-        _risk_at_time(model_global, X_test[global_cols], t_hor)
-        if model_global is not None
-        else np.zeros(len(X_test))
-    )
-    risk_loc = (
-        _risk_at_time(model_local, X_test[local_cols], t_hor)
-        if model_local is not None
-        else np.zeros(len(X_test))
-    )
+    risk_all = _risk_at_time(model_all, X_test, t_hor) if model_all is not None else np.zeros(len(X_test))
+    risk_glob = _risk_at_time(model_global, X_test[global_cols], t_hor) if model_global is not None else np.zeros(len(X_test))
+    risk_loc = _risk_at_time(model_local, X_test[local_cols], t_hor) if model_local is not None else np.zeros(len(X_test))
 
     # Two-stage gating setup
     # Obtain gating values (prefer explicit gating feature, else derive from local sum)
@@ -1283,10 +1397,15 @@ def evaluate_two_stage_strategy(
     # Also return top permutation importances (optional, compact)
     try:
         if model_global is not None:
-            perm_glob = permutation_importance(
-                model_global, X_test[global_cols], y_test, n_repeats=10, random_state=random_state, n_jobs=-1
-            )
-            fi_glob = pd.Series(perm_glob.importances_mean, index=global_cols).sort_values(ascending=False)
+            try:
+                X_pi_g = _align_X_to_model(model_global, X_test[global_cols])
+                names_g = _model_feature_names(model_global) or list(X_pi_g.columns)
+                perm_glob = permutation_importance(
+                    model_global, X_pi_g, y_test, n_repeats=10, random_state=random_state, n_jobs=-1
+                )
+                fi_glob = pd.Series(perm_glob.importances_mean, index=names_g).sort_values(ascending=False)
+            except Exception:
+                fi_glob = pd.Series(dtype=float)
             topg = fi_glob.head(8)
             print("Global features (top 8 by permutation importance):")
             print(topg)
@@ -1303,10 +1422,15 @@ def evaluate_two_stage_strategy(
             except Exception:
                 pass
         if model_local is not None:
-            perm_loc = permutation_importance(
-                model_local, X_test[local_cols], y_test, n_repeats=10, random_state=random_state, n_jobs=-1
-            )
-            fi_loc = pd.Series(perm_loc.importances_mean, index=local_cols).sort_values(ascending=False)
+            try:
+                X_pi_l = _align_X_to_model(model_local, X_test[local_cols])
+                names_l = _model_feature_names(model_local) or list(X_pi_l.columns)
+                perm_loc = permutation_importance(
+                    model_local, X_pi_l, y_test, n_repeats=10, random_state=random_state, n_jobs=-1
+                )
+                fi_loc = pd.Series(perm_loc.importances_mean, index=names_l).sort_values(ascending=False)
+            except Exception:
+                fi_loc = pd.Series(dtype=float)
             topl = fi_loc.head(8)
             print("Local features (top 8 by permutation importance):")
             print(topl)
