@@ -295,7 +295,19 @@ def train_random_survival_forest(
     rsf.fit(X_train, y_train)
 
     test_c_index = rsf.score(X_test, y_test)
-    feat_imp = pd.Series(rsf.feature_importances_, index=feature_names).sort_values(ascending=False)
+    # scikit-survival's RandomSurvivalForest does not implement feature_importances_.
+    # Use permutation importance on the hold-out set as a model-agnostic alternative.
+    perm_result = permutation_importance(
+        rsf,
+        X_test,
+        y_test,
+        n_repeats=20,
+        random_state=random_state,
+        n_jobs=-1,
+    )
+    feat_imp = pd.Series(perm_result.importances_mean, index=feature_names).sort_values(
+        ascending=False
+    )
     metrics = {"test_c_index": float(test_c_index)}
     return rsf, metrics, feat_imp
 
