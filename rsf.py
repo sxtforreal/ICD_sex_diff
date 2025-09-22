@@ -137,6 +137,10 @@ def load_dataframes() -> pd.DataFrame:
         axis=1,
     )
 
+    # Ensure non-negative follow-up times (defensive against date inconsistencies)
+    nicm["PE_Time"] = pd.to_numeric(nicm["PE_Time"], errors="coerce")
+    nicm["PE_Time"] = nicm["PE_Time"].clip(lower=0)
+
     # Drop features
     nicm.drop(
         [
@@ -247,6 +251,9 @@ def _prepare_survival_xy(clean_df: pd.DataFrame,
     if not np.issubdtype(df["PE_Time"].dtype, np.number):
         df["PE_Time"] = pd.to_numeric(df["PE_Time"], errors="coerce")
         df = df.dropna(subset=["PE_Time"])
+
+    # Clip negative durations to zero to satisfy scikit-survival requirements
+    df["PE_Time"] = df["PE_Time"].astype(float).clip(lower=0.0)
 
     df["VT/VF/SCD"] = df["VT/VF/SCD"].fillna(0).astype(int).astype(bool)
 
