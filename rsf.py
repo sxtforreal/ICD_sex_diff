@@ -11,6 +11,8 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.inspection import permutation_importance
 from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
 
 from sksurv.linear_model import CoxPHSurvivalAnalysis
 from sksurv.metrics import concordance_index_censored
@@ -1622,6 +1624,192 @@ def evaluate_three_model_grouping_and_rule(
     return out
 
 
+def train_assignment_classifier_and_tableone(
+    clean_df: pd.DataFrame,
+    test_size: float = 0.25,
+    random_state: int = 42,
+    n_splits_oof: int = 5,
+    percent_for_time: float = 0.75,
+    topk_coef: int = 12,
+    output_dir: Optional[str] = None,
+) -> Dict[str, object]:
+    """
+    Stage-1 (enhanced):
+    - Determine per-patient best model among {Global, Local, All} using OOF (train) and held-out risks (test)
+      at a fixed time horizon defined from training data.
+    - Train a multiclass classifier to predict assignment from baseline features.
+    - Evaluate assignment prediction on test and generate a TableOne-style summary across the three groups.
+    """
+    X_all, y_all, feature_names = _prepare_survival_xy(clean_df)
+    global_cols, local_cols, _ = _find_feature_groups(feature_names)
+    have_global = len(global_cols) > 0
+    have_local = len(local_cols) > 0
+    if not (have_global and have_local):
+        print("Assignment training skipped: missing global or local feature groups.")
+        return {"have_global": have_global, "have_local": have_local}
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_all, y_all, test_size=test_size, random_state=random_state
+    )
+
+    # OOF risks on train
+    risk_gl_tr, risk_lo_tr, risk_all_tr, ybin_tr, known_tr, t_mean = _compute_oof_three_model_risks(
+        X_train, y_train, global_cols, local_cols, n_splits_oof, random_state, percent_for_time
+    )
+    err_gl = (risk_gl_tr - ybin_tr) ** 2
+    err_lo = (risk_lo_tr - ybin_tr) ** 2
+    err_all = (risk_all_tr - ybin_tr) ** 2
+    valid_tr = known_tr & np.isfinite(err_gl) & np.isfinite(err_lo) & np.isfinite(err_all)
+    best_idx_tr = np.full(len(X_train), -1, dtype=int)
+    if valid_tr.any():
+        triple = np.vstack([err_gl[valid_tr], err_lo[valid_tr], err_all[valid_tr]])
+        best = np.argmin(triple, axis=0)
+        best_idx_tr[np.where(valid_tr)[0]] = best
+
+    # Fixed horizon on test = 75th percentile of train times
+    e_field, t_field = _surv_field_names(y_train)
+    t_hor = float(np.percentile(y_train[t_field], percent_for_time * 100.0)) if len(y_train) else 365.0
+    if not np.isfinite(t_hor) or t_hor <= 0:
+        t_hor = 365.0
+
+    # Train CoxPH models on full training
+    def _fit(X, y):
+        if X.shape[1] == 0:
+            return None
+        m = CoxPHSurvivalAnalysis()
+        m.fit(X, y)
+        return m
+
+    model_all = _fit(X_train, y_train)
+    model_gl = _fit(X_train[global_cols], y_train) if have_global else None
+    model_lo = _fit(X_train[local_cols], y_train) if have_local else None
+
+    # Risks and assignment on test
+    risk_all_te = _risk_at_time(model_all, X_test, t_hor) if model_all is not None else np.zeros(len(X_test))
+    risk_gl_te = _risk_at_time(model_gl, X_test[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_test))
+    risk_lo_te = _risk_at_time(model_lo, X_test[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_test))
+    ybin_te, known_te = _binary_outcome_at_time(y_test, t_hor)
+    err_gl_te = (risk_gl_te - ybin_te) ** 2
+    err_lo_te = (risk_lo_te - ybin_te) ** 2
+    err_all_te = (risk_all_te - ybin_te) ** 2
+    valid_te = known_te & np.isfinite(err_gl_te) & np.isfinite(err_lo_te) & np.isfinite(err_all_te)
+    best_idx_te = np.full(len(X_test), -1, dtype=int)
+    if valid_te.any():
+        triple = np.vstack([err_gl_te[valid_te], err_lo_te[valid_te], err_all_te[valid_te]])
+        best = np.argmin(triple, axis=0)
+        best_idx_te[np.where(valid_te)[0]] = best
+
+    # Prepare labels for classifier: 0=Global,1=Local,2=All
+    X_tr_cls = X_train.loc[valid_tr, :]
+    y_tr_cls = best_idx_tr[valid_tr]
+    X_te_cls = X_test.loc[valid_te, :]
+    y_te_cls = best_idx_te[valid_te]
+
+    # Multinomial logistic regression (with scaling)
+    clf = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegression(multi_class="multinomial", solver="lbfgs", max_iter=2000, n_jobs=None))
+    ])
+    clf.fit(X_tr_cls, y_tr_cls)
+    y_pred = clf.predict(X_te_cls) if len(X_te_cls) else np.array([], dtype=int)
+    acc = float(accuracy_score(y_te_cls, y_pred)) if len(y_te_cls) else np.nan
+    f1_macro = float(f1_score(y_te_cls, y_pred, average="macro")) if len(y_te_cls) else np.nan
+
+    print("\nAssignment prediction (multinomial logistic):")
+    print(f"- Train labeled: {len(X_tr_cls)} / {len(X_train)} | Test labeled: {len(X_te_cls)} / {len(X_test)}")
+    if np.isfinite(acc):
+        print(f"- Accuracy (test): {acc:.4f}, Macro-F1: {f1_macro:.4f}")
+        try:
+            print(classification_report(y_te_cls, y_pred, target_names=["Global","Local","All"]))
+        except Exception:
+            pass
+
+    # Coefficients as feature importance (per class)
+    try:
+        lr = clf.named_steps.get("clf")
+        if lr is not None and hasattr(lr, "coef_"):
+            coef = lr.coef_  # shape (3, n_features)
+            feat = X_tr_cls.columns.to_list()
+            coef_df = pd.DataFrame(coef, columns=feat, index=["Global","Local","All"]).T
+            # Top features per class by absolute coefficient
+            top_dict: Dict[str, pd.Series] = {}
+            for cls in ["Global","Local","All"]:
+                top_dict[cls] = coef_df[cls].abs().sort_values(ascending=False).head(topk_coef)
+            # Save CSVs
+            if output_dir:
+                _ensure_dir(output_dir)
+                coef_df.to_csv(os.path.join(output_dir, "assignment_logreg_coef.csv"))
+                with open(os.path.join(output_dir, "assignment_logreg_metrics.txt"), "w") as f:
+                    f.write(f"accuracy={acc}\nmacro_f1={f1_macro}\n")
+            # Plot per class top features
+            try:
+                for cls, ser in top_dict.items():
+                    _plot_series_barh(
+                        ser,
+                        topn=len(ser),
+                        title=f"Assignment predictor: top features for {cls}",
+                        xlabel="|coefficient|",
+                        output_dir=output_dir,
+                        filename=f"assignment_top_{cls.lower()}.png",
+                        color="#2ca02c" if cls=="Global" else ("#ff7f0e" if cls=="Local" else "#1f77b4"),
+                    )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Build TableOne-style summary across three groups (using available labeled samples)
+    mapping = {0: "Global", 1: "Local", 2: "All"}
+    df_train_groups = X_tr_cls.copy()
+    df_train_groups["assignment"] = pd.Series(y_tr_cls, index=df_train_groups.index).map(mapping)
+    df_test_groups = X_te_cls.copy()
+    df_test_groups["assignment"] = pd.Series(y_te_cls, index=df_test_groups.index).map(mapping)
+    df_groups = pd.concat([df_train_groups, df_test_groups], axis=0)
+
+    # Try to use tableone if available
+    tableone_df: Optional[pd.DataFrame] = None
+    try:
+        from tableone import TableOne  # type: ignore
+
+        # Heuristics: categorical if object dtype or low unique count (<=5)
+        cats = [c for c in df_groups.columns if c != "assignment" and (df_groups[c].dtype == "object" or df_groups[c].nunique() <= 5)]
+        conts = [c for c in df_groups.columns if c != "assignment" and c not in cats]
+        t1 = TableOne(df_groups, columns=cats + conts, categorical=cats, groupby="assignment", pval=True)
+        tableone_df = t1.tableone.reset_index()
+    except Exception:
+        # Fallback: simple describe by group (mean±std for numeric, % for binary-like)
+        try:
+            parts = []
+            for grp, sub in df_groups.groupby("assignment"):
+                desc = sub.describe().T
+                desc["group"] = grp
+                parts.append(desc)
+            tableone_df = pd.concat(parts)
+        except Exception:
+            tableone_df = None
+
+    if output_dir and tableone_df is not None:
+        try:
+            _ensure_dir(output_dir)
+            tableone_df.to_csv(os.path.join(output_dir, "tableone_assignment.csv"), index=False)
+        except Exception:
+            pass
+
+    result: Dict[str, object] = {
+        "n_train_labeled": int(len(X_tr_cls)),
+        "n_test_labeled": int(len(X_te_cls)),
+        "assignment_train_index": X_tr_cls.index.tolist(),
+        "assignment_train_labels": [int(v) for v in y_tr_cls],
+        "assignment_test_index": X_te_cls.index.tolist(),
+        "assignment_test_labels": [int(v) for v in y_te_cls],
+        "accuracy_test": acc,
+        "macro_f1_test": f1_macro,
+        "time_horizon_days": float(t_hor),
+    }
+    print("TableOne saved to tableone_assignment.csv" if output_dir and tableone_df is not None else "TableOne not generated.")
+    return result
+
+
 def main():
     clean_df = load_dataframes()
     figs_dir = os.path.join("figures", "coxph")
@@ -1643,6 +1831,12 @@ def main():
 
     # Stage-1: best-of-three grouping and rule learning/evaluation
     _ = evaluate_three_model_grouping_and_rule(
+        clean_df,
+        output_dir=figs_dir,
+    )
+
+    # Stage-1 enhanced: train assignment classifier and produce TableOne
+    _ = train_assignment_classifier_and_tableone(
         clean_df,
         output_dir=figs_dir,
     )
