@@ -2,6 +2,7 @@ from typing import List, Tuple, Optional, Dict
 import numpy as np
 import pandas as pd
 import os
+import argparse
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -41,6 +42,13 @@ def set_feature_groups(global_features: List[str], local_features: List[str]) ->
     global GLOBAL_FEATURES, LOCAL_FEATURES
     GLOBAL_FEATURES = list(global_features)
     LOCAL_FEATURES = list(local_features)
+
+# 显式控制图片保存目录（可通过 set_figures_dir 或命令行 --figs-dir 或环境变量 FIGURES_DIR 指定）
+FIGURES_DIR: Optional[str] = None
+
+def set_figures_dir(path: Optional[str]) -> None:
+    global FIGURES_DIR
+    FIGURES_DIR = path
 
 
 def impute_misforest(X, random_seed):
@@ -2046,8 +2054,16 @@ def train_assignment_classifier_and_tableone(
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Three-model assignment and reverse feature analysis")
+    parser.add_argument("--figs-dir", type=str, default=None, help="输出图片与CSV的根目录；优先级高于环境变量 FIGURES_DIR")
+    args = parser.parse_args()
+
     clean_df = load_dataframes()
-    figs_dir = os.path.join("figures", "three_model_assignment")
+    # 解析图片目录：命令行 > 全局设置 > 环境变量 > 默认
+    figs_dir_cli = args.figs_dir
+    figs_dir_env = os.environ.get("FIGURES_DIR")
+    figs_dir_glb = FIGURES_DIR
+    figs_dir = figs_dir_cli or figs_dir_glb or figs_dir_env or os.path.join("figures", "three_model_assignment")
     # 运行三模型+指派+反向特征分析
     _ = evaluate_three_model_assignment_and_classifier(
         clean_df,
