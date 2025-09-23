@@ -127,6 +127,13 @@ LOCAL_FEATURES: List[str] = [
     "LGE_RV insertion site (1 superior, 2 inferior. 3 both)",
 ]
 
+# Normalize predefined feature names (strip) to avoid mismatches
+try:
+    GLOBAL_FEATURES = [str(c).strip() for c in GLOBAL_FEATURES]
+    LOCAL_FEATURES = [str(c).strip() for c in LOCAL_FEATURES]
+except Exception:
+    pass
+
 
 def set_feature_groups(global_features: List[str], local_features: List[str]) -> None:
     """Set the global/local feature name lists explicitly (unknown names are ignored)."""
@@ -570,6 +577,12 @@ def load_dataframes() -> pd.DataFrame:
     icd_common["ICD"] = 1
     noicd_common["ICD"] = 0
     nicm = pd.concat([icd_common, noicd_common], ignore_index=True)
+
+    # Normalize column names to avoid trailing spaces mismatch
+    try:
+        nicm.columns = nicm.columns.str.strip()
+    except Exception:
+        pass
 
     # PE time
     nicm["MRI Date"] = pd.to_datetime(nicm["MRI Date"])
@@ -1348,6 +1361,23 @@ def _compute_oof_three_risks_lifelines(
     return risk_glob, risk_loc, risk_all
 
 
+def _log_model_feature_usage(tag: str, requested: List[str], df_cols: List[str], model: Optional[CoxPHFitter]) -> None:
+    """Best-effort logging of feature flow: requested -> available -> kept by model."""
+    try:
+        req = list(requested) if requested is not None else []
+        avail = [c for c in req if c in df_cols]
+        kept = list(model.params_.index) if (model is not None and hasattr(model, "params_")) else []
+        print(
+            f"[Features][{tag}] requested={len(req)}, available_in_df={len(avail)}, kept_by_model={len(kept)}"
+        )
+        missing = [c for c in req if c not in df_cols]
+        if missing:
+            print(f"[Features][{tag}] missing_from_df: {missing[:10]}{' ...' if len(missing) > 10 else ''}")
+        if kept:
+            print(f"[Features][{tag}] kept_sample: {kept[:10]}{' ...' if len(kept) > 10 else ''}")
+    except Exception:
+        pass
+
 def evaluate_three_model_assignment_and_classifier(
     clean_df: pd.DataFrame,
     test_size: float = 0.30,
@@ -1400,43 +1430,34 @@ def evaluate_three_model_assignment_and_classifier(
     cand_local = [c for c in local_cols if c in df_model.columns]
     cand_all = [c for c in feat_all_cols if c in df_model.columns]
 
-    # Feature selection or use preselected sets
+    # Use predefined feature sets directly (no forward/stability selection)
     if selected_features is not None:
         use_glob = [c for c in selected_features.get("global", []) if c in df_model.columns]
         use_local = [c for c in selected_features.get("local", []) if c in df_model.columns]
         use_all = [c for c in selected_features.get("all", []) if c in df_model.columns]
-        if (not use_glob) and cand_glob:
-            use_glob = cand_glob
-        if (not use_local) and cand_local:
-            use_local = cand_local
-        if (not use_all) and cand_all:
-            use_all = cand_all
     else:
-        # Forward selection per model on an inner split; then refit on full data and infer on full data
-        seeds_for_stability = list(range(10))
-        _log_progress("Selecting features for Global model", True)
-        sel_glob = _stability_select_features_lifelines(
-            df_model, cand_glob, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
-        ) if len(cand_glob) > 0 else []
-        _log_progress("Selecting features for Local model", True)
-        sel_local = _stability_select_features_lifelines(
-            df_model, cand_local, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
-        ) if len(cand_local) > 0 else []
-        _log_progress("Selecting features for All-features model", True)
-        sel_all = _stability_select_features_lifelines(
-            df_model, cand_all, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
-        ) if len(cand_all) > 0 else []
+        use_glob = cand_glob
+        use_local = cand_local
+        use_all = cand_all
 
-        # Ensure non-empty by falling back to candidate lists
-        use_glob = sel_glob if sel_glob else cand_glob
-        use_local = sel_local if sel_local else cand_local
-        use_all = sel_all if sel_all else cand_all
+    # Log requested vs available counts
+    try:
+        print(
+            f"[Features] Requested(Global/Local/All): {len(use_glob)}/{len(use_local)}/{len(use_all)}"
+        )
+    except Exception:
+        pass
 
     # Fit on all data
     _log_progress("Fitting Global/Local/All models on full data", True)
     model_gl = _fit_cox_lifelines(df_model, use_glob, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_glob) > 0 else None
     model_lo = _fit_cox_lifelines(df_model, use_local, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_local) > 0 else None
     model_all = _fit_cox_lifelines(df_model, use_all, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_all) > 0 else None
+
+    # Verify features kept by each fitted model
+    _log_model_feature_usage("Global", use_glob, list(df_model.columns), model_gl)
+    _log_model_feature_usage("Local", use_local, list(df_model.columns), model_lo)
+    _log_model_feature_usage("All", use_all, list(df_model.columns), model_all)
 
     # Inference on all data
     risk_gl_full = _predict_risk_lifelines(model_gl, df_model) if model_gl is not None else np.zeros(len(df_model))
