@@ -13,7 +13,12 @@ from sklearn.pipeline import Pipeline
 from sklearn.inspection import permutation_importance
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    classification_report,
+    confusion_matrix,
+)
 
 from sksurv.linear_model import CoxPHSurvivalAnalysis
 from sksurv.metrics import concordance_index_censored
@@ -34,8 +39,57 @@ except Exception:
 # 使用方式：
 # 1) 直接编辑下方列表；或
 # 2) 运行时调用 set_feature_groups(["featA",...], ["featB",...])
-GLOBAL_FEATURES: List[str] = []
-LOCAL_FEATURES: List[str] = []
+GLOBAL_FEATURES: List[str] = [
+    "Age at CMR",
+    "BMI",
+    "DM",
+    "HTN",
+    "HLP",
+    "AF",
+    "NYHA Class",
+    "LVEDVi",
+    "LVEF",
+    "LV Mass Index",
+    "RVEDVi",
+    "RVEF",
+    "LA EF",
+    "LAVi",
+    "MRF (%)",
+    "Sphericity Index",
+    "Relative Wall Thickness",
+    "MV Annular Diameter",
+    "Beta Blocker",
+    "ACEi/ARB/ARNi",
+    "Aldosterone Antagonist",
+    "AAD",
+    "CRT",
+    "QRS",
+    "QTc",
+    "LGE_LGE Burden 5SD",
+]
+LOCAL_FEATURES: List[str] = [
+    "LGE_Circumural",
+    "LGE_Ring-Like",
+    "LGE_Basal anterior  (0; No, 1; yes)",
+    "LGE_Basal anterior septum",
+    "LGE_Basal inferoseptum",
+    "LGE_Basal inferio",
+    "LGE_Basal inferolateral",
+    "LGE_Basal anterolateral ",
+    "LGE_mid anterior",
+    "LGE_mid anterior septum",
+    "LGE_mid inferoseptum",
+    "LGE_mid inferior",
+    "LGE_mid inferolateral ",
+    "LGE_mid anterolateral ",
+    "LGE_apical anterior",
+    "LGE_apical septum",
+    "LGE_apical inferior",
+    "LGE_apical lateral",
+    "LGE_Apical cap",
+    "LGE_RV insertion site (1 superior, 2 inferior. 3 both)",
+]
+
 
 def set_feature_groups(global_features: List[str], local_features: List[str]) -> None:
     """显式设置全局/局部特征名列表（不在数据中的名字会被忽略）。"""
@@ -43,8 +97,10 @@ def set_feature_groups(global_features: List[str], local_features: List[str]) ->
     GLOBAL_FEATURES = list(global_features)
     LOCAL_FEATURES = list(local_features)
 
+
 # 显式控制图片保存目录（可通过 set_figures_dir 或命令行 --figs-dir 或环境变量 FIGURES_DIR 指定）
 FIGURES_DIR: Optional[str] = None
+
 
 def set_figures_dir(path: Optional[str]) -> None:
     global FIGURES_DIR
@@ -81,7 +137,9 @@ def _save_fig(fig: plt.Figure, output_dir: Optional[str], filename: str) -> None
     if output_dir:
         _ensure_dir(output_dir)
         try:
-            fig.savefig(os.path.join(output_dir, filename), dpi=150, bbox_inches="tight")
+            fig.savefig(
+                os.path.join(output_dir, filename), dpi=150, bbox_inches="tight"
+            )
             plt.close(fig)
             return
         except Exception:
@@ -178,7 +236,11 @@ def _plot_zone_counts(metrics: Dict[str, float], output_dir: Optional[str]) -> N
 
 
 def _plot_cindex_bars_generic(
-    labels: List[str], vals: List[float], title: str, output_dir: Optional[str], filename: str
+    labels: List[str],
+    vals: List[float],
+    title: str,
+    output_dir: Optional[str],
+    filename: str,
 ) -> None:
     fig, ax = plt.subplots(figsize=(6.8, 4.4))
     sns.barplot(x=labels, y=vals, hue=labels, ax=ax, palette="Set2", legend=False)
@@ -206,7 +268,9 @@ def _plot_gating_hist_by_best(
 
 
 def _plot_zone_best_model_stack(
-    counts_per_zone: Dict[str, Dict[str, int]], output_dir: Optional[str], filename: str = "zone_best_model_stack.png"
+    counts_per_zone: Dict[str, Dict[str, int]],
+    output_dir: Optional[str],
+    filename: str = "zone_best_model_stack.png",
 ) -> None:
     # counts_per_zone: {"low": {"Global": n, "Local": n, "All": n}, ...}
     zones = ["Low", "Mid", "High"]
@@ -232,7 +296,14 @@ def _plot_zone_best_model_stack(
         # annotate
         for xi, v, b in zip(range(len(zones)), vals, bottoms):
             if v > 0.02:
-                ax.text(xi, b - v / 2.0, f"{int(round(v*100))}%", ha="center", va="center", color="white")
+                ax.text(
+                    xi,
+                    b - v / 2.0,
+                    f"{int(round(v*100))}%",
+                    ha="center",
+                    va="center",
+                    color="white",
+                )
     ax.set_ylim(0.0, 1.0)
     ax.set_ylabel("Proportion within zone")
     ax.set_title("Best model composition by zone (train, OOF)")
@@ -346,14 +417,23 @@ def search_best_gating_feature_by_cv(
         return {"have_global": have_global, "have_local": have_local}
 
     # Build modeling DataFrame for OOF assignment
-    df_model = pd.concat([
-        clean_df[["PE_Time", "VT/VF/SCD"]].reset_index(drop=True),
-        X_all.reset_index(drop=True),
-    ], axis=1)
+    df_model = pd.concat(
+        [
+            clean_df[["PE_Time", "VT/VF/SCD"]].reset_index(drop=True),
+            X_all.reset_index(drop=True),
+        ],
+        axis=1,
+    )
 
     # OOF risks for assignment on the full data
     risk_gl_oof, risk_lo_oof, risk_all_oof = _compute_oof_three_risks_lifelines(
-        df_model, global_cols, local_cols, time_col="PE_Time", event_col="VT/VF/SCD", n_splits=n_splits, random_state=random_state
+        df_model,
+        global_cols,
+        local_cols,
+        time_col="PE_Time",
+        event_col="VT/VF/SCD",
+        n_splits=n_splits,
+        random_state=random_state,
     )
     evt = df_model["VT/VF/SCD"].values.astype(int)
     risks_stack = np.vstack([risk_gl_oof, risk_lo_oof, risk_all_oof])
@@ -406,7 +486,11 @@ def search_best_gating_feature_by_cv(
                             thr_h = float(np.nanquantile(x_tr, qh))
                         except Exception:
                             continue
-                        if not np.isfinite(thr_l) or not np.isfinite(thr_h) or thr_l >= thr_h:
+                        if (
+                            not np.isfinite(thr_l)
+                            or not np.isfinite(thr_h)
+                            or thr_l >= thr_h
+                        ):
                             continue
 
                         # Zones on training
@@ -417,7 +501,11 @@ def search_best_gating_feature_by_cv(
                         # Majority mapping per zone
                         z2m: Dict[str, int] = {}
                         acc_parts = []
-                        for name, m in ("low", z_low_tr), ("mid", z_mid_tr), ("high", z_high_tr):
+                        for name, m in (
+                            ("low", z_low_tr),
+                            ("mid", z_mid_tr),
+                            ("high", z_high_tr),
+                        ):
                             if m.sum() == 0:
                                 continue
                             labels = y_tr[m]
@@ -445,14 +533,21 @@ def search_best_gating_feature_by_cv(
                             best_score = acc
                             best_q = (ql, qh)
 
-        if np.isfinite(best_score) and best_score > -np.inf and np.isfinite(best_q[0]) and np.isfinite(best_q[1]):
-            feat_results.append({
-                "feature": f,
-                "cv_acc": float(best_score),
-                "q_low": float(best_q[0]),
-                "q_high": float(best_q[1]),
-                "n_finite": int(finite.sum()),
-            })
+        if (
+            np.isfinite(best_score)
+            and best_score > -np.inf
+            and np.isfinite(best_q[0])
+            and np.isfinite(best_q[1])
+        ):
+            feat_results.append(
+                {
+                    "feature": f,
+                    "cv_acc": float(best_score),
+                    "q_low": float(best_q[0]),
+                    "q_high": float(best_q[1]),
+                    "n_finite": int(finite.sum()),
+                }
+            )
 
     if len(feat_results) == 0:
         print("No valid features for gating search.")
@@ -504,7 +599,11 @@ def search_best_gating_feature_by_cv(
     y_pred_rule[z_high] = int(mapping.get("high", 0))
 
     # Overall agreement with OOF best labels (not a test score, just descriptive)
-    overall_acc = float((y_pred_rule[finite_full] == best_idx[finite_full]).mean()) if finite_full.any() else float("nan")
+    overall_acc = (
+        float((y_pred_rule[finite_full] == best_idx[finite_full]).mean())
+        if finite_full.any()
+        else float("nan")
+    )
 
     # Visualizations
     try:
@@ -512,7 +611,9 @@ def search_best_gating_feature_by_cv(
             _ensure_dir(output_dir)
             # Save top-k feature summary
             topk = min(topk_report, len(feat_results))
-            pd.DataFrame(feat_results[:topk]).to_csv(os.path.join(output_dir, "gating_search_topk.csv"), index=False)
+            pd.DataFrame(feat_results[:topk]).to_csv(
+                os.path.join(output_dir, "gating_search_topk.csv"), index=False
+            )
     except Exception:
         pass
 
@@ -526,7 +627,9 @@ def search_best_gating_feature_by_cv(
             output_dir=output_dir,
             filename="gating_best_feature_hist.png",
         )
-        _plot_zone_best_model_stack(comp_counts, output_dir, filename="gating_zone_composition.png")
+        _plot_zone_best_model_stack(
+            comp_counts, output_dir, filename="gating_zone_composition.png"
+        )
     except Exception:
         pass
 
@@ -553,9 +656,15 @@ def search_best_gating_feature_by_cv(
 
     print("\n=== Gating feature search (three-group separation) ===")
     print(f"- Selected feature: {result['selected_feature']}")
-    print(f"- Quantiles (q_low, q_high): ({result['q_low']:.2f}, {result['q_high']:.2f})")
-    print(f"- Thresholds (low, high): ({result['thr_low']:.5g}, {result['thr_high']:.5g})")
-    print(f"- Zone -> Model mapping: low->{human_mapping.get('low','?')}, mid->{human_mapping.get('mid','?')}, high->{human_mapping.get('high','?')}")
+    print(
+        f"- Quantiles (q_low, q_high): ({result['q_low']:.2f}, {result['q_high']:.2f})"
+    )
+    print(
+        f"- Thresholds (low, high): ({result['thr_low']:.5g}, {result['thr_high']:.5g})"
+    )
+    print(
+        f"- Zone -> Model mapping: low->{human_mapping.get('low','?')}, mid->{human_mapping.get('mid','?')}, high->{human_mapping.get('high','?')}"
+    )
     print(f"- Agreement with OOF best labels (all data): {overall_acc:.4f}")
 
     return result
@@ -698,8 +807,9 @@ def load_dataframes() -> pd.DataFrame:
     return clean_df
 
 
-def _prepare_survival_xy(clean_df: pd.DataFrame,
-                         drop_cols: Optional[List[str]] = None) -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+def _prepare_survival_xy(
+    clean_df: pd.DataFrame, drop_cols: Optional[List[str]] = None
+) -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
     """
     Prepare X and y for survival modeling from cleaned data.
 
@@ -781,7 +891,11 @@ def train_coxph_model(
     except Exception:
         risk_scores = np.zeros(len(X_test), dtype=float)
     e_field, t_field = _surv_field_names(y_test)
-    test_c_index = float(concordance_index_censored(y_test[e_field].astype(bool), y_test[t_field].astype(float), risk_scores)[0])
+    test_c_index = float(
+        concordance_index_censored(
+            y_test[e_field].astype(bool), y_test[t_field].astype(float), risk_scores
+        )[0]
+    )
     # Use permutation importance on the hold-out set as a model-agnostic alternative.
     if model is not None:
         try:
@@ -797,9 +911,9 @@ def train_coxph_model(
                 random_state=random_state,
                 n_jobs=-1,
             )
-            feat_imp = pd.Series(perm_result.importances_mean, index=names_in).sort_values(
-                ascending=False
-            )
+            feat_imp = pd.Series(
+                perm_result.importances_mean, index=names_in
+            ).sort_values(ascending=False)
         except Exception:
             feat_imp = pd.Series(dtype=float)
     else:
@@ -821,7 +935,9 @@ def train_coxph_model(
     return model, metrics, feat_imp
 
 
-def _find_feature_groups(feature_names: List[str]) -> Tuple[List[str], List[str], Optional[str]]:
+def _find_feature_groups(
+    feature_names: List[str],
+) -> Tuple[List[str], List[str], Optional[str]]:
     """
     返回 (global_cols, local_cols, gating_feature)；已移除门控逻辑，gating 恒为 None。
 
@@ -944,7 +1060,11 @@ def _model_feature_names(model) -> Optional[List[str]]:
         steps = getattr(model, "named_steps", None)
         if isinstance(steps, dict):
             # Common last-step name
-            last = steps.get("coxph") or steps.get("final") or steps.get(list(steps.keys())[-1])
+            last = (
+                steps.get("coxph")
+                or steps.get("final")
+                or steps.get(list(steps.keys())[-1])
+            )
             if last is not None:
                 last_names = getattr(last, "feature_names_in_", None)
                 if last_names is not None:
@@ -1032,7 +1152,9 @@ def _fit_cox_lifelines(
     if train_df is None or len(train_df) == 0 or not feature_cols:
         return None
     # Sanitize feature matrix
-    X_sanitized = _sanitize_cox_features_matrix(train_df[feature_cols], corr_threshold=0.995, verbose=False)
+    X_sanitized = _sanitize_cox_features_matrix(
+        train_df[feature_cols], corr_threshold=0.995, verbose=False
+    )
     kept_features = list(X_sanitized.columns)
     if len(kept_features) == 0:
         return None
@@ -1049,7 +1171,9 @@ def _fit_cox_lifelines(
         return cph
     except Exception:
         # Retry with stronger sanitization and regularization
-        X_sanitized2 = _sanitize_cox_features_matrix(train_df[feature_cols], corr_threshold=0.95, verbose=False)
+        X_sanitized2 = _sanitize_cox_features_matrix(
+            train_df[feature_cols], corr_threshold=0.95, verbose=False
+        )
         if X_sanitized2.shape[1] == 0:
             return None
         df_fit2 = pd.concat(
@@ -1101,21 +1225,49 @@ def _compute_oof_three_risks_lifelines(
     risk_all = np.full(n, np.nan, dtype=float)
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
-    all_feature_cols = [c for c in df.columns if c not in [time_col, event_col, "MRN", "ICD"]]
+    all_feature_cols = [
+        c for c in df.columns if c not in [time_col, event_col, "MRN", "ICD"]
+    ]
 
     for tr_idx, va_idx in kf.split(df):
         tr = df.iloc[tr_idx]
         va = df.iloc[va_idx]
 
         # Fit three models on fold-train
-        model_gl = _fit_cox_lifelines(tr, [c for c in global_cols if c in tr.columns], time_col, event_col) if len(global_cols) > 0 else None
-        model_lo = _fit_cox_lifelines(tr, [c for c in local_cols if c in tr.columns], time_col, event_col) if len(local_cols) > 0 else None
-        model_all = _fit_cox_lifelines(tr, [c for c in all_feature_cols if c in tr.columns], time_col, event_col)
+        model_gl = (
+            _fit_cox_lifelines(
+                tr, [c for c in global_cols if c in tr.columns], time_col, event_col
+            )
+            if len(global_cols) > 0
+            else None
+        )
+        model_lo = (
+            _fit_cox_lifelines(
+                tr, [c for c in local_cols if c in tr.columns], time_col, event_col
+            )
+            if len(local_cols) > 0
+            else None
+        )
+        model_all = _fit_cox_lifelines(
+            tr, [c for c in all_feature_cols if c in tr.columns], time_col, event_col
+        )
 
         # Predict risks on fold-val
-        risk_gl = _predict_risk_lifelines(model_gl, va) if model_gl is not None else np.zeros(len(va))
-        risk_lo = _predict_risk_lifelines(model_lo, va) if model_lo is not None else np.zeros(len(va))
-        risk_al = _predict_risk_lifelines(model_all, va) if model_all is not None else np.zeros(len(va))
+        risk_gl = (
+            _predict_risk_lifelines(model_gl, va)
+            if model_gl is not None
+            else np.zeros(len(va))
+        )
+        risk_lo = (
+            _predict_risk_lifelines(model_lo, va)
+            if model_lo is not None
+            else np.zeros(len(va))
+        )
+        risk_al = (
+            _predict_risk_lifelines(model_all, va)
+            if model_all is not None
+            else np.zeros(len(va))
+        )
 
         risk_glob[va_idx] = risk_gl
         risk_loc[va_idx] = risk_lo
@@ -1144,8 +1296,12 @@ def evaluate_three_model_assignment_and_classifier(
     """
     df = clean_df.copy()
     # Ensure basic dtypes
-    df["VT/VF/SCD"] = pd.to_numeric(df["VT/VF/SCD"], errors="coerce").fillna(0).astype(int)
-    df["PE_Time"] = pd.to_numeric(df["PE_Time"], errors="coerce").fillna(0).astype(float)
+    df["VT/VF/SCD"] = (
+        pd.to_numeric(df["VT/VF/SCD"], errors="coerce").fillna(0).astype(int)
+    )
+    df["PE_Time"] = (
+        pd.to_numeric(df["PE_Time"], errors="coerce").fillna(0).astype(float)
+    )
     df = df.dropna(subset=["PE_Time"]).copy()
 
     # Feature groups
@@ -1161,14 +1317,23 @@ def evaluate_three_model_assignment_and_classifier(
     feat_all_cols = [c for c in feature_names]
     # 保留 MRN（若存在）用于输出标识；模型训练时会自动忽略 MRN
     left_cols = ["PE_Time", "VT/VF/SCD"] + (["MRN"] if "MRN" in df.columns else [])
-    df_model = pd.concat([
-        df[left_cols].reset_index(drop=True),
-        X_all[feat_all_cols].reset_index(drop=True)
-    ], axis=1)
+    df_model = pd.concat(
+        [
+            df[left_cols].reset_index(drop=True),
+            X_all[feat_all_cols].reset_index(drop=True),
+        ],
+        axis=1,
+    )
 
     # OOF risks on full data (for assignment labels)
     risk_gl_oof, risk_lo_oof, risk_all_oof = _compute_oof_three_risks_lifelines(
-        df_model, global_cols, local_cols, time_col="PE_Time", event_col="VT/VF/SCD", n_splits=5, random_state=random_state
+        df_model,
+        global_cols,
+        local_cols,
+        time_col="PE_Time",
+        event_col="VT/VF/SCD",
+        n_splits=5,
+        random_state=random_state,
     )
 
     evt = df_model["VT/VF/SCD"].values.astype(int)
@@ -1181,7 +1346,10 @@ def evaluate_three_model_assignment_and_classifier(
 
     # Train/test split for classifier and evaluation（用于评估，不影响全体标签的产生与保存）
     tr_idx, te_idx = train_test_split(
-        np.arange(len(df_model)), test_size=test_size, random_state=random_state, stratify=evt
+        np.arange(len(df_model)),
+        test_size=test_size,
+        random_state=random_state,
+        stratify=evt,
     )
     tr_df = df_model.iloc[tr_idx].copy()
     te_df = df_model.iloc[te_idx].copy()
@@ -1189,27 +1357,53 @@ def evaluate_three_model_assignment_and_classifier(
     y_te_assign = best_idx[te_idx]
 
     # Fit three lifelines Cox models on training set for test-time metrics
-    model_gl = _fit_cox_lifelines(tr_df, [c for c in global_cols if c in tr_df.columns], time_col="PE_Time", event_col="VT/VF/SCD")
-    model_lo = _fit_cox_lifelines(tr_df, [c for c in local_cols if c in tr_df.columns], time_col="PE_Time", event_col="VT/VF/SCD")
+    model_gl = _fit_cox_lifelines(
+        tr_df,
+        [c for c in global_cols if c in tr_df.columns],
+        time_col="PE_Time",
+        event_col="VT/VF/SCD",
+    )
+    model_lo = _fit_cox_lifelines(
+        tr_df,
+        [c for c in local_cols if c in tr_df.columns],
+        time_col="PE_Time",
+        event_col="VT/VF/SCD",
+    )
     feat_all_cols_tr = [c for c in feat_all_cols if c in tr_df.columns]
-    model_all = _fit_cox_lifelines(tr_df, feat_all_cols_tr, time_col="PE_Time", event_col="VT/VF/SCD")
+    model_all = _fit_cox_lifelines(
+        tr_df, feat_all_cols_tr, time_col="PE_Time", event_col="VT/VF/SCD"
+    )
 
     risk_gl_te = _predict_risk_lifelines(model_gl, te_df)
     risk_lo_te = _predict_risk_lifelines(model_lo, te_df)
     risk_all_te = _predict_risk_lifelines(model_all, te_df)
 
     # Test-set C-index for three models
-    cidx_gl = concordance_index(te_df["PE_Time"].values, -risk_gl_te, te_df["VT/VF/SCD"].values)
-    cidx_lo = concordance_index(te_df["PE_Time"].values, -risk_lo_te, te_df["VT/VF/SCD"].values)
-    cidx_all = concordance_index(te_df["PE_Time"].values, -risk_all_te, te_df["VT/VF/SCD"].values)
+    cidx_gl = concordance_index(
+        te_df["PE_Time"].values, -risk_gl_te, te_df["VT/VF/SCD"].values
+    )
+    cidx_lo = concordance_index(
+        te_df["PE_Time"].values, -risk_lo_te, te_df["VT/VF/SCD"].values
+    )
+    cidx_all = concordance_index(
+        te_df["PE_Time"].values, -risk_all_te, te_df["VT/VF/SCD"].values
+    )
 
     # Train classifier to predict assignment label (0=Global,1=Local,2=All)
     from sklearn.pipeline import Pipeline as SkPipeline
     from sklearn.preprocessing import StandardScaler as SkStandardScaler
-    clf = SkPipeline([
-        ("scaler", SkStandardScaler()),
-        ("clf", LogisticRegression(multi_class="multinomial", solver="lbfgs", max_iter=2000)),
-    ])
+
+    clf = SkPipeline(
+        [
+            ("scaler", SkStandardScaler()),
+            (
+                "clf",
+                LogisticRegression(
+                    multi_class="multinomial", solver="lbfgs", max_iter=2000
+                ),
+            ),
+        ]
+    )
     X_tr_cls = tr_df.drop(columns=["PE_Time", "VT/VF/SCD"], errors="ignore")
     X_te_cls = te_df.drop(columns=["PE_Time", "VT/VF/SCD"], errors="ignore")
     clf.fit(X_tr_cls, y_tr_assign)
@@ -1218,11 +1412,19 @@ def evaluate_three_model_assignment_and_classifier(
     f1_macro = float(f1_score(y_te_assign, y_pred, average="macro"))
 
     print("\nThree-model assignment via lifelines CoxPH:")
-    print(f"- Global cols: {len(global_cols)}, Local cols: {len(local_cols)}, All cols: {len(feat_all_cols)}")
-    print(f"- Test C-index | Global: {cidx_gl:.4f} | Local: {cidx_lo:.4f} | All: {cidx_all:.4f}")
+    print(
+        f"- Global cols: {len(global_cols)}, Local cols: {len(local_cols)}, All cols: {len(feat_all_cols)}"
+    )
+    print(
+        f"- Test C-index | Global: {cidx_gl:.4f} | Local: {cidx_lo:.4f} | All: {cidx_all:.4f}"
+    )
     print(f"- Assignment classifier | Acc: {acc:.4f} | F1-macro: {f1_macro:.4f}")
     try:
-        print(classification_report(y_te_assign, y_pred, target_names=["Global","Local","All"]))
+        print(
+            classification_report(
+                y_te_assign, y_pred, target_names=["Global", "Local", "All"]
+            )
+        )
     except Exception:
         pass
 
@@ -1232,12 +1434,16 @@ def evaluate_three_model_assignment_and_classifier(
         if lr is not None and hasattr(lr, "coef_"):
             coef = lr.coef_
             feat = X_tr_cls.columns.to_list()
-            coef_df = pd.DataFrame(coef, columns=feat, index=["Global","Local","All"]).T
+            coef_df = pd.DataFrame(
+                coef, columns=feat, index=["Global", "Local", "All"]
+            ).T
             if output_dir:
                 _ensure_dir(output_dir)
-                coef_df.to_csv(os.path.join(output_dir, "assignment_lifelines_coef.csv"))
+                coef_df.to_csv(
+                    os.path.join(output_dir, "assignment_lifelines_coef.csv")
+                )
             topk = 15
-            for cls in ["Global","Local","All"]:
+            for cls in ["Global", "Local", "All"]:
                 ser = coef_df[cls].abs().sort_values(ascending=False).head(topk)
                 _plot_series_barh(
                     ser,
@@ -1246,14 +1452,24 @@ def evaluate_three_model_assignment_and_classifier(
                     xlabel="|coefficient|",
                     output_dir=output_dir,
                     filename=f"assignment_lifelines_top_{cls.lower()}.png",
-                    color="#2ca02c" if cls=="Global" else ("#ff7f0e" if cls=="Local" else "#1f77b4"),
+                    color=(
+                        "#2ca02c"
+                        if cls == "Global"
+                        else ("#ff7f0e" if cls == "Local" else "#1f77b4")
+                    ),
                 )
     except Exception:
         pass
 
     # Counts plot of assigned groups（基于全体 OOF 标签）
     try:
-        counts = pd.Series({"Global": int((best_idx==0).sum()), "Local": int((best_idx==1).sum()), "All": int((best_idx==2).sum())})
+        counts = pd.Series(
+            {
+                "Global": int((best_idx == 0).sum()),
+                "Local": int((best_idx == 1).sum()),
+                "All": int((best_idx == 2).sum()),
+            }
+        )
         _plot_series_barh(
             counts,
             topn=len(counts),
@@ -1269,15 +1485,23 @@ def evaluate_three_model_assignment_and_classifier(
     # Save and return per-sample assignment labels for the full dataset
     try:
         mapping = {0: "Global", 1: "Local", 2: "All"}
-        id_series = df_model["MRN"] if "MRN" in df_model.columns else pd.Series(np.arange(len(df_model)), name="index")
-        assign_df = pd.DataFrame({
-            id_series.name: id_series.values,
-            "assignment_label": best_idx.astype(int),
-            "assignment_group": pd.Series(best_idx).map(mapping).fillna("").values,
-        })
+        id_series = (
+            df_model["MRN"]
+            if "MRN" in df_model.columns
+            else pd.Series(np.arange(len(df_model)), name="index")
+        )
+        assign_df = pd.DataFrame(
+            {
+                id_series.name: id_series.values,
+                "assignment_label": best_idx.astype(int),
+                "assignment_group": pd.Series(best_idx).map(mapping).fillna("").values,
+            }
+        )
         if output_dir:
             _ensure_dir(output_dir)
-            assign_df.to_csv(os.path.join(output_dir, "assignment_labels_all.csv"), index=False)
+            assign_df.to_csv(
+                os.path.join(output_dir, "assignment_labels_all.csv"), index=False
+            )
     except Exception:
         pass
 
@@ -1285,24 +1509,38 @@ def evaluate_three_model_assignment_and_classifier(
     try:
         from sklearn.pipeline import Pipeline as SkPipeline
         from sklearn.preprocessing import StandardScaler as SkStandardScaler
-        X_cls_all = df_model.drop(columns=["PE_Time", "VT/VF/SCD", "MRN"], errors="ignore")
+
+        X_cls_all = df_model.drop(
+            columns=["PE_Time", "VT/VF/SCD", "MRN"], errors="ignore"
+        )
         y_cls_all = best_idx.astype(int)
-        clf_all = SkPipeline([
-            ("scaler", SkStandardScaler()),
-            ("clf", LogisticRegression(multi_class="multinomial", solver="lbfgs", max_iter=2000)),
-        ])
+        clf_all = SkPipeline(
+            [
+                ("scaler", SkStandardScaler()),
+                (
+                    "clf",
+                    LogisticRegression(
+                        multi_class="multinomial", solver="lbfgs", max_iter=2000
+                    ),
+                ),
+            ]
+        )
         clf_all.fit(X_cls_all, y_cls_all)
         lr_all = clf_all.named_steps.get("clf")
         if lr_all is not None and hasattr(lr_all, "coef_"):
             coef_all = lr_all.coef_
             feat_all = X_cls_all.columns.to_list()
-            coef_df_all = pd.DataFrame(coef_all, columns=feat_all, index=["Global","Local","All"]).T
+            coef_df_all = pd.DataFrame(
+                coef_all, columns=feat_all, index=["Global", "Local", "All"]
+            ).T
             if output_dir:
                 _ensure_dir(output_dir)
-                coef_df_all.to_csv(os.path.join(output_dir, "assignment_coefficients_all.csv"))
+                coef_df_all.to_csv(
+                    os.path.join(output_dir, "assignment_coefficients_all.csv")
+                )
             # Plot top features per class
             topk = 20
-            for cls in ["Global","Local","All"]:
+            for cls in ["Global", "Local", "All"]:
                 ser = coef_df_all[cls].abs().sort_values(ascending=False).head(topk)
                 _plot_series_barh(
                     ser,
@@ -1311,7 +1549,11 @@ def evaluate_three_model_assignment_and_classifier(
                     xlabel="|coefficient|",
                     output_dir=output_dir,
                     filename=f"assignment_full_top_{cls.lower()}.png",
-                    color="#2ca02c" if cls=="Global" else ("#ff7f0e" if cls=="Local" else "#1f77b4"),
+                    color=(
+                        "#2ca02c"
+                        if cls == "Global"
+                        else ("#ff7f0e" if cls == "Local" else "#1f77b4")
+                    ),
                 )
     except Exception:
         pass
@@ -1325,7 +1567,11 @@ def evaluate_three_model_assignment_and_classifier(
         "n_train": int(len(tr_df)),
         "n_test": int(len(te_df)),
         "assignment_all_labels": [int(v) for v in best_idx.tolist()],
-        "assignment_all_ids": (df_model["MRN"].tolist() if "MRN" in df_model.columns else list(range(len(df_model)))),
+        "assignment_all_ids": (
+            df_model["MRN"].tolist()
+            if "MRN" in df_model.columns
+            else list(range(len(df_model)))
+        ),
     }
 
 
@@ -1382,10 +1628,12 @@ def _fit_coxph_clean(X: pd.DataFrame, y: np.ndarray) -> Optional[object]:
     from sklearn.preprocessing import StandardScaler as SkStandardScaler
 
     # Use scaling to prevent exp overflow in risk computations
-    pipe = SkPipeline([
-        ("scaler", SkStandardScaler()),
-        ("coxph", CoxPHSurvivalAnalysis()),
-    ])
+    pipe = SkPipeline(
+        [
+            ("scaler", SkStandardScaler()),
+            ("coxph", CoxPHSurvivalAnalysis()),
+        ]
+    )
     try:
         pipe.fit(Xc, y)
         return pipe
@@ -1522,7 +1770,10 @@ def _optimize_gate_quantiles(
                 best_score = score
                 best_pair = (ql, qh)
 
-    info: Dict[str, float] = {"tried": float(tried), "best_c_index_val": float(best_score)}
+    info: Dict[str, float] = {
+        "tried": float(tried),
+        "best_c_index_val": float(best_score),
+    }
     return best_pair[0], best_pair[1], info
 
 
@@ -1550,7 +1801,9 @@ def analyze_benefit_subgroup(
     have_local = len(local_cols) > 0
     n = len(X_all)
     if n == 0 or not (have_global and have_local):
-        print("Benefit analysis skipped: insufficient data or feature groups not found.")
+        print(
+            "Benefit analysis skipped: insufficient data or feature groups not found."
+        )
         return {
             "n": int(n),
             "have_global": have_global,
@@ -1574,7 +1827,11 @@ def analyze_benefit_subgroup(
 
         # Fold-specific time horizon
         e_field, t_field = _surv_field_names(y_tr)
-        t_hor = float(np.percentile(y_tr[t_field], percent_for_time * 100.0)) if len(y_tr) else 365.0
+        t_hor = (
+            float(np.percentile(y_tr[t_field], percent_for_time * 100.0))
+            if len(y_tr)
+            else 365.0
+        )
         if not np.isfinite(t_hor) or t_hor <= 0:
             t_hor = 365.0
 
@@ -1585,12 +1842,20 @@ def analyze_benefit_subgroup(
 
         # OOF risk predictions at t
         risk_gl = (
-            _risk_at_time(model_gl, X_va[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_va))
+            _risk_at_time(model_gl, X_va[global_cols], t_hor)
+            if model_gl is not None
+            else np.zeros(len(X_va))
         )
         risk_lo = (
-            _risk_at_time(model_lo, X_va[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_va))
+            _risk_at_time(model_lo, X_va[local_cols], t_hor)
+            if model_lo is not None
+            else np.zeros(len(X_va))
         )
-        risk_all = _risk_at_time(model_all, X_va, t_hor) if model_all is not None else np.zeros(len(X_va))
+        risk_all = (
+            _risk_at_time(model_all, X_va, t_hor)
+            if model_all is not None
+            else np.zeros(len(X_va))
+        )
 
         # Binary outcome at t with known mask
         y_bin, known = _binary_outcome_at_time(y_va, t_hor)
@@ -1614,7 +1879,9 @@ def analyze_benefit_subgroup(
     # Best-of-three winner per sample
     best_idx = np.full(len(X_all), -1, dtype=int)
     if valid.any():
-        triple = np.vstack([err_gl[valid], err_lo[valid], err_all[valid]])  # rows: G, L, A
+        triple = np.vstack(
+            [err_gl[valid], err_lo[valid], err_all[valid]]
+        )  # rows: G, L, A
         best = np.argmin(triple, axis=0)
         best_idx[np.where(valid)[0]] = best
     best_g = best_idx == 0
@@ -1640,11 +1907,19 @@ def analyze_benefit_subgroup(
     }
 
     if benefit_local.sum() > 1:
-        metrics["c_index_global_in_benefitLocal"] = _c_index(y_all[benefit_local], risk_glob_oof[benefit_local])
-        metrics["c_index_all_in_benefitLocal"] = _c_index(y_all[benefit_local], risk_all_oof[benefit_local])
+        metrics["c_index_global_in_benefitLocal"] = _c_index(
+            y_all[benefit_local], risk_glob_oof[benefit_local]
+        )
+        metrics["c_index_all_in_benefitLocal"] = _c_index(
+            y_all[benefit_local], risk_all_oof[benefit_local]
+        )
     if benefit_global.sum() > 1:
-        metrics["c_index_local_in_benefitGlobal"] = _c_index(y_all[benefit_global], risk_loc_oof[benefit_global])
-        metrics["c_index_all_in_benefitGlobal"] = _c_index(y_all[benefit_global], risk_all_oof[benefit_global])
+        metrics["c_index_local_in_benefitGlobal"] = _c_index(
+            y_all[benefit_global], risk_loc_oof[benefit_global]
+        )
+        metrics["c_index_all_in_benefitGlobal"] = _c_index(
+            y_all[benefit_global], risk_all_oof[benefit_global]
+        )
 
     # Train local-only model on benefit subgroup and compute permutation importance
     try:
@@ -1656,7 +1931,9 @@ def analyze_benefit_subgroup(
             if model_ben_all is not None:
                 try:
                     X_pi_all = _align_X_to_model(model_ben_all, X_ben_all)
-                    names_all = _model_feature_names(model_ben_all) or list(X_pi_all.columns)
+                    names_all = _model_feature_names(model_ben_all) or list(
+                        X_pi_all.columns
+                    )
                     perm_all = permutation_importance(
                         model_ben_all,
                         X_pi_all,
@@ -1665,13 +1942,19 @@ def analyze_benefit_subgroup(
                         random_state=random_state,
                         n_jobs=-1,
                     )
-                    fi_all = pd.Series(perm_all.importances_mean, index=names_all).sort_values(ascending=False)
+                    fi_all = pd.Series(
+                        perm_all.importances_mean, index=names_all
+                    ).sort_values(ascending=False)
                 except Exception:
                     fi_all = pd.Series(dtype=float)
             else:
                 fi_all = pd.Series(dtype=float)
-            fi_local_cond = fi_all[fi_all.index.isin(local_cols)].sort_values(ascending=False)
-            metrics["local_feature_importance_in_benefit_conditional"] = fi_local_cond.head(topk_local_importance)
+            fi_local_cond = fi_all[fi_all.index.isin(local_cols)].sort_values(
+                ascending=False
+            )
+            metrics["local_feature_importance_in_benefit_conditional"] = (
+                fi_local_cond.head(topk_local_importance)
+            )
             try:
                 _plot_series_barh(
                     fi_local_cond,
@@ -1691,7 +1974,9 @@ def analyze_benefit_subgroup(
             if model_ben_loc is not None:
                 try:
                     X_pi_loc = _align_X_to_model(model_ben_loc, X_ben_loc)
-                    names_loc = _model_feature_names(model_ben_loc) or list(X_pi_loc.columns)
+                    names_loc = _model_feature_names(model_ben_loc) or list(
+                        X_pi_loc.columns
+                    )
                     perm_loc = permutation_importance(
                         model_ben_loc,
                         X_pi_loc,
@@ -1700,12 +1985,16 @@ def analyze_benefit_subgroup(
                         random_state=random_state,
                         n_jobs=-1,
                     )
-                    fi_loc = pd.Series(perm_loc.importances_mean, index=names_loc).sort_values(ascending=False)
+                    fi_loc = pd.Series(
+                        perm_loc.importances_mean, index=names_loc
+                    ).sort_values(ascending=False)
                 except Exception:
                     fi_loc = pd.Series(dtype=float)
             else:
                 fi_loc = pd.Series(dtype=float)
-            metrics["local_feature_importance_in_benefit_localOnly"] = fi_loc.head(topk_local_importance)
+            metrics["local_feature_importance_in_benefit_localOnly"] = fi_loc.head(
+                topk_local_importance
+            )
             try:
                 _plot_series_barh(
                     fi_loc,
@@ -1719,7 +2008,9 @@ def analyze_benefit_subgroup(
             except Exception:
                 pass
 
-            print("\nBenefit subgroup (A better than G): local feature importance (conditional on globals, top):")
+            print(
+                "\nBenefit subgroup (A better than G): local feature importance (conditional on globals, top):"
+            )
             print(metrics["local_feature_importance_in_benefit_conditional"])
             print("\nBenefit subgroup: local-only model feature importance (top):")
             print(metrics["local_feature_importance_in_benefit_localOnly"])
@@ -1727,10 +2018,14 @@ def analyze_benefit_subgroup(
         pass
 
     print("\nBenefit subgroup analysis:")
-    print(f"- Labeled at t: {metrics['n_labeled']} / {metrics['n']} (valid={metrics['n_valid']})")
+    print(
+        f"- Labeled at t: {metrics['n_labeled']} / {metrics['n']} (valid={metrics['n_valid']})"
+    )
     print(f"- Benefit (A better than G): {metrics['n_benefit_local']}")
     print(f"- Benefit (A better than L): {metrics['n_benefit_global']}")
-    print(f"- Best model counts [G/L/A]: {metrics['n_best_global']} / {metrics['n_best_local']} / {metrics['n_best_all']}")
+    print(
+        f"- Best model counts [G/L/A]: {metrics['n_best_global']} / {metrics['n_best_local']} / {metrics['n_best_all']}"
+    )
     if "c_index_global_in_benefitLocal" in metrics:
         print(
             f"- C-index in BENEFIT(A>G): all={metrics['c_index_all_in_benefitLocal']:.4f}, global={metrics['c_index_global_in_benefitLocal']:.4f}"
@@ -1824,7 +2119,11 @@ def _compute_oof_three_model_risks(
 
         # Fold-specific horizon
         e_field, t_field = _surv_field_names(y_tr)
-        t_hor = float(np.percentile(y_tr[t_field], percent_for_time * 100.0)) if len(y_tr) else 365.0
+        t_hor = (
+            float(np.percentile(y_tr[t_field], percent_for_time * 100.0))
+            if len(y_tr)
+            else 365.0
+        )
         if not np.isfinite(t_hor) or t_hor <= 0:
             t_hor = 365.0
         t_values.append(t_hor)
@@ -1835,9 +2134,21 @@ def _compute_oof_three_model_risks(
         model_all = _fit(X_tr, y_tr)
 
         # Predict risks on fold-val
-        risk_gl = _risk_at_time(model_gl, X_va[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_va))
-        risk_lo = _risk_at_time(model_lo, X_va[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_va))
-        risk_all = _risk_at_time(model_all, X_va, t_hor) if model_all is not None else np.zeros(len(X_va))
+        risk_gl = (
+            _risk_at_time(model_gl, X_va[global_cols], t_hor)
+            if model_gl is not None
+            else np.zeros(len(X_va))
+        )
+        risk_lo = (
+            _risk_at_time(model_lo, X_va[local_cols], t_hor)
+            if model_lo is not None
+            else np.zeros(len(X_va))
+        )
+        risk_all = (
+            _risk_at_time(model_all, X_va, t_hor)
+            if model_all is not None
+            else np.zeros(len(X_va))
+        )
 
         # Binary outcomes and known mask at t
         y_bin, known = _binary_outcome_at_time(y_va, t_hor)
@@ -1867,7 +2178,9 @@ def evaluate_three_model_grouping_and_rule(
     """
     三分区门控规则已移除：此函数禁用。
     """
-    print("[INFO] Three-model grouping and gating rule has been removed and is disabled.")
+    print(
+        "[INFO] Three-model grouping and gating rule has been removed and is disabled."
+    )
     return {"removed": True}
 
 
@@ -1900,13 +2213,23 @@ def train_assignment_classifier_and_tableone(
     )
 
     # OOF risks on train
-    risk_gl_tr, risk_lo_tr, risk_all_tr, ybin_tr, known_tr, t_mean = _compute_oof_three_model_risks(
-        X_train, y_train, global_cols, local_cols, n_splits_oof, random_state, percent_for_time
+    risk_gl_tr, risk_lo_tr, risk_all_tr, ybin_tr, known_tr, t_mean = (
+        _compute_oof_three_model_risks(
+            X_train,
+            y_train,
+            global_cols,
+            local_cols,
+            n_splits_oof,
+            random_state,
+            percent_for_time,
+        )
     )
     err_gl = (risk_gl_tr - ybin_tr) ** 2
     err_lo = (risk_lo_tr - ybin_tr) ** 2
     err_all = (risk_all_tr - ybin_tr) ** 2
-    valid_tr = known_tr & np.isfinite(err_gl) & np.isfinite(err_lo) & np.isfinite(err_all)
+    valid_tr = (
+        known_tr & np.isfinite(err_gl) & np.isfinite(err_lo) & np.isfinite(err_all)
+    )
     best_idx_tr = np.full(len(X_train), -1, dtype=int)
     if valid_tr.any():
         triple = np.vstack([err_gl[valid_tr], err_lo[valid_tr], err_all[valid_tr]])
@@ -1915,7 +2238,11 @@ def train_assignment_classifier_and_tableone(
 
     # Fixed horizon on test = 75th percentile of train times
     e_field, t_field = _surv_field_names(y_train)
-    t_hor = float(np.percentile(y_train[t_field], percent_for_time * 100.0)) if len(y_train) else 365.0
+    t_hor = (
+        float(np.percentile(y_train[t_field], percent_for_time * 100.0))
+        if len(y_train)
+        else 365.0
+    )
     if not np.isfinite(t_hor) or t_hor <= 0:
         t_hor = 365.0
 
@@ -1928,17 +2255,36 @@ def train_assignment_classifier_and_tableone(
     model_lo = _fit(X_train[local_cols], y_train) if have_local else None
 
     # Risks and assignment on test
-    risk_all_te = _risk_at_time(model_all, X_test, t_hor) if model_all is not None else np.zeros(len(X_test))
-    risk_gl_te = _risk_at_time(model_gl, X_test[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_test))
-    risk_lo_te = _risk_at_time(model_lo, X_test[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_test))
+    risk_all_te = (
+        _risk_at_time(model_all, X_test, t_hor)
+        if model_all is not None
+        else np.zeros(len(X_test))
+    )
+    risk_gl_te = (
+        _risk_at_time(model_gl, X_test[global_cols], t_hor)
+        if model_gl is not None
+        else np.zeros(len(X_test))
+    )
+    risk_lo_te = (
+        _risk_at_time(model_lo, X_test[local_cols], t_hor)
+        if model_lo is not None
+        else np.zeros(len(X_test))
+    )
     ybin_te, known_te = _binary_outcome_at_time(y_test, t_hor)
     err_gl_te = (risk_gl_te - ybin_te) ** 2
     err_lo_te = (risk_lo_te - ybin_te) ** 2
     err_all_te = (risk_all_te - ybin_te) ** 2
-    valid_te = known_te & np.isfinite(err_gl_te) & np.isfinite(err_lo_te) & np.isfinite(err_all_te)
+    valid_te = (
+        known_te
+        & np.isfinite(err_gl_te)
+        & np.isfinite(err_lo_te)
+        & np.isfinite(err_all_te)
+    )
     best_idx_te = np.full(len(X_test), -1, dtype=int)
     if valid_te.any():
-        triple = np.vstack([err_gl_te[valid_te], err_lo_te[valid_te], err_all_te[valid_te]])
+        triple = np.vstack(
+            [err_gl_te[valid_te], err_lo_te[valid_te], err_all_te[valid_te]]
+        )
         best = np.argmin(triple, axis=0)
         best_idx_te[np.where(valid_te)[0]] = best
 
@@ -1949,21 +2295,39 @@ def train_assignment_classifier_and_tableone(
     y_te_cls = best_idx_te[valid_te]
 
     # Multinomial logistic regression (with scaling)
-    clf = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(multi_class="multinomial", solver="lbfgs", max_iter=2000, n_jobs=None))
-    ])
+    clf = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "clf",
+                LogisticRegression(
+                    multi_class="multinomial",
+                    solver="lbfgs",
+                    max_iter=2000,
+                    n_jobs=None,
+                ),
+            ),
+        ]
+    )
     clf.fit(X_tr_cls, y_tr_cls)
     y_pred = clf.predict(X_te_cls) if len(X_te_cls) else np.array([], dtype=int)
     acc = float(accuracy_score(y_te_cls, y_pred)) if len(y_te_cls) else np.nan
-    f1_macro = float(f1_score(y_te_cls, y_pred, average="macro")) if len(y_te_cls) else np.nan
+    f1_macro = (
+        float(f1_score(y_te_cls, y_pred, average="macro")) if len(y_te_cls) else np.nan
+    )
 
     print("\nAssignment prediction (multinomial logistic):")
-    print(f"- Train labeled: {len(X_tr_cls)} / {len(X_train)} | Test labeled: {len(X_te_cls)} / {len(X_test)}")
+    print(
+        f"- Train labeled: {len(X_tr_cls)} / {len(X_train)} | Test labeled: {len(X_te_cls)} / {len(X_test)}"
+    )
     if np.isfinite(acc):
         print(f"- Accuracy (test): {acc:.4f}, Macro-F1: {f1_macro:.4f}")
         try:
-            print(classification_report(y_te_cls, y_pred, target_names=["Global","Local","All"]))
+            print(
+                classification_report(
+                    y_te_cls, y_pred, target_names=["Global", "Local", "All"]
+                )
+            )
         except Exception:
             pass
 
@@ -1973,16 +2337,22 @@ def train_assignment_classifier_and_tableone(
         if lr is not None and hasattr(lr, "coef_"):
             coef = lr.coef_  # shape (3, n_features)
             feat = X_tr_cls.columns.to_list()
-            coef_df = pd.DataFrame(coef, columns=feat, index=["Global","Local","All"]).T
+            coef_df = pd.DataFrame(
+                coef, columns=feat, index=["Global", "Local", "All"]
+            ).T
             # Top features per class by absolute coefficient
             top_dict: Dict[str, pd.Series] = {}
-            for cls in ["Global","Local","All"]:
-                top_dict[cls] = coef_df[cls].abs().sort_values(ascending=False).head(topk_coef)
+            for cls in ["Global", "Local", "All"]:
+                top_dict[cls] = (
+                    coef_df[cls].abs().sort_values(ascending=False).head(topk_coef)
+                )
             # Save CSVs
             if output_dir:
                 _ensure_dir(output_dir)
                 coef_df.to_csv(os.path.join(output_dir, "assignment_logreg_coef.csv"))
-                with open(os.path.join(output_dir, "assignment_logreg_metrics.txt"), "w") as f:
+                with open(
+                    os.path.join(output_dir, "assignment_logreg_metrics.txt"), "w"
+                ) as f:
                     f.write(f"accuracy={acc}\nmacro_f1={f1_macro}\n")
             # Plot per class top features
             try:
@@ -1994,7 +2364,11 @@ def train_assignment_classifier_and_tableone(
                         xlabel="|coefficient|",
                         output_dir=output_dir,
                         filename=f"assignment_top_{cls.lower()}.png",
-                        color="#2ca02c" if cls=="Global" else ("#ff7f0e" if cls=="Local" else "#1f77b4"),
+                        color=(
+                            "#2ca02c"
+                            if cls == "Global"
+                            else ("#ff7f0e" if cls == "Local" else "#1f77b4")
+                        ),
                     )
             except Exception:
                 pass
@@ -2004,9 +2378,13 @@ def train_assignment_classifier_and_tableone(
     # Build TableOne-style summary across three groups (using available labeled samples)
     mapping = {0: "Global", 1: "Local", 2: "All"}
     df_train_groups = X_tr_cls.copy()
-    df_train_groups["assignment"] = pd.Series(y_tr_cls, index=df_train_groups.index).map(mapping)
+    df_train_groups["assignment"] = pd.Series(
+        y_tr_cls, index=df_train_groups.index
+    ).map(mapping)
     df_test_groups = X_te_cls.copy()
-    df_test_groups["assignment"] = pd.Series(y_te_cls, index=df_test_groups.index).map(mapping)
+    df_test_groups["assignment"] = pd.Series(y_te_cls, index=df_test_groups.index).map(
+        mapping
+    )
     df_groups = pd.concat([df_train_groups, df_test_groups], axis=0)
 
     # Try to use tableone if available
@@ -2015,9 +2393,20 @@ def train_assignment_classifier_and_tableone(
         from tableone import TableOne  # type: ignore
 
         # Heuristics: categorical if object dtype or low unique count (<=5)
-        cats = [c for c in df_groups.columns if c != "assignment" and (df_groups[c].dtype == "object" or df_groups[c].nunique() <= 5)]
+        cats = [
+            c
+            for c in df_groups.columns
+            if c != "assignment"
+            and (df_groups[c].dtype == "object" or df_groups[c].nunique() <= 5)
+        ]
         conts = [c for c in df_groups.columns if c != "assignment" and c not in cats]
-        t1 = TableOne(df_groups, columns=cats + conts, categorical=cats, groupby="assignment", pval=True)
+        t1 = TableOne(
+            df_groups,
+            columns=cats + conts,
+            categorical=cats,
+            groupby="assignment",
+            pval=True,
+        )
         tableone_df = t1.tableone.reset_index()
     except Exception:
         # Fallback: simple describe by group (mean±std for numeric, % for binary-like)
@@ -2034,7 +2423,9 @@ def train_assignment_classifier_and_tableone(
     if output_dir and tableone_df is not None:
         try:
             _ensure_dir(output_dir)
-            tableone_df.to_csv(os.path.join(output_dir, "tableone_assignment.csv"), index=False)
+            tableone_df.to_csv(
+                os.path.join(output_dir, "tableone_assignment.csv"), index=False
+            )
         except Exception:
             pass
 
@@ -2049,13 +2440,24 @@ def train_assignment_classifier_and_tableone(
         "macro_f1_test": f1_macro,
         "time_horizon_days": float(t_hor),
     }
-    print("TableOne saved to tableone_assignment.csv" if output_dir and tableone_df is not None else "TableOne not generated.")
+    print(
+        "TableOne saved to tableone_assignment.csv"
+        if output_dir and tableone_df is not None
+        else "TableOne not generated."
+    )
     return result
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Three-model assignment and reverse feature analysis")
-    parser.add_argument("--figs-dir", type=str, default=None, help="输出图片与CSV的根目录；优先级高于环境变量 FIGURES_DIR")
+    parser = argparse.ArgumentParser(
+        description="Three-model assignment and reverse feature analysis"
+    )
+    parser.add_argument(
+        "--figs-dir",
+        type=str,
+        default="/home/sunx/data/aiiih/projects/sunx/projects/ICD/fig",
+        help="输出图片与CSV的根目录；优先级高于环境变量 FIGURES_DIR",
+    )
     args = parser.parse_args()
 
     clean_df = load_dataframes()
@@ -2063,7 +2465,12 @@ def main():
     figs_dir_cli = args.figs_dir
     figs_dir_env = os.environ.get("FIGURES_DIR")
     figs_dir_glb = FIGURES_DIR
-    figs_dir = figs_dir_cli or figs_dir_glb or figs_dir_env or os.path.join("figures", "three_model_assignment")
+    figs_dir = (
+        figs_dir_cli
+        or figs_dir_glb
+        or figs_dir_env
+        or os.path.join("figures", "three_model_assignment")
+    )
     # 运行三模型+指派+反向特征分析
     _ = evaluate_three_model_assignment_and_classifier(
         clean_df,
@@ -2073,4 +2480,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
