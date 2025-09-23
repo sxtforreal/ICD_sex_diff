@@ -1355,6 +1355,7 @@ def evaluate_three_model_assignment_and_classifier(
     output_dir: Optional[str] = None,
     quiet: bool = False,
     produce_outputs: bool = True,
+    selected_features: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, object]:
     """Lifelines CoxPH for three feature sets (Global/Local/All),
     assign per-patient best model without fixed horizon, and train a classifier to predict the assignment.
@@ -1399,25 +1400,37 @@ def evaluate_three_model_assignment_and_classifier(
     cand_local = [c for c in local_cols if c in df_model.columns]
     cand_all = [c for c in feat_all_cols if c in df_model.columns]
 
-    # Forward selection per model on an inner split; then refit on full data and infer on full data
-    seeds_for_stability = list(range(10))
-    _log_progress("Selecting features for Global model", True)
-    sel_glob = _stability_select_features_lifelines(
-        df_model, cand_glob, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
-    ) if len(cand_glob) > 0 else []
-    _log_progress("Selecting features for Local model", True)
-    sel_local = _stability_select_features_lifelines(
-        df_model, cand_local, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
-    ) if len(cand_local) > 0 else []
-    _log_progress("Selecting features for All-features model", True)
-    sel_all = _stability_select_features_lifelines(
-        df_model, cand_all, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
-    ) if len(cand_all) > 0 else []
+    # Feature selection or use preselected sets
+    if selected_features is not None:
+        use_glob = [c for c in selected_features.get("global", []) if c in df_model.columns]
+        use_local = [c for c in selected_features.get("local", []) if c in df_model.columns]
+        use_all = [c for c in selected_features.get("all", []) if c in df_model.columns]
+        if (not use_glob) and cand_glob:
+            use_glob = cand_glob
+        if (not use_local) and cand_local:
+            use_local = cand_local
+        if (not use_all) and cand_all:
+            use_all = cand_all
+    else:
+        # Forward selection per model on an inner split; then refit on full data and infer on full data
+        seeds_for_stability = list(range(10))
+        _log_progress("Selecting features for Global model", True)
+        sel_glob = _stability_select_features_lifelines(
+            df_model, cand_glob, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
+        ) if len(cand_glob) > 0 else []
+        _log_progress("Selecting features for Local model", True)
+        sel_local = _stability_select_features_lifelines(
+            df_model, cand_local, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
+        ) if len(cand_local) > 0 else []
+        _log_progress("Selecting features for All-features model", True)
+        sel_all = _stability_select_features_lifelines(
+            df_model, cand_all, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
+        ) if len(cand_all) > 0 else []
 
-    # Ensure non-empty by falling back to candidate lists
-    use_glob = sel_glob if sel_glob else cand_glob
-    use_local = sel_local if sel_local else cand_local
-    use_all = sel_all if sel_all else cand_all
+        # Ensure non-empty by falling back to candidate lists
+        use_glob = sel_glob if sel_glob else cand_glob
+        use_local = sel_local if sel_local else cand_local
+        use_all = sel_all if sel_all else cand_all
 
     # Fit on all data
     _log_progress("Fitting Global/Local/All models on full data", True)
@@ -1744,6 +1757,156 @@ def evaluate_three_model_assignment_and_classifier(
             "all": use_all,
         },
     }
+
+
+def select_best_feature_sets_by_runs(
+    clean_df: pd.DataFrame,
+    runs: int = 10,
+    test_size: float = 0.30,
+    random_state: int = 42,
+    output_dir: Optional[str] = None,
+) -> Dict[str, object]:
+    """For each model group (Global/Local/All), run X seeds and pick the feature set
+    yielding the best test C-index. Return the best feature sets for the three models.
+    """
+    df = clean_df.copy()
+    X_all, y_all, feature_names = _prepare_survival_xy(df)
+    global_cols, local_cols, _ = _find_feature_groups(feature_names)
+    have_global = len(global_cols) > 0
+    have_local = len(local_cols) > 0
+    if not (have_global and have_local):
+        print("Best-set selection skipped: missing global or local feature groups.")
+        return {"have_global": have_global, "have_local": have_local}
+
+    feat_all_cols = [c for c in feature_names]
+    left_cols = ["PE_Time", "VT/VF/SCD"] + (["MRN"] if "MRN" in df.columns else [])
+    df_model = pd.concat(
+        [
+            df[left_cols].reset_index(drop=True),
+            X_all[feat_all_cols].reset_index(drop=True),
+        ],
+        axis=1,
+    )
+
+    seeds = [int(random_state + i) for i in range(max(1, int(runs)))]
+
+    def _eval_group(candidates: List[str], label: str) -> Tuple[List[str], float, int]:
+        best_feats: List[str] = []
+        best_score: float = -np.inf
+        best_seed: int = int(seeds[0])
+        if not candidates:
+            return best_feats, best_score, best_seed
+        for i, s in enumerate(seeds, start=1):
+            _log_progress(f"[{label}] run {i}/{len(seeds)} seed={s}", True)
+            try:
+                sel = _stability_select_features_lifelines(
+                    df_model,
+                    candidates,
+                    time_col="PE_Time",
+                    event_col="VT/VF/SCD",
+                    seeds=[s],
+                    threshold=0.4,
+                    verbose=False,
+                )
+            except Exception:
+                sel = []
+            use_sel = sel if sel else [c for c in candidates if c in df_model.columns]
+            # Train/test split for evaluation
+            try:
+                tr_df, te_df = train_test_split(
+                    df_model,
+                    test_size=test_size,
+                    random_state=s,
+                    stratify=df_model["VT/VF/SCD"] if df_model["VT/VF/SCD"].nunique() > 1 else None,
+                )
+            except Exception:
+                tr_df, te_df = train_test_split(df_model, test_size=test_size, random_state=s)
+            model = _fit_cox_lifelines(
+                tr_df,
+                [c for c in use_sel if c in tr_df.columns],
+                time_col="PE_Time",
+                event_col="VT/VF/SCD",
+            ) if len(use_sel) > 0 else None
+            risk_te = _predict_risk_lifelines(model, te_df)
+            try:
+                cidx = concordance_index(
+                    te_df["PE_Time"].values, -risk_te, te_df["VT/VF/SCD"].values
+                )
+            except Exception:
+                cidx = float("nan")
+            if np.isfinite(cidx) and (cidx > best_score + 1e-12):
+                best_score = float(cidx)
+                best_feats = list(use_sel)
+                best_seed = int(s)
+        return best_feats, best_score, best_seed
+
+    cand_glob = [c for c in global_cols if c in df_model.columns]
+    cand_local = [c for c in local_cols if c in df_model.columns]
+    cand_all = [c for c in feat_all_cols if c in df_model.columns]
+
+    best_glob, score_glob, seed_glob = _eval_group(cand_glob, "Global")
+    best_local, score_local, seed_local = _eval_group(cand_local, "Local")
+    best_all, score_all, seed_all = _eval_group(cand_all, "All")
+
+    result = {
+        "selected_features": {
+            "global": best_glob if best_glob else cand_glob,
+            "local": best_local if best_local else cand_local,
+            "all": best_all if best_all else cand_all,
+        },
+        "best_scores": {
+            "global": score_glob,
+            "local": score_local,
+            "all": score_all,
+        },
+        "best_seeds": {
+            "global": seed_glob,
+            "local": seed_local,
+            "all": seed_all,
+        },
+        "runs": int(len(seeds)),
+    }
+    if output_dir:
+        try:
+            _ensure_dir(output_dir)
+            with open(os.path.join(output_dir, "best_feature_sets.txt"), "w") as f:
+                f.write("Global:\n" + ",".join(result["selected_features"]["global"]) + "\n")
+                f.write("Local:\n" + ",".join(result["selected_features"]["local"]) + "\n")
+                f.write("All:\n" + ",".join(result["selected_features"]["all"]) + "\n")
+        except Exception:
+            pass
+    return result
+
+
+def run_best_models_and_full_assignment(
+    clean_df: pd.DataFrame,
+    runs: int = 10,
+    test_size: float = 0.30,
+    random_state: int = 42,
+    output_dir: Optional[str] = None,
+) -> Dict[str, object]:
+    """Each model (Global/Local/All) runs X times to pick the best feature set.
+    Then apply the three best models on all patients to select the best per-patient label,
+    followed by downstream analysis and figure/CSV outputs.
+    """
+    sel = select_best_feature_sets_by_runs(
+        clean_df=clean_df,
+        runs=runs,
+        test_size=test_size,
+        random_state=random_state,
+        output_dir=output_dir,
+    )
+    sf = sel.get("selected_features") if isinstance(sel, dict) else None
+    final = evaluate_three_model_assignment_and_classifier(
+        clean_df=clean_df,
+        test_size=test_size,
+        random_state=random_state,
+        output_dir=output_dir,
+        quiet=False,
+        produce_outputs=True,
+        selected_features=sf if isinstance(sf, dict) else None,
+    )
+    return {"best": sel, "final": final}
 
 
 def run_assignment_experiments(
@@ -2679,10 +2842,10 @@ def main():
             PROGRESS = False
         except Exception:
             pass
-    # Run experiments: multi-seed aggregation when --runs > 1, else single run
+    # When --runs > 1: per-model best-of-X runs, then apply best three models to ALL patients
     if int(args.runs) > 1:
-        _ = run_assignment_experiments(
-            clean_df,
+        _ = run_best_models_and_full_assignment(
+            clean_df=clean_df,
             runs=int(args.runs),
             test_size=0.30,
             random_state=int(args.seed_base),
