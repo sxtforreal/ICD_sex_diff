@@ -1739,6 +1739,97 @@ def evaluate_three_model_assignment_and_classifier(
     }
 
 
+def run_assignment_experiments(
+    clean_df: pd.DataFrame,
+    runs: int = 50,
+    test_size: float = 0.30,
+    random_state: int = 42,
+    output_dir: Optional[str] = None,
+) -> Dict[str, object]:
+    """Run multiple seeds of three-model assignment and aggregate metrics.
+
+    Aggregates mean and 95% CI (normal approx) for C-index and classifier metrics.
+    """
+    seeds = [int(random_state + i) for i in range(max(1, int(runs)))]
+    per_run: List[Dict[str, float]] = []
+
+    for i, s in enumerate(seeds, start=1):
+        _log_progress(f"Run {i}/{len(seeds)} (seed={s})", True)
+        res = evaluate_three_model_assignment_and_classifier(
+            clean_df=clean_df,
+            test_size=test_size,
+            random_state=s,
+            output_dir=output_dir,
+        )
+        per_run.append(
+            {
+                "seed": float(s),
+                "c_index_global": float(res.get("c_index_global", np.nan)),
+                "c_index_local": float(res.get("c_index_local", np.nan)),
+                "c_index_all": float(res.get("c_index_all", np.nan)),
+                "accuracy": float(res.get("accuracy", np.nan)),
+                "macro_f1": float(res.get("macro_f1", np.nan)),
+            }
+        )
+
+    def _mean_ci(x: List[float]) -> Tuple[float, float, float]:
+        arr = np.asarray(x, dtype=float)
+        mask = np.isfinite(arr)
+        if not mask.any():
+            return float("nan"), float("nan"), float("nan")
+        vals = arr[mask]
+        n = len(vals)
+        mu = float(np.nanmean(vals))
+        if n <= 1:
+            return mu, float("nan"), float("nan")
+        se = float(np.nanstd(vals, ddof=1) / np.sqrt(n))
+        ci = 1.96 * se
+        return mu, mu - ci, mu + ci
+
+    # Build summary
+    keys = [
+        "c_index_global",
+        "c_index_local",
+        "c_index_all",
+        "accuracy",
+        "macro_f1",
+    ]
+    summary: Dict[str, Tuple[float, float, float]] = {}
+    for k in keys:
+        summary[k] = _mean_ci([r.get(k, np.nan) for r in per_run])
+
+    # Print summary
+    print("\n=== Multi-seed summary (mean [95% CI]) ===")
+    for k in keys:
+        mu, lo, hi = summary[k]
+        if np.isfinite(mu) and np.isfinite(lo) and np.isfinite(hi):
+            print(f"- {k}: {mu:.3f} ({lo:.3f}, {hi:.3f})")
+        else:
+            print(f"- {k}: {mu}")
+
+    # Optional export
+    try:
+        if output_dir:
+            _ensure_dir(output_dir)
+            runs_df = pd.DataFrame(per_run)
+            runs_df.to_csv(os.path.join(output_dir, "assignment_multi_seed_runs.csv"), index=False)
+            # Expand summary to a table for convenient saving
+            sm_rows = []
+            for k, (mu, lo, hi) in summary.items():
+                sm_rows.append({"metric": k, "mean": mu, "ci_lower": lo, "ci_upper": hi})
+            pd.DataFrame(sm_rows).to_csv(
+                os.path.join(output_dir, "assignment_multi_seed_summary.csv"), index=False
+            )
+    except Exception:
+        pass
+
+    return {
+        "per_run": per_run,
+        "summary": summary,
+        "runs": int(len(seeds)),
+    }
+
+
 def _clean_X_for_cox(X: pd.DataFrame) -> pd.DataFrame:
     """Make design matrix numeric, finite, and reasonably conditioned for CoxPH.
 
@@ -2534,6 +2625,18 @@ def main():
         action="store_true",
         help="Disable tqdm progress bars and progress logs.",
     )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Number of random seeds to run for aggregation (1 = single run).",
+    )
+    parser.add_argument(
+        "--seed-base",
+        type=int,
+        default=42,
+        help="Base random seed; seeds will be seed_base + i per run.",
+    )
     args = parser.parse_args()
 
     clean_df = load_dataframes()
@@ -2555,11 +2658,20 @@ def main():
             PROGRESS = False
         except Exception:
             pass
-    # Run three-model assignment and reverse feature analysis
-    _ = evaluate_three_model_assignment_and_classifier(
-        clean_df,
-        output_dir=figs_dir,
-    )
+    # Run experiments: multi-seed aggregation when --runs > 1, else single run
+    if int(args.runs) > 1:
+        _ = run_assignment_experiments(
+            clean_df,
+            runs=int(args.runs),
+            test_size=0.30,
+            random_state=int(args.seed_base),
+            output_dir=figs_dir,
+        )
+    else:
+        _ = evaluate_three_model_assignment_and_classifier(
+            clean_df,
+            output_dir=figs_dir,
+        )
 
 
 if __name__ == "__main__":
