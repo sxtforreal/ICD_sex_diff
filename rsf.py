@@ -1110,9 +1110,21 @@ def _predict_risk_lifelines(model: CoxPHFitter, df: pd.DataFrame) -> np.ndarray:
             if c not in X.columns:
                 X[c] = 0.0
         X = X[model_features]
-        risk = model.predict_partial_hazard(X).values.reshape(-1)
+        # Prefer log-partial hazard to avoid overflow while preserving ordering
+        risk = model.predict_log_partial_hazard(X).values.reshape(-1)
         risk = np.asarray(risk, dtype=float)
-        risk[~np.isfinite(risk)] = 0.0
+        finite = np.isfinite(risk)
+        if not finite.any():
+            # Fallback to partial hazard -> log if log-PH entirely non-finite
+            try:
+                ph = model.predict_partial_hazard(X).values.reshape(-1)
+                risk = np.log(np.asarray(ph, dtype=float))
+                finite = np.isfinite(risk)
+            except Exception:
+                return np.zeros(len(df), dtype=float)
+        if (~finite).any():
+            med = float(np.nanmedian(risk[finite])) if finite.any() else 0.0
+            risk[~finite] = med
         return risk
     except Exception:
         return np.zeros(len(df), dtype=float)
@@ -1303,8 +1315,9 @@ def _compute_oof_three_risks_lifelines(
     risk_all = np.full(n, np.nan, dtype=float)
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
+    # Ensure All = Global ∪ Local for OOF as well
     all_feature_cols = [
-        c for c in df.columns if c not in [time_col, event_col, "MRN", "ICD"]
+        c for c in sorted(set(global_cols) | set(local_cols)) if c in df.columns
     ]
 
     for fold_idx, (tr_idx, va_idx) in _maybe_tqdm(list(enumerate(kf.split(df), start=1)), total=n_splits, desc="OOF Folds", leave=False):
@@ -1414,7 +1427,8 @@ def evaluate_three_model_assignment_and_classifier(
         return {"have_global": have_global, "have_local": have_local}
 
     # Build a modeling DataFrame for lifelines containing all features
-    feat_all_cols = [c for c in feature_names]
+    # Ensure All = Global ∪ Local (no extra columns)
+    feat_all_cols = sorted(set(global_cols) | set(local_cols))
     # Keep MRN (if present) for identification in outputs; models ignore MRN
     left_cols = ["PE_Time", "VT/VF/SCD"] + (["MRN"] if "MRN" in df.columns else [])
     df_model = pd.concat(
@@ -1592,14 +1606,14 @@ def evaluate_three_model_assignment_and_classifier(
         y_pred = np.full_like(y_te_assign, const_label)
         acc = float(accuracy_score(y_te_assign, y_pred))
         f1_macro = float(
-            f1_score(y_te_assign, y_pred, average="macro", zero_division=0)
+            f1_score(y_te_assign, y_pred, labels=[0, 1, 2], average="macro", zero_division=0)
         )
     else:
         clf.fit(X_tr_cls, y_tr_assign)
         y_pred = clf.predict(X_te_cls)
         acc = float(accuracy_score(y_te_assign, y_pred))
         f1_macro = float(
-            f1_score(y_te_assign, y_pred, average="macro", zero_division=0)
+            f1_score(y_te_assign, y_pred, labels=[0, 1, 2], average="macro", zero_division=0)
         )
 
     if not quiet:
@@ -1799,7 +1813,8 @@ def select_best_feature_sets_by_runs(
         print("Best-set selection skipped: missing global or local feature groups.")
         return {"have_global": have_global, "have_local": have_local}
 
-    feat_all_cols = [c for c in feature_names]
+    # Ensure All = Global ∪ Local (no extra columns)
+    feat_all_cols = sorted(set(global_cols) | set(local_cols))
     left_cols = ["PE_Time", "VT/VF/SCD"] + (["MRN"] if "MRN" in df.columns else [])
     df_model = pd.concat(
         [
@@ -2674,7 +2689,9 @@ def train_assignment_classifier_and_tableone(
     y_pred = clf.predict(X_te_cls) if len(X_te_cls) else np.array([], dtype=int)
     acc = float(accuracy_score(y_te_cls, y_pred)) if len(y_te_cls) else np.nan
     f1_macro = (
-        float(f1_score(y_te_cls, y_pred, average="macro")) if len(y_te_cls) else np.nan
+        float(f1_score(y_te_cls, y_pred, labels=[0, 1, 2], average="macro", zero_division=0))
+        if len(y_te_cls)
+        else np.nan
     )
 
     print("\nAssignment prediction (multinomial logistic):")
