@@ -15,6 +15,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sklearn.exceptions import ConvergenceWarning
 
 from sksurv.linear_model import CoxPHSurvivalAnalysis
 from sksurv.metrics import concordance_index_censored
@@ -141,13 +142,36 @@ def conversion_and_imputation(
                 df[c] = _tmp
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Imputation on feature matrix (simple: median for numeric)
+    # Imputation on feature matrix: allow optional MissForest via env flag; fallback to median
     X = df[features].copy()
     for col in X.columns:
         if not pd.api.types.is_numeric_dtype(X[col]):
             X[col] = pd.to_numeric(X[col], errors="coerce")
-        if X[col].isnull().any():
-            X[col] = X[col].fillna(X[col].median())
+    use_missforest = os.environ.get("RSF_USE_MISSFOREST", "0") in ("1", "true", "True")
+    if use_missforest:
+        try:
+            from missingpy import MissForest  # type: ignore
+            scaler = StandardScaler()
+            X_scaled = pd.DataFrame(
+                scaler.fit_transform(X), columns=X.columns, index=X.index
+            )
+            imputer = MissForest(random_state=0)
+            X_imp_scaled = pd.DataFrame(
+                imputer.fit_transform(X_scaled), columns=X.columns, index=X.index
+            )
+            X = pd.DataFrame(
+                scaler.inverse_transform(X_imp_scaled),
+                columns=X.columns,
+                index=X.index,
+            )
+        except Exception:
+            for col in X.columns:
+                if X[col].isnull().any():
+                    X[col] = X[col].fillna(X[col].median())
+    else:
+        for col in X.columns:
+            if X[col].isnull().any():
+                X[col] = X[col].fillna(X[col].median())
 
     imputed_X = X.copy()
     imputed_X.index = df.index
@@ -323,10 +347,12 @@ def load_dataframes(
 
 
 def _prepare_survival_xy(
-    clean_df: pd.DataFrame, drop_cols: Optional[List[str]] = None
+    clean_df: pd.DataFrame,
+    drop_cols: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
     if drop_cols is None:
-        drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time", "Female"]
+        # By default, keep Female as a potential feature (do not drop here)
+        drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
 
     df = clean_df.copy()
     df = df.dropna(subset=["PE_Time"]).copy()
@@ -395,8 +421,9 @@ class CoxPHWithScaler:
     Provides predict_survival_function and predict consistent with scikit-survival's API.
     """
 
-    def __init__(self, alpha: float = 0.1):
+    def __init__(self, alpha: float = 0.1, clip_value: float = float("inf")):
         self.alpha = float(alpha)
+        self.clip_value = float(clip_value)
         self.scaler: Optional[StandardScaler] = None
         self.model: Optional[CoxPHSurvivalAnalysis] = None
         self.columns: Optional[List[str]] = None
@@ -412,8 +439,37 @@ class CoxPHWithScaler:
         X_scaled = pd.DataFrame(
             self.scaler.fit_transform(X_use), columns=self.columns, index=X_use.index
         )
-        self.model = CoxPHSurvivalAnalysis(alpha=self.alpha)
-        self.model.fit(X_scaled, y)
+        # Clip scaled features to avoid extremely large linear predictors
+        if np.isfinite(self.clip_value) and self.clip_value > 0:
+            X_scaled = X_scaled.clip(lower=-self.clip_value, upper=self.clip_value)
+
+        # Try multiple constructor signatures for version compatibility
+        def _build_model(alpha: float) -> CoxPHSurvivalAnalysis:
+            for kwargs in (
+                {"alpha": alpha, "ties": "efron", "n_iter": 1024},
+                {"alpha": alpha, "tie_method": "efron", "n_iter": 1024},
+                {"alpha": alpha, "ties": "efron"},
+                {"alpha": alpha, "tie_method": "efron"},
+                {"alpha": alpha},
+            ):
+                try:
+                    return CoxPHSurvivalAnalysis(**kwargs)  # type: ignore[arg-type]
+                except TypeError:
+                    continue
+            return CoxPHSurvivalAnalysis(alpha=alpha)
+
+        self.model = _build_model(self.alpha)
+
+        # Attempt fit; if convergence warning occurs, refit with stronger regularization
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ConvergenceWarning)
+            try:
+                self.model.fit(X_scaled, y)
+            except ConvergenceWarning:
+                # Increase regularization and try again
+                stronger_alpha = max(self.alpha * 10.0, self.alpha + 0.9)
+                self.model = _build_model(stronger_alpha)
+                self.model.fit(X_scaled, y)
         return self
 
     def _ensure_ready(self) -> None:
@@ -442,12 +498,12 @@ class CoxPHWithScaler:
 
 
 def _fit_cox(
-    X: pd.DataFrame, y: np.ndarray, alpha: float = 0.1
+    X: pd.DataFrame, y: np.ndarray, alpha: float = 0.1, clip_value: float = 8.0
 ) -> Optional[CoxPHWithScaler]:
     if X is None or X.shape[0] == 0 or X.shape[1] == 0:
         return None
     try:
-        wrapper = CoxPHWithScaler(alpha=alpha)
+        wrapper = CoxPHWithScaler(alpha=alpha, clip_value=clip_value)
         wrapper.fit(X, y)
         return wrapper
     except Exception as ex:
@@ -521,8 +577,14 @@ def compute_oof_losses(
     repeats: int = 1,
     random_state: int = 42,
     cox_alpha: float = 0.1,
+    include_female: bool = False,
+    cox_clip_value: float = 8.0,
 ) -> Dict[str, np.ndarray]:
-    X_all, y_all, feat_names = _prepare_survival_xy(clean_df)
+    # Control whether Female is part of features
+    drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
+    if not include_female:
+        drop_cols = drop_cols + ["Female"]
+    X_all, y_all, feat_names = _prepare_survival_xy(clean_df, drop_cols=drop_cols)
     all_cols = [c for c in feat_names]
     global_cols = [c for c in global_cols if c in all_cols]
     local_cols = [c for c in local_cols if c in all_cols]
@@ -547,8 +609,8 @@ def compute_oof_losses(
             y_tr, y_va = y_all[tr_idx], y_all[va_idx]
 
             # Fit two Cox models: global-only, and all (global+local)
-            mdl_gl = _fit_cox(X_tr[global_cols], y_tr, alpha=cox_alpha)
-            mdl_all = _fit_cox(X_tr[all_cols], y_tr, alpha=cox_alpha)
+            mdl_gl = _fit_cox(X_tr[global_cols], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
+            mdl_all = _fit_cox(X_tr[all_cols], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
 
             # Predict S(t0) for IPCW-Brier (used for meta-labels). C-index will use linear predictors.
             if mdl_gl:
@@ -769,10 +831,19 @@ def evaluate_on_holdout(
     lambda_penalty: float = 0.0,
     cox_alpha: float = 0.1,
     topk_importance: int = 20,
+    include_female: bool = False,
+    cox_clip_value: float = 8.0,
 ) -> Dict[str, object]:
-    X_all, y_all, feat_names = _prepare_survival_xy(clean_df)
+    # Control whether Female is included as a feature throughout
+    drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
+    if not include_female:
+        drop_cols = drop_cols + ["Female"]
+    X_all, y_all, feat_names = _prepare_survival_xy(clean_df, drop_cols=drop_cols)
     all_cols = [c for c in feat_names]
     global_cols = [c for c in global_cols if c in all_cols]
+    # Optionally include Female in the global feature set if requested and available
+    if include_female and "Female" in all_cols and "Female" not in global_cols:
+        global_cols = list(global_cols) + ["Female"]
     local_cols = [c for c in local_cols if c in all_cols]
 
     X_tr, X_te, y_tr, y_te = train_test_split(
@@ -802,6 +873,8 @@ def evaluate_on_holdout(
         repeats=repeats,
         random_state=random_state,
         cox_alpha=cox_alpha,
+        include_female=include_female,
+        cox_clip_value=cox_clip_value,
     )
 
     _log("Generating strict meta-labels by hard-threshold rule (binary) ...")
@@ -820,8 +893,8 @@ def evaluate_on_holdout(
 
     # Fit base models on full training set
     _log("Fitting base models on the full training set ...")
-    mdl_global = _fit_cox(X_tr[global_cols], y_tr, alpha=cox_alpha)
-    mdl_all = _fit_cox(X_tr[all_cols], y_tr, alpha=cox_alpha)
+    mdl_global = _fit_cox(X_tr[global_cols], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
+    mdl_all = _fit_cox(X_tr[all_cols], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
 
     # Predict on test set via learned gating
     _log("Applying gating to test set and computing metrics ...")
@@ -940,6 +1013,13 @@ def main() -> None:
     parser.add_argument("--no-progress", action="store_true", help="关闭进度输出")
     parser.add_argument("--cox-alpha", type=float, default=0.1, help="Cox L2 正则强度 alpha")
     parser.add_argument("--topk-importance", type=int, default=20, help="打印 gating 特征重要性 Top-K")
+    parser.add_argument("--include-female", action="store_true", help="是否将 Female 作为特征纳入 Cox 与 gating")
+    parser.add_argument(
+        "--cox-clip-value",
+        type=float,
+        default=8.0,
+        help="标准化后特征的裁剪阈值(避免线性预测过大导致溢出)",
+    )
     args = parser.parse_args()
 
     global PROGRESS
@@ -970,6 +1050,8 @@ def main() -> None:
         lambda_penalty=args.lambda_penalty,
         cox_alpha=args.cox_alpha,
         topk_importance=args.topk_importance,
+        include_female=args.include_female,
+        cox_clip_value=args.cox_clip_value,
     )
 
     print("\n=== Gating OOF (train) ===")
