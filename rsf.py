@@ -8,6 +8,7 @@ import warnings
 
 import numpy as np
 import pandas as pd
+pd.set_option("future.no_silent_downcasting", True)
 
 from sklearn.model_selection import KFold, train_test_split
 from sklearn.pipeline import Pipeline
@@ -672,11 +673,16 @@ def evaluate_on_holdout(
 
     # Build a DataFrame back to reuse OOF pipeline conveniently
     df_tr = X_tr.copy()
-    df_tr["VT/VF/SCD"] = y_tr["event"].astype(int)
-    df_tr["PE_Time"] = y_tr["time"].astype(float)
+    # Robustly detect field names of structured array y_tr/y_te
+    e_field_tr = "event" if "event" in y_tr.dtype.names else y_tr.dtype.names[0]
+    t_field_tr = "time" if "time" in y_tr.dtype.names else y_tr.dtype.names[1]
+    e_field_te = "event" if "event" in y_te.dtype.names else y_te.dtype.names[0]
+    t_field_te = "time" if "time" in y_te.dtype.names else y_te.dtype.names[1]
+    df_tr["VT/VF/SCD"] = y_tr[e_field_tr].astype(int)
+    df_tr["PE_Time"] = y_tr[t_field_tr].astype(float)
     df_te = X_te.copy()
-    df_te["VT/VF/SCD"] = y_te["event"].astype(int)
-    df_te["PE_Time"] = y_te["time"].astype(float)
+    df_te["VT/VF/SCD"] = y_te[e_field_te].astype(int)
+    df_te["PE_Time"] = y_te[t_field_te].astype(float)
 
     _log("Computing OOF losses on training set for meta-labels ...")
     oof_tr = compute_oof_losses(
