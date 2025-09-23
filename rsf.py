@@ -4,6 +4,7 @@ import pandas as pd
 import os
 import argparse
 import matplotlib.pyplot as plt
+import warnings
 
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.pipeline import Pipeline
@@ -21,6 +22,36 @@ from sksurv.metrics import concordance_index_censored
 from sksurv.util import Surv
 from lifelines import CoxPHFitter
 from lifelines.utils import concordance_index
+from lifelines.exceptions import ConvergenceWarning
+
+# Optional progress bars
+try:
+    from tqdm.auto import tqdm as _tqdm
+    _HAS_TQDM = True
+except Exception:
+    _HAS_TQDM = False
+
+# Global control for showing progress bars
+PROGRESS = True
+
+def _maybe_tqdm(iterable, total=None, desc=None, leave=False):
+    if _HAS_TQDM and PROGRESS:
+        try:
+            return _tqdm(iterable, total=total, desc=desc, leave=leave)
+        except Exception:
+            return iterable
+    return iterable
+
+# Global max iterations for lifelines CoxPHFitter (None = library default)
+MAX_LIFELINES_STEPS: Optional[int] = None
+
+def set_max_iterations(n: Optional[int]) -> None:
+    """Set global max Newton–Raphson steps for lifelines Cox fitting."""
+    global MAX_LIFELINES_STEPS
+    try:
+        MAX_LIFELINES_STEPS = int(n) if n is not None and int(n) > 0 else None
+    except Exception:
+        MAX_LIFELINES_STEPS = None
 
 try:
     from missingpy import MissForest
@@ -146,6 +177,14 @@ def _save_fig(fig: plt.Figure, output_dir: Optional[str], filename: str) -> None
     except Exception:
         pass
     plt.show()
+
+
+def _log_progress(message: str, enabled: bool = True) -> None:
+    if enabled:
+        try:
+            print(f"[Progress] {message}")
+        except Exception:
+            pass
 
 
 def _plot_series_barh(
@@ -848,6 +887,7 @@ def train_coxph_model(
         X, y, test_size=test_size, random_state=random_state
     )
 
+    _log_progress("Training Cox model on train split", True)
     model = _fit_coxph_clean(X_train, y_train)
 
     # Use model's risk scores for C-index evaluation
@@ -878,6 +918,7 @@ def train_coxph_model(
             if names_in is None:
                 names_in = list(X_train.columns)
             X_pi = _align_X_to_model(model, X_test)
+            _log_progress("Computing permutation importance on test split", True)
             perm_result = permutation_importance(
                 model,
                 X_pi,
@@ -1124,47 +1165,51 @@ def _sanitize_cox_features_matrix(
 def _fit_cox_lifelines(
     train_df: pd.DataFrame, feature_cols: List[str], time_col: str, event_col: str
 ) -> Optional[CoxPHFitter]:
-    """Fit CoxPH via lifelines with sanitization to avoid singularities/overflows."""
+    """Fit CoxPH via lifelines with sanitization and automatic retries on convergence issues."""
     if train_df is None or len(train_df) == 0 or not feature_cols:
         return None
-    # Sanitize feature matrix
-    X_sanitized = _sanitize_cox_features_matrix(
-        train_df[feature_cols], corr_threshold=0.995, verbose=False
-    )
-    kept_features = list(X_sanitized.columns)
-    if len(kept_features) == 0:
-        return None
-    df_fit = pd.concat(
-        [
-            train_df[[time_col, event_col]].reset_index(drop=True),
-            X_sanitized.reset_index(drop=True),
-        ],
-        axis=1,
-    )
-    cph = CoxPHFitter(penalizer=0.1, l1_ratio=0.0)
-    try:
-        cph.fit(df_fit, duration_col=time_col, event_col=event_col, robust=True)
-        return cph
-    except Exception:
-        # Retry with stronger sanitization and regularization
-        X_sanitized2 = _sanitize_cox_features_matrix(
-            train_df[feature_cols], corr_threshold=0.95, verbose=False
-        )
-        if X_sanitized2.shape[1] == 0:
-            return None
-        df_fit2 = pd.concat(
+
+    # Try a sequence of (corr_threshold, penalizer) settings; treat convergence warnings as errors
+    corr_thresholds = [0.995, 0.98, 0.95, 0.90]
+    penalizers = [0.1, 0.5, 1.0, 5.0, 10.0]
+
+    for corr_thr in _maybe_tqdm(corr_thresholds, total=len(corr_thresholds), desc="Cox sanitize", leave=False):
+        try:
+            X_sanitized = _sanitize_cox_features_matrix(
+                train_df[feature_cols], corr_threshold=corr_thr, verbose=False
+            )
+        except Exception:
+            X_sanitized = train_df[feature_cols].copy()
+
+        kept_features = list(X_sanitized.columns)
+        if len(kept_features) == 0:
+            continue
+
+        df_fit = pd.concat(
             [
                 train_df[[time_col, event_col]].reset_index(drop=True),
-                X_sanitized2.reset_index(drop=True),
+                X_sanitized.reset_index(drop=True),
             ],
             axis=1,
         )
-        try:
-            cph2 = CoxPHFitter(penalizer=1.0, l1_ratio=0.0)
-            cph2.fit(df_fit2, duration_col=time_col, event_col=event_col, robust=True)
-            return cph2
-        except Exception:
-            return None
+
+        for pen in _maybe_tqdm(penalizers, total=len(penalizers), desc=f"Cox penalizer(thr={corr_thr})", leave=False):
+            cph = CoxPHFitter(penalizer=pen, l1_ratio=0.0)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", ConvergenceWarning)
+                    cph.fit(
+                        df_fit,
+                        duration_col=time_col,
+                        event_col=event_col,
+                        robust=True,
+                        max_steps=MAX_LIFELINES_STEPS,
+                    )
+                return cph
+            except Exception:
+                continue
+
+    return None
 
 
 def _predict_risk_lifelines(model: CoxPHFitter, df: pd.DataFrame) -> np.ndarray:
@@ -1234,13 +1279,14 @@ def _forward_select_features_lifelines(
         len(remaining) if max_features is None else max(0, min(len(remaining), max_features))
     )
 
-    for step_idx in range(max_iters):
+    for step_idx in _maybe_tqdm(range(max_iters), total=max_iters, desc=f"FS-Forward(seed={random_state})", leave=False):
         best_feat = None
         best_feat_cidx = best_val_cidx
         if verbose:
             try:
-                print(
-                    f"[FS][Forward] seed={random_state} step={step_idx+1}/{max_iters} remaining={len(remaining)}"
+                _log_progress(
+                    f"FS-Forward seed={random_state} step {step_idx+1}/{max_iters}, remaining {len(remaining)}",
+                    True,
                 )
             except Exception:
                 pass
@@ -1268,7 +1314,10 @@ def _forward_select_features_lifelines(
         best_val_cidx = best_feat_cidx
         if verbose:
             try:
-                print(f"[FS][Forward] + {best_feat} -> val c-index={best_val_cidx:.4f}")
+                _log_progress(
+                    f"FS-Forward add {best_feat} -> val c-index {best_val_cidx:.4f}",
+                    True,
+                )
             except Exception:
                 pass
 
@@ -1307,11 +1356,11 @@ def _stability_select_features_lifelines(
 
     counter: Counter = Counter()
     total_runs = 0
-    for idx, s in enumerate(seeds, start=1):
+    for idx, s in _maybe_tqdm(list(enumerate(seeds, start=1)), total=len(seeds), desc="FS-Stability", leave=False):
         try:
             if verbose:
                 try:
-                    print(f"[FS][Stability] seed {idx}/{len(seeds)} -> start")
+                    _log_progress(f"FS-Stability {idx}/{len(seeds)} starting", True)
                 except Exception:
                     pass
             sel = _forward_select_features_lifelines(
@@ -1370,7 +1419,8 @@ def _compute_oof_three_risks_lifelines(
         c for c in df.columns if c not in [time_col, event_col, "MRN", "ICD"]
     ]
 
-    for tr_idx, va_idx in kf.split(df):
+    for fold_idx, (tr_idx, va_idx) in _maybe_tqdm(list(enumerate(kf.split(df), start=1)), total=n_splits, desc="OOF Folds", leave=False):
+        _log_progress(f"OOF fold {fold_idx}/{n_splits} fitting models", True)
         tr = df.iloc[tr_idx]
         va = df.iloc[va_idx]
 
@@ -1413,6 +1463,7 @@ def _compute_oof_three_risks_lifelines(
         risk_glob[va_idx] = risk_gl
         risk_loc[va_idx] = risk_lo
         risk_all[va_idx] = risk_al
+        _log_progress(f"OOF fold {fold_idx}/{n_splits} done", True)
 
     # Replace any residual NaNs with 0
     for arr in (risk_glob, risk_loc, risk_all):
@@ -1473,12 +1524,15 @@ def evaluate_three_model_assignment_and_classifier(
 
     # Forward selection per model on an inner split; then refit on full data and infer on full data
     seeds_for_stability = list(range(10))
+    _log_progress("Selecting features for Global model", True)
     sel_glob = _stability_select_features_lifelines(
         df_model, cand_glob, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
     ) if len(cand_glob) > 0 else []
+    _log_progress("Selecting features for Local model", True)
     sel_local = _stability_select_features_lifelines(
         df_model, cand_local, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
     ) if len(cand_local) > 0 else []
+    _log_progress("Selecting features for All-features model", True)
     sel_all = _stability_select_features_lifelines(
         df_model, cand_all, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
     ) if len(cand_all) > 0 else []
@@ -1489,6 +1543,7 @@ def evaluate_three_model_assignment_and_classifier(
     use_all = sel_all if sel_all else cand_all
 
     # Fit on all data
+    _log_progress("Fitting Global/Local/All models on full data", True)
     model_gl = _fit_cox_lifelines(df_model, use_glob, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_glob) > 0 else None
     model_lo = _fit_cox_lifelines(df_model, use_local, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_local) > 0 else None
     model_all = _fit_cox_lifelines(df_model, use_all, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_all) > 0 else None
@@ -1512,12 +1567,14 @@ def evaluate_three_model_assignment_and_classifier(
         random_state=random_state,
         stratify=evt,
     )
+    _log_progress("Splitting data for classifier evaluation", True)
     tr_df = df_model.iloc[tr_idx].copy()
     te_df = df_model.iloc[te_idx].copy()
     y_tr_assign = best_idx[tr_idx]
     y_te_assign = best_idx[te_idx]
 
     # Fit three lifelines Cox models on training set for test-time metrics
+    _log_progress("Fitting three lifelines models on training split", True)
     model_gl = _fit_cox_lifelines(
         tr_df,
         [c for c in global_cols if c in tr_df.columns],
@@ -1535,6 +1592,7 @@ def evaluate_three_model_assignment_and_classifier(
         tr_df, feat_all_cols_tr, time_col="PE_Time", event_col="VT/VF/SCD"
     )
 
+    _log_progress("Predicting risks on test split", True)
     risk_gl_te = _predict_risk_lifelines(model_gl, te_df)
     risk_lo_te = _predict_risk_lifelines(model_lo, te_df)
     risk_all_te = _predict_risk_lifelines(model_all, te_df)
@@ -1567,6 +1625,7 @@ def evaluate_three_model_assignment_and_classifier(
     )
     X_tr_cls = tr_df.drop(columns=["PE_Time", "VT/VF/SCD"], errors="ignore")
     X_te_cls = te_df.drop(columns=["PE_Time", "VT/VF/SCD"], errors="ignore")
+    _log_progress("Training assignment classifier", True)
     clf.fit(X_tr_cls, y_tr_assign)
     y_pred = clf.predict(X_te_cls)
     acc = float(accuracy_score(y_te_assign, y_pred))
@@ -1894,7 +1953,8 @@ def analyze_benefit_subgroup(
     def _fit(X, y) -> Optional[object]:
         return _fit_coxph_clean(X, y)
 
-    for tr_idx, va_idx in kf.split(X_all):
+    for fold_idx, (tr_idx, va_idx) in _maybe_tqdm(list(enumerate(kf.split(X_all), start=1)), total=n_splits, desc="Benefit CV", leave=False):
+        _log_progress(f"Benefit CV fold {fold_idx}/{n_splits} start", True)
         X_tr, X_va = X_all.iloc[tr_idx], X_all.iloc[va_idx]
         y_tr, y_va = y_all[tr_idx], y_all[va_idx]
 
@@ -1939,6 +1999,7 @@ def analyze_benefit_subgroup(
         risk_all_oof[va_idx] = risk_all
         y_bin_oof[va_idx] = y_bin
         known_oof[va_idx] = known
+        _log_progress(f"Benefit CV fold {fold_idx}/{n_splits} done", True)
 
     # Define benefit by squared-error improvement with optional margin
     err_gl = (risk_glob_oof - y_bin_oof) ** 2
@@ -2527,6 +2588,17 @@ def main():
         default="/home/sunx/data/aiiih/projects/sunx/projects/ICD/fig",
         help="Output directory for figures and CSVs; takes precedence over env FIGURES_DIR",
     )
+    parser.add_argument(
+        "--max-iter",
+        type=int,
+        default=None,
+        help="Maximum iterations for lifelines CoxPH (Newton–Raphson steps).",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars and progress logs.",
+    )
     args = parser.parse_args()
 
     clean_df = load_dataframes()
@@ -2540,6 +2612,14 @@ def main():
         or figs_dir_env
         or os.path.join("figures", "three_model_assignment")
     )
+    # Apply CLI controls
+    set_max_iterations(args.max_iter)
+    if args.no_progress:
+        try:
+            global PROGRESS
+            PROGRESS = False
+        except Exception:
+            pass
     # Run three-model assignment and reverse feature analysis
     _ = evaluate_three_model_assignment_and_classifier(
         clean_df,
