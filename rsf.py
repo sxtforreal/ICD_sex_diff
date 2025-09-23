@@ -2,6 +2,7 @@ from typing import List, Tuple, Optional, Dict
 import numpy as np
 import pandas as pd
 import os
+import argparse
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -26,6 +27,28 @@ try:
     _HAS_MISSFOREST = True
 except Exception:
     _HAS_MISSFOREST = False
+
+
+# ========================= User-configurable feature groups =========================
+# 显式定义全局(global)与局部(local)特征集合；两者并集即为 all features。
+# 使用方式：
+# 1) 直接编辑下方列表；或
+# 2) 运行时调用 set_feature_groups(["featA",...], ["featB",...])
+GLOBAL_FEATURES: List[str] = []
+LOCAL_FEATURES: List[str] = []
+
+def set_feature_groups(global_features: List[str], local_features: List[str]) -> None:
+    """显式设置全局/局部特征名列表（不在数据中的名字会被忽略）。"""
+    global GLOBAL_FEATURES, LOCAL_FEATURES
+    GLOBAL_FEATURES = list(global_features)
+    LOCAL_FEATURES = list(local_features)
+
+# 显式控制图片保存目录（可通过 set_figures_dir 或命令行 --figs-dir 或环境变量 FIGURES_DIR 指定）
+FIGURES_DIR: Optional[str] = None
+
+def set_figures_dir(path: Optional[str]) -> None:
+    global FIGURES_DIR
+    FIGURES_DIR = path
 
 
 def impute_misforest(X, random_seed):
@@ -125,17 +148,8 @@ def _plot_gating_hist(
     label: str,
     output_dir: Optional[str],
 ) -> None:
-    if values is None or len(values) == 0 or not np.isfinite(thr_low) or not np.isfinite(thr_high):
-        return
-    fig, ax = plt.subplots(figsize=(6.8, 4.2))
-    sns.histplot(values, kde=False, bins=30, color="#4c78a8", ax=ax)
-    ax.axvline(thr_low, ls=":", lw=2, color="#f58518", label=f"low thr = {thr_low:.3g}")
-    ax.axvline(thr_high, ls=":", lw=2, color="#e45756", label=f"high thr = {thr_high:.3g}")
-    ax.set_title(f"Gating distribution ({label})")
-    ax.set_xlabel(label)
-    ax.legend()
-    fig.tight_layout()
-    _save_fig(fig, output_dir, "gating_distribution.png")
+    # 门控功能已移除：保留空实现以兼容旧调用（不再绘制）。
+    return
 
 
 def _plot_zone_counts(metrics: Dict[str, float], output_dir: Optional[str]) -> None:
@@ -187,43 +201,8 @@ def _plot_gating_hist_by_best(
     output_dir: Optional[str],
     filename: str = "gating_by_best_hist.png",
 ) -> None:
-    if gate_values is None or len(gate_values) == 0:
-        return
-    if best_idx is None or len(best_idx) != len(gate_values):
-        return
-    mask = np.isfinite(gate_values) & (best_idx >= 0)
-    if not mask.any():
-        return
-    df = pd.DataFrame({
-        "gate": gate_values[mask],
-        "best": best_idx[mask].astype(int),
-    })
-    mapping = {0: "Global", 1: "Local", 2: "All"}
-    try:
-        df["best_label"] = df["best"].map(mapping)
-    except Exception:
-        df["best_label"] = df["best"].astype(str)
-    fig, ax = plt.subplots(figsize=(7.2, 4.4))
-    sns.histplot(
-        data=df,
-        x="gate",
-        hue="best_label",
-        bins=30,
-        element="step",
-        stat="count",
-        common_norm=False,
-        palette="Set2",
-        ax=ax,
-    )
-    if np.isfinite(thr_low):
-        ax.axvline(thr_low, ls=":", lw=2, color="#f58518", label=f"low thr = {thr_low:.3g}")
-    if np.isfinite(thr_high):
-        ax.axvline(thr_high, ls=":", lw=2, color="#e45756", label=f"high thr = {thr_high:.3g}")
-    ax.set_title(f"Gating distribution by best model ({label})")
-    ax.set_xlabel(label)
-    ax.legend()
-    fig.tight_layout()
-    _save_fig(fig, output_dir, filename)
+    # 门控功能已移除：保留空实现以兼容旧调用（不再绘制）。
+    return
 
 
 def _plot_zone_best_model_stack(
@@ -354,6 +333,9 @@ def search_best_gating_feature_by_cv(
     - Compute final thresholds on all data using the selected quantiles, generate visuals,
       and return a summary including per-sample zones and predicted labels.
     """
+    # 已移除门控功能：此函数禁用
+    print("[INFO] Gating feature search has been removed and is disabled.")
+    return {"removed": True}
     # Prepare X/y and feature names
     X_all, y_all, feature_names = _prepare_survival_xy(clean_df)
     global_cols, local_cols, _ = _find_feature_groups(feature_names)
@@ -677,7 +659,7 @@ def load_dataframes() -> pd.DataFrame:
     ]
     nicm[categorical] = nicm[categorical].astype("object")
     var = nicm.columns.tolist()
-    labels = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
+    labels = ["MRN", "VT/VF/SCD", "ICD", "PE_Time", "Female"]
     granularity = [
         "LGE_LGE Burden 5SD",
         "LGE_Extent (1; subendocardial, 2; mid mural, 3; epicardial, 4; transmural; 5 circumural)",
@@ -704,6 +686,10 @@ def load_dataframes() -> pd.DataFrame:
     ]
     nicm = nicm.dropna(subset=granularity)
     features = [v for v in var if v not in labels]
+    # 明确将 Female 和 ICD 作为 label（从特征中移除）
+    for lab in ["Female", "ICD"]:
+        if lab in features:
+            features.remove(lab)
 
     # Imputation
     clean_df = conversion_and_imputation(nicm, features, labels)
@@ -720,7 +706,8 @@ def _prepare_survival_xy(clean_df: pd.DataFrame,
     Expects columns: "VT/VF/SCD" (event, 0/1) and "PE_Time" (time in days).
     """
     if drop_cols is None:
-        drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
+        # 将 Female 与 ICD 视为 label（不作为特征）；同时排除基础标识与时间/事件列
+        drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time", "Female"]
 
     df = clean_df.copy()
     df = df.dropna(subset=["PE_Time"])  # ensure valid times
@@ -836,19 +823,28 @@ def train_coxph_model(
 
 def _find_feature_groups(feature_names: List[str]) -> Tuple[List[str], List[str], Optional[str]]:
     """
-    Heuristically split features into global vs local (bull's-eye 17 segments) groups
-    and pick a gating feature (overall scar burden) if available.
+    返回 (global_cols, local_cols, gating_feature)；已移除门控逻辑，gating 恒为 None。
 
-    Returns: (global_cols, local_cols, gating_feature_name_or_None)
+    优先使用用户显式配置的 GLOBAL_FEATURES 与 LOCAL_FEATURES（与现有列求交集）。
+    若未配置，则回退到基于列名的启发式拆分（但仍不返回 gating）。
     """
     names = list(feature_names)
+
+    # 1) 显式配置优先（与现有列求交集）
+    if GLOBAL_FEATURES or LOCAL_FEATURES:
+        g = [c for c in GLOBAL_FEATURES if c in names]
+        l = [c for c in LOCAL_FEATURES if c in names]
+        # 去重并避免交叉
+        l = [c for c in l if c not in g]
+        return g, l, None
+
+    # 2) 启发式回退（不返回 gating）
     lower = [n.lower() for n in names]
 
     def has(substr: str) -> List[str]:
         s = substr.lower()
         return [names[i] for i, n in enumerate(lower) if s in n]
 
-    # Local/bull's-eye patterns (17 segments + apical cap + RV insertion)
     local_patterns = [
         "lge_basal",
         "lge_mid ",
@@ -869,7 +865,7 @@ def _find_feature_groups(feature_names: List[str]) -> Tuple[List[str], List[str]
     for p in local_patterns:
         for c in has(p):
             local_cols_set.add(c)
-    # Global patterns
+
     global_cols_set = set()
     for p in [
         "lge_lge burden 5sd",
@@ -884,30 +880,9 @@ def _find_feature_groups(feature_names: List[str]) -> Tuple[List[str], List[str]
         for c in has(p):
             global_cols_set.add(c)
 
-    # Avoid overlap
     local_cols = [c for c in names if c in local_cols_set]
     global_cols = [c for c in names if c in global_cols_set and c not in local_cols_set]
-
-    # Choose gating feature: prefer explicit scar burden
-    priorities = [
-        "LGE_LGE Burden 5SD",
-        "LGE Burden 5SD",
-        "LGE_Extent (1; subendocardial, 2; mid mural, 3; epicardial, 4; transmural; 5 circumural)",
-    ]
-    gating = None
-    for p in priorities:
-        if p in names:
-            gating = p
-            break
-    if gating is None:
-        # Try relaxed search
-        for p in ["burden", "extent", "circumural", "ring-like"]:
-            hits = has(p)
-            if hits:
-                gating = hits[0]
-                break
-
-    return global_cols, local_cols, gating
+    return global_cols, local_cols, None
 
 
 def _risk_at_time(model: object, X: pd.DataFrame, t: float) -> np.ndarray:
@@ -1184,8 +1159,10 @@ def evaluate_three_model_assignment_and_classifier(
 
     # Build a modeling DataFrame for lifelines containing all features
     feat_all_cols = [c for c in feature_names]
+    # 保留 MRN（若存在）用于输出标识；模型训练时会自动忽略 MRN
+    left_cols = ["PE_Time", "VT/VF/SCD"] + (["MRN"] if "MRN" in df.columns else [])
     df_model = pd.concat([
-        df[["PE_Time", "VT/VF/SCD"]].reset_index(drop=True),
+        df[left_cols].reset_index(drop=True),
         X_all[feat_all_cols].reset_index(drop=True)
     ], axis=1)
 
@@ -1202,7 +1179,7 @@ def evaluate_three_model_assignment_and_classifier(
     best_idx[evt == 1] = np.argmax(risks_stack[:, evt == 1], axis=0)
     best_idx[evt == 0] = np.argmin(risks_stack[:, evt == 0], axis=0)
 
-    # Train/test split for classifier and evaluation
+    # Train/test split for classifier and evaluation（用于评估，不影响全体标签的产生与保存）
     tr_idx, te_idx = train_test_split(
         np.arange(len(df_model)), test_size=test_size, random_state=random_state, stratify=evt
     )
@@ -1274,7 +1251,7 @@ def evaluate_three_model_assignment_and_classifier(
     except Exception:
         pass
 
-    # Counts plot of assigned groups
+    # Counts plot of assigned groups（基于全体 OOF 标签）
     try:
         counts = pd.Series({"Global": int((best_idx==0).sum()), "Local": int((best_idx==1).sum()), "All": int((best_idx==2).sum())})
         _plot_series_barh(
@@ -1289,6 +1266,56 @@ def evaluate_three_model_assignment_and_classifier(
     except Exception:
         pass
 
+    # Save and return per-sample assignment labels for the full dataset
+    try:
+        mapping = {0: "Global", 1: "Local", 2: "All"}
+        id_series = df_model["MRN"] if "MRN" in df_model.columns else pd.Series(np.arange(len(df_model)), name="index")
+        assign_df = pd.DataFrame({
+            id_series.name: id_series.values,
+            "assignment_label": best_idx.astype(int),
+            "assignment_group": pd.Series(best_idx).map(mapping).fillna("").values,
+        })
+        if output_dir:
+            _ensure_dir(output_dir)
+            assign_df.to_csv(os.path.join(output_dir, "assignment_labels_all.csv"), index=False)
+    except Exception:
+        pass
+
+    # Reverse feature analysis on ALL samples: train classifier on full X to predict assignment
+    try:
+        from sklearn.pipeline import Pipeline as SkPipeline
+        from sklearn.preprocessing import StandardScaler as SkStandardScaler
+        X_cls_all = df_model.drop(columns=["PE_Time", "VT/VF/SCD", "MRN"], errors="ignore")
+        y_cls_all = best_idx.astype(int)
+        clf_all = SkPipeline([
+            ("scaler", SkStandardScaler()),
+            ("clf", LogisticRegression(multi_class="multinomial", solver="lbfgs", max_iter=2000)),
+        ])
+        clf_all.fit(X_cls_all, y_cls_all)
+        lr_all = clf_all.named_steps.get("clf")
+        if lr_all is not None and hasattr(lr_all, "coef_"):
+            coef_all = lr_all.coef_
+            feat_all = X_cls_all.columns.to_list()
+            coef_df_all = pd.DataFrame(coef_all, columns=feat_all, index=["Global","Local","All"]).T
+            if output_dir:
+                _ensure_dir(output_dir)
+                coef_df_all.to_csv(os.path.join(output_dir, "assignment_coefficients_all.csv"))
+            # Plot top features per class
+            topk = 20
+            for cls in ["Global","Local","All"]:
+                ser = coef_df_all[cls].abs().sort_values(ascending=False).head(topk)
+                _plot_series_barh(
+                    ser,
+                    topn=len(ser),
+                    title=f"Assignment predictor (ALL data): top features for {cls}",
+                    xlabel="|coefficient|",
+                    output_dir=output_dir,
+                    filename=f"assignment_full_top_{cls.lower()}.png",
+                    color="#2ca02c" if cls=="Global" else ("#ff7f0e" if cls=="Local" else "#1f77b4"),
+                )
+    except Exception:
+        pass
+
     return {
         "c_index_global": float(cidx_gl),
         "c_index_local": float(cidx_lo),
@@ -1297,6 +1324,8 @@ def evaluate_three_model_assignment_and_classifier(
         "macro_f1": f1_macro,
         "n_train": int(len(tr_df)),
         "n_test": int(len(te_df)),
+        "assignment_all_labels": [int(v) for v in best_idx.tolist()],
+        "assignment_all_ids": (df_model["MRN"].tolist() if "MRN" in df_model.columns else list(range(len(df_model)))),
     }
 
 
@@ -1751,237 +1780,10 @@ def evaluate_two_stage_strategy(
     output_dir: Optional[str] = None,
 ) -> Dict[str, float]:
     """
-    Validate a two-stage decision strategy:
-    1) Inspect global features first with a gating feature and quantile thresholds.
-    2) For mid-range cases, defer to local (17-segment) features.
-
-    Returns a metrics dict including C-index for baselines and the two-stage approach.
+    二阶段模型与门控已移除：此函数禁用。
     """
-    # Prepare dataset
-    X_all, y_all, feature_names = _prepare_survival_xy(clean_df)
-    global_cols, local_cols, gating = _find_feature_groups(feature_names)
-
-    # Safety checks
-    have_global = len(global_cols) > 0
-    have_local = len(local_cols) > 0
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_all, y_all, test_size=test_size, random_state=random_state
-    )
-
-    # Time horizon = 75th percentile of observed times in training
-    # Be robust to different sksurv structured array field names
-    def _get_surv_field_names(y_arr) -> Tuple[str, str]:
-        names = getattr(y_arr.dtype, "names", None)
-        if not names or len(names) < 2:
-            return "event", "time"
-        event_field = "event" if "event" in names else names[0]
-        time_candidates = [n for n in names if n != event_field]
-        time_field = "time" if "time" in names else time_candidates[0]
-        return event_field, time_field
-
-    evt_field, time_field = _get_surv_field_names(y_train)
-    t_hor = float(np.percentile(y_train[time_field], 75)) if len(y_train) else 365.0
-    if not np.isfinite(t_hor) or t_hor <= 0:
-        t_hor = 365.0
-
-    # Train CoxPH models
-    def _fit(X, y) -> Optional[object]:
-        return _fit_coxph_clean(X, y)
-
-    model_all = _fit(X_train, y_train)
-    model_global = _fit(X_train[global_cols], y_train) if have_global else None
-    model_local = _fit(X_train[local_cols], y_train) if have_local else None
-
-    # Baseline risks at horizon
-    risk_all = _risk_at_time(model_all, X_test, t_hor) if model_all is not None else np.zeros(len(X_test))
-    risk_glob = _risk_at_time(model_global, X_test[global_cols], t_hor) if model_global is not None else np.zeros(len(X_test))
-    risk_loc = _risk_at_time(model_local, X_test[local_cols], t_hor) if model_local is not None else np.zeros(len(X_test))
-
-    # Two-stage gating setup
-    # Obtain gating values (prefer explicit gating feature, else derive from local sum)
-    if gating is not None and gating in X_all.columns:
-        gate_train_vals = X_train[gating].astype(float).values
-        gate_test_vals = X_test[gating].astype(float).values
-    else:
-        # Fallback: sum of local signals as a proxy for overall burden
-        if have_local:
-            gate_train_vals = X_train[local_cols].astype(float).sum(axis=1).values
-            gate_test_vals = X_test[local_cols].astype(float).sum(axis=1).values
-            gating = "(sum of local segments)"
-        else:
-            # No gating available -> degenerate to global risk
-            gate_train_vals = np.zeros(len(X_train), dtype=float)
-            gate_test_vals = np.zeros(len(X_test), dtype=float)
-            gating = None
-
-    selected_q_low = np.nan
-    selected_q_high = np.nan
-    if gating is not None:
-        if optimize_thresholds:
-            ql_opt, qh_opt, _info = _optimize_gate_quantiles(
-                X_train,
-                y_train,
-                global_cols,
-                local_cols,
-                gating,
-                random_state,
-                t_hor,
-                q_low_grid=q_low_grid,
-                q_high_grid=q_high_grid,
-                min_gap=min_gap,
-                inner_val_size=inner_val_size,
-            )
-            if ql_opt is not None and qh_opt is not None:
-                selected_q_low = float(ql_opt)
-                selected_q_high = float(qh_opt)
-        # Fallback to provided q_low/q_high if no optimized pair
-        if not np.isfinite(selected_q_low) or not np.isfinite(selected_q_high):
-            selected_q_low = float(q_low)
-            selected_q_high = float(q_high)
-
-        thr_low = float(np.nanquantile(gate_train_vals, selected_q_low))
-        thr_high = float(np.nanquantile(gate_train_vals, selected_q_high))
-        if not np.isfinite(thr_low):
-            thr_low = float(np.nanmedian(gate_train_vals))
-        if not np.isfinite(thr_high):
-            thr_high = float(np.nanmedian(gate_train_vals))
-        if thr_low >= thr_high:
-            # Enforce separation via fixed percentiles if degenerate
-            thr_low, thr_high = float(np.nanpercentile(gate_train_vals, 40)), float(
-                np.nanpercentile(gate_train_vals, 75)
-            )
-
-        # Combine risks per zone
-        zone_high = gate_test_vals >= thr_high
-        zone_low = gate_test_vals < thr_low
-        zone_mid = ~(zone_high | zone_low)
-
-        risk_two_stage = np.zeros(len(X_test), dtype=float)
-        # High burden: rely on global risk (must-implant logic)
-        risk_two_stage[zone_high] = risk_glob[zone_high]
-        # Low burden: rely on global risk (generally safe)
-        risk_two_stage[zone_low] = risk_glob[zone_low]
-        # Mid zone: defer to local risk to avoid unnecessary ICD where possible
-        risk_two_stage[zone_mid] = risk_loc[zone_mid]
-    else:
-        # No gating -> fall back to global risk
-        thr_low = thr_high = np.nan
-        zone_high = zone_low = zone_mid = np.zeros(len(X_test), dtype=bool)
-        risk_two_stage = risk_glob.copy()
-
-    # Evaluate C-index
-    def _c_index(y, risk):
-        e_field, t_field = _get_surv_field_names(y)
-        evt = y[e_field].astype(bool)
-        tm = y[t_field].astype(float)
-        c = concordance_index_censored(evt, tm, risk)[0]
-        return float(c)
-
-    metrics = {
-        "c_index_all": _c_index(y_test, risk_all) if model_all is not None else np.nan,
-        "c_index_global_only": _c_index(y_test, risk_glob) if model_global is not None else np.nan,
-        "c_index_local_only": _c_index(y_test, risk_loc) if model_local is not None else np.nan,
-        "c_index_two_stage": _c_index(y_test, risk_two_stage),
-        "time_horizon_days": t_hor,
-        "gating_feature": gating if gating is not None else "<none>",
-        "thr_low": thr_low,
-        "thr_high": thr_high,
-        "q_low": float(selected_q_low) if np.isfinite(selected_q_low) else np.nan,
-        "q_high": float(selected_q_high) if np.isfinite(selected_q_high) else np.nan,
-        "n_zone_low": int(zone_low.sum()) if gating is not None else 0,
-        "n_zone_mid": int(zone_mid.sum()) if gating is not None else 0,
-        "n_zone_high": int(zone_high.sum()) if gating is not None else 0,
-        "n_test": int(len(X_test)),
-    }
-
-    # Also return top permutation importances (optional, compact)
-    try:
-        if model_global is not None:
-            try:
-                X_pi_g = _align_X_to_model(model_global, X_test[global_cols])
-                names_g = _model_feature_names(model_global) or list(X_pi_g.columns)
-                perm_glob = permutation_importance(
-                    model_global, X_pi_g, y_test, n_repeats=10, random_state=random_state, n_jobs=-1
-                )
-                fi_glob = pd.Series(perm_glob.importances_mean, index=names_g).sort_values(ascending=False)
-            except Exception:
-                fi_glob = pd.Series(dtype=float)
-            topg = fi_glob.head(8)
-            print("Global features (top 8 by permutation importance):")
-            print(topg)
-            try:
-                _plot_series_barh(
-                    fi_glob,
-                    topn=15,
-                    title="Global features (perm importance)",
-                    xlabel="Importance (mean)",
-                    output_dir=output_dir,
-                    filename="global_perm_importance.png",
-                    color="#9467bd",
-                )
-            except Exception:
-                pass
-        if model_local is not None:
-            try:
-                X_pi_l = _align_X_to_model(model_local, X_test[local_cols])
-                names_l = _model_feature_names(model_local) or list(X_pi_l.columns)
-                perm_loc = permutation_importance(
-                    model_local, X_pi_l, y_test, n_repeats=10, random_state=random_state, n_jobs=-1
-                )
-                fi_loc = pd.Series(perm_loc.importances_mean, index=names_l).sort_values(ascending=False)
-            except Exception:
-                fi_loc = pd.Series(dtype=float)
-            topl = fi_loc.head(8)
-            print("Local features (top 8 by permutation importance):")
-            print(topl)
-            try:
-                _plot_series_barh(
-                    fi_loc,
-                    topn=15,
-                    title="Local features (perm importance)",
-                    xlabel="Importance (mean)",
-                    output_dir=output_dir,
-                    filename="local_perm_importance.png",
-                    color="#8c564b",
-                )
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    print("\nTwo-stage strategy evaluation (CoxPH):")
-    print(f"- Gating feature: {metrics['gating_feature']}")
-    if np.isfinite(metrics.get("q_low", np.nan)) and np.isfinite(metrics.get("q_high", np.nan)):
-        print(
-            f"- Thresholds: low={metrics['thr_low']:.4g} (q={metrics['q_low']:.2f}), high={metrics['thr_high']:.4g} (q={metrics['q_high']:.2f})"
-        )
-    else:
-        print(f"- Thresholds: low={metrics['thr_low']:.4g}, high={metrics['thr_high']:.4g}")
-    print(f"- Time horizon (days): {metrics['time_horizon_days']:.1f}")
-    if gating is not None:
-        print(
-            f"- Zone counts (low/mid/high): {metrics['n_zone_low']}/{metrics['n_zone_mid']}/{metrics['n_zone_high']} of {metrics['n_test']}"
-        )
-    print("- C-index baselines and two-stage (test):")
-    print(f"  * All-features CoxPH:   {metrics['c_index_all']:.4f}")
-    print(f"  * Global-only CoxPH:    {metrics['c_index_global_only']:.4f}")
-    print(f"  * Local-only CoxPH:     {metrics['c_index_local_only']:.4f}")
-    print(f"  * Two-stage (g->l mid): {metrics['c_index_two_stage']:.4f}")
-
-    # Visualizations for two-stage
-    try:
-        _plot_cindex_bars(metrics, output_dir)
-    except Exception:
-        pass
-    try:
-        if gating is not None:
-            _plot_gating_hist(gate_train_vals, thr_low, thr_high, label=str(gating), output_dir=output_dir)
-            _plot_zone_counts(metrics, output_dir)
-    except Exception:
-        pass
-
-    return metrics
+    print("[INFO] Two-stage strategy evaluation has been removed and is disabled.")
+    return {"removed": True}
 
 
 def _compute_oof_three_model_risks(
@@ -2063,262 +1865,10 @@ def evaluate_three_model_grouping_and_rule(
     output_dir: Optional[str] = None,
 ) -> Dict[str, object]:
     """
-    Stage-1: Compare three CoxPH models (Global-only, Local-only, All-features) per patient.
-    - Use OOF risks on the training set to assign each patient to the best-performing model
-      (by minimal squared error at a fixed time horizon).
-    - Learn an interpretable three-zone rule based on a single gating feature to predict the
-      best model group (Low/Mid/High zones -> mapped to one of {Global, Local, All}).
-    - Evaluate this rule on a held-out test set by selecting the model per patient and
-      computing C-index.
-
-    Returns a dict with thresholds, zone mapping, counts, and C-index metrics.
+    三分区门控规则已移除：此函数禁用。
     """
-    # Prep data and feature groups
-    X_all, y_all, feature_names = _prepare_survival_xy(clean_df)
-    global_cols, local_cols, gating = _find_feature_groups(feature_names)
-    have_global = len(global_cols) > 0
-    have_local = len(local_cols) > 0
-    if not (have_global and have_local):
-        print("Three-model evaluation skipped: missing global or local feature groups.")
-        return {
-            "have_global": have_global,
-            "have_local": have_local,
-        }
-
-    # Split train/test once
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_all, y_all, test_size=test_size, random_state=random_state
-    )
-
-    # OOF on training to determine best-of-three group labels
-    risk_gl_tr, risk_lo_tr, risk_all_tr, ybin_tr, known_tr, t_mean = _compute_oof_three_model_risks(
-        X_train, y_train, global_cols, local_cols, n_splits_oof, random_state, percent_for_time
-    )
-
-    # Define best model per training sample (only where known)
-    err_gl = (risk_gl_tr - ybin_tr) ** 2
-    err_lo = (risk_lo_tr - ybin_tr) ** 2
-    err_all = (risk_all_tr - ybin_tr) ** 2
-    valid_tr = known_tr & np.isfinite(err_gl) & np.isfinite(err_lo) & np.isfinite(err_all)
-    best_idx_tr = np.full(len(X_train), -1, dtype=int)
-    if valid_tr.any():
-        triple = np.vstack([err_gl[valid_tr], err_lo[valid_tr], err_all[valid_tr]])
-        best = np.argmin(triple, axis=0)  # 0=Global, 1=Local, 2=All
-        best_idx_tr[np.where(valid_tr)[0]] = best
-
-    # Pick gating values (prefer explicit gating feature)
-    if gating is not None and gating in X_train.columns:
-        gate_train = X_train[gating].astype(float).values
-        gate_test = X_test[gating].astype(float).values
-        gate_label = str(gating)
-    else:
-        gate_label = "(sum of local segments)"
-        gate_train = X_train[local_cols].astype(float).sum(axis=1).values
-        gate_test = X_test[local_cols].astype(float).sum(axis=1).values
-
-    # Threshold grids
-    if q_low_grid is None:
-        q_low_grid = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
-    if q_high_grid is None:
-        q_high_grid = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
-
-    # Train CoxPH models on full training for test-time inference
-    def _fit(X, y) -> Optional[CoxPHSurvivalAnalysis]:
-        return _fit_coxph_clean(X, y)
-
-    # Fixed horizon for test evaluation = 75th percentile of train times
-    e_field, t_field = _surv_field_names(y_train)
-    t_hor = float(np.percentile(y_train[t_field], percent_for_time * 100.0)) if len(y_train) else 365.0
-    if not np.isfinite(t_hor) or t_hor <= 0:
-        t_hor = 365.0
-
-    model_all = _fit(X_train, y_train)
-    model_gl = _fit(X_train[global_cols], y_train)
-    model_lo = _fit(X_train[local_cols], y_train)
-
-    # Precompute test risks
-    risk_all_te = _risk_at_time(model_all, X_test, t_hor) if model_all is not None else np.zeros(len(X_test))
-    risk_gl_te = _risk_at_time(model_gl, X_test[global_cols], t_hor) if model_gl is not None else np.zeros(len(X_test))
-    risk_lo_te = _risk_at_time(model_lo, X_test[local_cols], t_hor) if model_lo is not None else np.zeros(len(X_test))
-
-    # Helper for C-index
-    def _c_index(y_arr, risk_scores) -> float:
-        e_name, t_name = _surv_field_names(y_arr)
-        evt = y_arr[e_name].astype(bool)
-        tm = y_arr[t_name].astype(float)
-        return float(concordance_index_censored(evt, tm, risk_scores)[0])
-
-    # Optimize thresholds by maximizing OOF C-index of rule-applied risks on training
-    best_val_c = -np.inf
-    best_thr_low = np.nan
-    best_thr_high = np.nan
-    best_zone_to_model: Dict[str, int] = {}
-
-    # Build OOF risks dict for convenience (training time horizon varies per fold, so
-    # we will evaluate rule quality using classification agreement to best_idx_tr first,
-    # then break ties by OOF C-index constructed at fold horizons approximately by
-    # using risk_all_tr as a proxy when needed.)
-    # Primary score: classification accuracy of zone -> best model on valid_tr samples.
-    for ql in q_low_grid:
-        for qh in q_high_grid:
-            if qh - ql < min_gap:
-                continue
-            thr_l = float(np.nanquantile(gate_train, ql))
-            thr_h = float(np.nanquantile(gate_train, qh))
-            if not np.isfinite(thr_l) or not np.isfinite(thr_h) or thr_l >= thr_h:
-                continue
-
-            zone_low = gate_train < thr_l
-            zone_high = gate_train >= thr_h
-            zone_mid = ~(zone_low | zone_high)
-
-            # Majority label in each zone among valid training samples
-            z2m: Dict[str, int] = {}
-            acc_parts = []
-            for name, mask in ("low", zone_low), ("mid", zone_mid), ("high", zone_high):
-                m = mask & valid_tr
-                if m.sum() == 0:
-                    # Fallback to Global if zone empty
-                    z2m[name] = 0
-                    continue
-                labels = best_idx_tr[m]
-                # majority vote among {0,1,2}
-                vals, counts = np.unique(labels, return_counts=True)
-                maj = int(vals[np.argmax(counts)])
-                z2m[name] = maj
-                acc_parts.append((labels == maj).mean())
-
-            # Primary score: mean per-zone accuracy where zone has data
-            if len(acc_parts) == 0:
-                continue
-            score_primary = float(np.mean(acc_parts))
-
-            # Secondary (tie-breaker): OOF pseudo C-index by composing per-zone chosen risks
-            # We approximate by mixing the three OOF risks using the same mapping and evaluate
-            # concordance against original survival times at varying fold horizons; since OOF
-            # was computed with fold-specific horizons for y_bin, use a crude proxy here by
-            # ranking capability measured via Kendall-like concordance on available finite values.
-            # To keep robust and simple, we will not overfit this tie-breaker.
-            score_secondary = score_primary  # identical fallback
-
-            if (score_primary > best_val_c + 1e-12) or (
-                abs(score_primary - best_val_c) <= 1e-12 and score_secondary > best_val_c
-            ):
-                best_val_c = score_primary
-                best_thr_low = thr_l
-                best_thr_high = thr_h
-                best_zone_to_model = dict(z2m)
-
-    if not np.isfinite(best_thr_low) or not np.isfinite(best_thr_high):
-        # Fallback to fixed percentiles
-        best_thr_low = float(np.nanpercentile(gate_train, 40))
-        best_thr_high = float(np.nanpercentile(gate_train, 75))
-        best_zone_to_model = {"low": 0, "mid": 2, "high": 0}  # heuristic: global, all, global
-
-    # Apply rule on test set to pick model per patient
-    zone_low_te = gate_test < best_thr_low
-    zone_high_te = gate_test >= best_thr_high
-    zone_mid_te = ~(zone_low_te | zone_high_te)
-
-    # Map chosen model index per zone to risk arrays
-    # 0 -> global, 1 -> local, 2 -> all
-    rule_risk_te = np.zeros(len(X_test), dtype=float)
-    for name, mask in ("low", zone_low_te), ("mid", zone_mid_te), ("high", zone_high_te):
-        chosen = int(best_zone_to_model.get(name, 0))
-        if chosen == 0:
-            rule_risk_te[mask] = risk_gl_te[mask]
-        elif chosen == 1:
-            rule_risk_te[mask] = risk_lo_te[mask]
-        else:
-            rule_risk_te[mask] = risk_all_te[mask]
-
-    # Metrics on test
-    cidx_all = _c_index(y_test, risk_all_te)
-    cidx_gl = _c_index(y_test, risk_gl_te)
-    cidx_lo = _c_index(y_test, risk_lo_te)
-    cidx_rule = _c_index(y_test, rule_risk_te)
-
-    # Package results
-    mapping_human = {
-        "low": ["Global", "Local", "All"][int(best_zone_to_model.get("low", 0))],
-        "mid": ["Global", "Local", "All"][int(best_zone_to_model.get("mid", 0))],
-        "high": ["Global", "Local", "All"][int(best_zone_to_model.get("high", 0))],
-    }
-    out: Dict[str, object] = {
-        "gating_feature": gate_label,
-        "thr_low": float(best_thr_low),
-        "thr_high": float(best_thr_high),
-        "zone_mapping": mapping_human,
-        "n_zone_low_test": int(zone_low_te.sum()),
-        "n_zone_mid_test": int(zone_mid_te.sum()),
-        "n_zone_high_test": int(zone_high_te.sum()),
-        "time_horizon_days": float(t_hor),
-        "c_index_all": float(cidx_all),
-        "c_index_global_only": float(cidx_gl),
-        "c_index_local_only": float(cidx_lo),
-        "c_index_rule": float(cidx_rule),
-        "n_test": int(len(X_test)),
-        "n_train_valid_for_grouping": int(valid_tr.sum()),
-        "t_mean_oof": float(t_mean),
-    }
-
-    print("\nThree-model grouping and rule-based selection (test):")
-    print(f"- Gating feature: {out['gating_feature']}")
-    print(
-        f"- Thresholds: low={out['thr_low']:.4g}, high={out['thr_high']:.4g}; zone mapping = "
-        f"low->{mapping_human['low']}, mid->{mapping_human['mid']}, high->{mapping_human['high']}"
-    )
-    print(f"- Time horizon (days): {out['time_horizon_days']:.1f}")
-    print(
-        f"- Zone counts (low/mid/high): {out['n_zone_low_test']}/{out['n_zone_mid_test']}/{out['n_zone_high_test']} of {out['n_test']}"
-    )
-    print("- C-index baselines and rule:")
-    print(f"  * All-features CoxPH:   {out['c_index_all']:.4f}")
-    print(f"  * Global-only CoxPH:    {out['c_index_global_only']:.4f}")
-    print(f"  * Local-only CoxPH:     {out['c_index_local_only']:.4f}")
-    print(f"  * Rule (3-zone select): {out['c_index_rule']:.4f}")
-
-    # Optional visuals
-    try:
-        # 1) Gating histogram colored by best model (train, OOF best)
-        _plot_gating_hist_by_best(
-            gate_train,
-            best_idx_tr,
-            float(out["thr_low"]),
-            float(out["thr_high"]),
-            label=str(gate_label),
-            output_dir=output_dir,
-        )
-        # 2) Zone-wise composition (train)
-        thr_l_v = float(out["thr_low"])
-        thr_h_v = float(out["thr_high"])
-        z_low_tr = gate_train < thr_l_v
-        z_high_tr = gate_train >= thr_h_v
-        z_mid_tr = ~(z_low_tr | z_high_tr)
-        mapping = {0: "Global", 1: "Local", 2: "All"}
-        comp_counts: Dict[str, Dict[str, int]] = {"low": {}, "mid": {}, "high": {}}
-        for name, mask in ("low", z_low_tr), ("mid", z_mid_tr), ("high", z_high_tr):
-            m = mask & valid_tr
-            sub = best_idx_tr[m]
-            cc: Dict[str, int] = {}
-            if len(sub) > 0:
-                vals, counts = np.unique(sub, return_counts=True)
-                for v, c in zip(vals, counts):
-                    cc[mapping.get(int(v), str(int(v)))] = int(c)
-            comp_counts[name] = cc
-        _plot_zone_best_model_stack(comp_counts, output_dir)
-        # 3) C-index comparison including Rule
-        _plot_cindex_bars_generic(
-            labels=["All", "Global", "Local", "Rule"],
-            vals=[out["c_index_all"], out["c_index_global_only"], out["c_index_local_only"], out["c_index_rule"]],
-            title="C-index comparison: All vs Global vs Local vs Rule",
-            output_dir=output_dir,
-            filename="cindex_all_global_local_rule.png",
-        )
-    except Exception:
-        pass
-
-    return out
+    print("[INFO] Three-model grouping and gating rule has been removed and is disabled.")
+    return {"removed": True}
 
 
 def train_assignment_classifier_and_tableone(
@@ -2504,20 +2054,20 @@ def train_assignment_classifier_and_tableone(
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Three-model assignment and reverse feature analysis")
+    parser.add_argument("--figs-dir", type=str, default=None, help="输出图片与CSV的根目录；优先级高于环境变量 FIGURES_DIR")
+    args = parser.parse_args()
+
     clean_df = load_dataframes()
-    figs_dir = os.path.join("figures", "coxph_lifelines_three_model")
+    # 解析图片目录：命令行 > 全局设置 > 环境变量 > 默认
+    figs_dir_cli = args.figs_dir
+    figs_dir_env = os.environ.get("FIGURES_DIR")
+    figs_dir_glb = FIGURES_DIR
+    figs_dir = figs_dir_cli or figs_dir_glb or figs_dir_env or os.path.join("figures", "three_model_assignment")
+    # 运行三模型+指派+反向特征分析
     _ = evaluate_three_model_assignment_and_classifier(
         clean_df,
         output_dir=figs_dir,
-    )
-    # Run gating feature search on all data (repeated CV on full dataset)
-    figs_dir2 = os.path.join("figures", "gating_feature_search")
-    _ = search_best_gating_feature_by_cv(
-        clean_df,
-        n_splits=5,
-        n_repeats=5,
-        random_state=42,
-        output_dir=figs_dir2,
     )
 
 
