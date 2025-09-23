@@ -24,6 +24,24 @@ from lifelines import CoxPHFitter
 from lifelines.utils import concordance_index
 from lifelines.exceptions import ConvergenceWarning
 
+# Optional progress bars
+try:
+    from tqdm.auto import tqdm as _tqdm
+    _HAS_TQDM = True
+except Exception:
+    _HAS_TQDM = False
+
+# Global control for showing progress bars
+PROGRESS = True
+
+def _maybe_tqdm(iterable, total=None, desc=None, leave=False):
+    if _HAS_TQDM and PROGRESS:
+        try:
+            return _tqdm(iterable, total=total, desc=desc, leave=leave)
+        except Exception:
+            return iterable
+    return iterable
+
 try:
     from missingpy import MissForest
 
@@ -1144,7 +1162,7 @@ def _fit_cox_lifelines(
     corr_thresholds = [0.995, 0.98, 0.95, 0.90]
     penalizers = [0.1, 0.5, 1.0, 5.0, 10.0]
 
-    for corr_thr in corr_thresholds:
+    for corr_thr in _maybe_tqdm(corr_thresholds, total=len(corr_thresholds), desc="Cox sanitize", leave=False):
         try:
             X_sanitized = _sanitize_cox_features_matrix(
                 train_df[feature_cols], corr_threshold=corr_thr, verbose=False
@@ -1164,7 +1182,7 @@ def _fit_cox_lifelines(
             axis=1,
         )
 
-        for pen in penalizers:
+        for pen in _maybe_tqdm(penalizers, total=len(penalizers), desc=f"Cox penalizer(thr={corr_thr})", leave=False):
             cph = CoxPHFitter(penalizer=pen, l1_ratio=0.0)
             try:
                 with warnings.catch_warnings():
@@ -1249,7 +1267,7 @@ def _forward_select_features_lifelines(
         len(remaining) if max_features is None else max(0, min(len(remaining), max_features))
     )
 
-    for step_idx in range(max_iters):
+    for step_idx in _maybe_tqdm(range(max_iters), total=max_iters, desc=f"FS-Forward(seed={random_state})", leave=False):
         best_feat = None
         best_feat_cidx = best_val_cidx
         if verbose:
@@ -1326,7 +1344,7 @@ def _stability_select_features_lifelines(
 
     counter: Counter = Counter()
     total_runs = 0
-    for idx, s in enumerate(seeds, start=1):
+    for idx, s in _maybe_tqdm(list(enumerate(seeds, start=1)), total=len(seeds), desc="FS-Stability", leave=False):
         try:
             if verbose:
                 try:
@@ -1389,7 +1407,7 @@ def _compute_oof_three_risks_lifelines(
         c for c in df.columns if c not in [time_col, event_col, "MRN", "ICD"]
     ]
 
-    for fold_idx, (tr_idx, va_idx) in enumerate(kf.split(df), start=1):
+    for fold_idx, (tr_idx, va_idx) in _maybe_tqdm(list(enumerate(kf.split(df), start=1)), total=n_splits, desc="OOF Folds", leave=False):
         _log_progress(f"OOF fold {fold_idx}/{n_splits} fitting models", True)
         tr = df.iloc[tr_idx]
         va = df.iloc[va_idx]
@@ -1923,7 +1941,7 @@ def analyze_benefit_subgroup(
     def _fit(X, y) -> Optional[object]:
         return _fit_coxph_clean(X, y)
 
-    for fold_idx, (tr_idx, va_idx) in enumerate(kf.split(X_all), start=1):
+    for fold_idx, (tr_idx, va_idx) in _maybe_tqdm(list(enumerate(kf.split(X_all), start=1)), total=n_splits, desc="Benefit CV", leave=False):
         _log_progress(f"Benefit CV fold {fold_idx}/{n_splits} start", True)
         X_tr, X_va = X_all.iloc[tr_idx], X_all.iloc[va_idx]
         y_tr, y_va = y_all[tr_idx], y_all[va_idx]
