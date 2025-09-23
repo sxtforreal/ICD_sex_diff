@@ -564,6 +564,105 @@ def _ipcw_brier_per_sample(
 
 
 # =============================
+# Feature selection utilities (forward C-index selection on training only)
+# =============================
+
+
+def _sanitize_feature_pool(
+    X: pd.DataFrame, candidate_cols: List[str], corr_threshold: float = 0.995
+) -> List[str]:
+    cols = [c for c in candidate_cols if c in X.columns]
+    if not cols:
+        return []
+    Xc = X[cols].copy()
+    # Drop constant columns
+    nunique = Xc.nunique(dropna=True)
+    cols = nunique[nunique > 1].index.tolist()
+    if len(cols) <= 1:
+        return list(cols)
+    Xc = Xc[cols]
+    # Drop exactly duplicated columns
+    dup_mask = Xc.fillna(0.0).T.duplicated(keep="first")
+    if dup_mask.any():
+        cols = [c for i, c in enumerate(Xc.columns.tolist()) if not bool(dup_mask.values[i])]
+        Xc = Xc[cols]
+    if len(cols) <= 1:
+        return list(cols)
+    # Drop highly correlated columns
+    corr = Xc.fillna(0.0).corr().abs()
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+    to_drop = [col for col in upper.columns if (upper[col] >= float(corr_threshold)).any()]
+    kept = [c for c in Xc.columns if c not in set(to_drop)]
+    return kept
+
+
+def _forward_select_max_cindex(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    candidate_cols: List[str],
+    random_state: int = 0,
+    max_features: Optional[int] = None,
+    cox_alpha: float = 0.1,
+    clip_value: float = 8.0,
+    verbose: bool = False,
+) -> List[str]:
+    # Prepare pool
+    pool = _sanitize_feature_pool(X, candidate_cols, corr_threshold=0.995)
+    if len(pool) <= 1:
+        return list(pool)
+
+    # Inner split on training only
+    names = getattr(y.dtype, "names", ("event", "time"))
+    e_all = y[names[0]].astype(bool)
+    idx = np.arange(len(X))
+    try:
+        tr_idx, va_idx = train_test_split(
+            idx,
+            test_size=0.3,
+            random_state=int(random_state),
+            stratify=e_all if np.unique(e_all).size > 1 else None,
+        )
+    except Exception:
+        tr_idx, va_idx = train_test_split(idx, test_size=0.3, random_state=int(random_state))
+    Xtr, Xva = X.iloc[tr_idx], X.iloc[va_idx]
+    ytr, yva = y[tr_idx], y[va_idx]
+
+    selected: List[str] = []
+    best_c: float = -np.inf
+    remaining = list(pool)
+    max_iters = len(remaining) if max_features is None else max(0, min(len(remaining), int(max_features)))
+
+    for step in range(max_iters):
+        best_feat = None
+        best_feat_c = best_c
+        for feat in remaining:
+            trial = selected + [feat]
+            mdl = _fit_cox(Xtr[trial], ytr, alpha=cox_alpha, clip_value=clip_value)
+            if mdl is None:
+                continue
+            try:
+                scores = np.asarray(mdl.predict(Xva[trial]), dtype=float).ravel()
+                c = concordance_index_censored(
+                    yva[names[0]].astype(bool), yva[names[1]].astype(float), scores
+                )[0]
+            except Exception:
+                c = np.nan
+            if np.isfinite(c) and (float(c) > float(best_feat_c) + 1e-10):
+                best_feat_c = float(c)
+                best_feat = feat
+        if best_feat is None:
+            break
+        selected.append(best_feat)
+        remaining.remove(best_feat)
+        best_c = best_feat_c
+        if verbose:
+            try:
+                print(f"[FS] + {best_feat} -> inner c-index={best_c:.4f}")
+            except Exception:
+                pass
+    return selected
+
+# =============================
 # Step 1: K 折 OOF 双模型损失（global vs global+local）
 # =============================
 
@@ -579,15 +678,19 @@ def compute_oof_losses(
     cox_alpha: float = 0.1,
     include_female: bool = False,
     cox_clip_value: float = 8.0,
+    use_feature_selection: bool = False,
+    fs_max_features: Optional[int] = None,
 ) -> Dict[str, np.ndarray]:
     # Control whether Female is part of features
     drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
     if not include_female:
         drop_cols = drop_cols + ["Female"]
     X_all, y_all, feat_names = _prepare_survival_xy(clean_df, drop_cols=drop_cols)
-    all_cols = [c for c in feat_names]
-    global_cols = [c for c in global_cols if c in all_cols]
-    local_cols = [c for c in local_cols if c in all_cols]
+    feat_set = set(feat_names)
+    global_cols = [c for c in global_cols if c in feat_set]
+    local_cols = [c for c in local_cols if c in feat_set]
+    # Use curated union for 'all' instead of all available columns to avoid noise leakage
+    all_cols = sorted(set(global_cols) | set(local_cols))
     if len(global_cols) == 0 or len(local_cols) == 0:
         raise ValueError("GLOBAL_FEATURES 或 LOCAL_FEATURES 为空或与数据不匹配。")
 
@@ -608,19 +711,38 @@ def compute_oof_losses(
             X_tr, X_va = X_all.iloc[tr_idx], X_all.iloc[va_idx]
             y_tr, y_va = y_all[tr_idx], y_all[va_idx]
 
+            # Optional forward feature selection on TRAIN FOLD only
+            sel_global = list(global_cols)
+            sel_all = list(all_cols)
+            if use_feature_selection:
+                try:
+                    sel_global = _forward_select_max_cindex(
+                        X_tr, y_tr, global_cols, random_state=rng, max_features=fs_max_features,
+                        cox_alpha=cox_alpha, clip_value=cox_clip_value, verbose=False
+                    ) or list(global_cols)
+                except Exception:
+                    sel_global = list(global_cols)
+                try:
+                    sel_all = _forward_select_max_cindex(
+                        X_tr, y_tr, all_cols, random_state=rng, max_features=fs_max_features,
+                        cox_alpha=cox_alpha, clip_value=cox_clip_value, verbose=False
+                    ) or list(all_cols)
+                except Exception:
+                    sel_all = list(all_cols)
+
             # Fit two Cox models: global-only, and all (global+local)
-            mdl_gl = _fit_cox(X_tr[global_cols], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
-            mdl_all = _fit_cox(X_tr[all_cols], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
+            mdl_gl = _fit_cox(X_tr[sel_global], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
+            mdl_all = _fit_cox(X_tr[sel_all], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
 
             # Predict S(t0) for IPCW-Brier (used for meta-labels). C-index will use linear predictors.
             if mdl_gl:
-                survf_gl = mdl_gl.predict_survival_function(X_va[global_cols])
+                survf_gl = mdl_gl.predict_survival_function(X_va[sel_global])
                 s_gl = np.array([sf(horizon_days) for sf in survf_gl], dtype=float)
             else:
                 s_gl = np.ones(len(va_idx), dtype=float)
 
             if mdl_all:
-                survf_all = mdl_all.predict_survival_function(X_va[all_cols])
+                survf_all = mdl_all.predict_survival_function(X_va[sel_all])
                 s_all = np.array([sf(horizon_days) for sf in survf_all], dtype=float)
             else:
                 s_all = np.ones(len(va_idx), dtype=float)
@@ -637,11 +759,11 @@ def compute_oof_losses(
             t_field = y_va.dtype.names[1]
             # Use Cox linear predictors (risk scores) for C-index
             if mdl_gl:
-                lin_gl = np.asarray(mdl_gl.predict(X_va[global_cols]), dtype=float).ravel()
+                lin_gl = np.asarray(mdl_gl.predict(X_va[sel_global]), dtype=float).ravel()
             else:
                 lin_gl = np.zeros(len(va_idx), dtype=float)
             if mdl_all:
-                lin_all = np.asarray(mdl_all.predict(X_va[all_cols]), dtype=float).ravel()
+                lin_all = np.asarray(mdl_all.predict(X_va[sel_all]), dtype=float).ravel()
             else:
                 lin_all = np.zeros(len(va_idx), dtype=float)
 
@@ -833,18 +955,21 @@ def evaluate_on_holdout(
     topk_importance: int = 20,
     include_female: bool = False,
     cox_clip_value: float = 8.0,
+    use_feature_selection: bool = False,
+    fs_max_features: Optional[int] = None,
 ) -> Dict[str, object]:
     # Control whether Female is included as a feature throughout
     drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
     if not include_female:
         drop_cols = drop_cols + ["Female"]
     X_all, y_all, feat_names = _prepare_survival_xy(clean_df, drop_cols=drop_cols)
-    all_cols = [c for c in feat_names]
-    global_cols = [c for c in global_cols if c in all_cols]
+    feat_set = set(feat_names)
+    global_cols = [c for c in global_cols if c in feat_set]
     # Optionally include Female in the global feature set if requested and available
-    if include_female and "Female" in all_cols and "Female" not in global_cols:
+    all_cols = sorted(set(global_cols) | set([c for c in local_cols if c in feat_set]))
+    if include_female and "Female" in feat_set and "Female" not in global_cols:
         global_cols = list(global_cols) + ["Female"]
-    local_cols = [c for c in local_cols if c in all_cols]
+    local_cols = [c for c in local_cols if c in feat_set]
 
     X_tr, X_te, y_tr, y_te = train_test_split(
         X_all, y_all, test_size=test_size, random_state=random_state
@@ -875,6 +1000,8 @@ def evaluate_on_holdout(
         cox_alpha=cox_alpha,
         include_female=include_female,
         cox_clip_value=cox_clip_value,
+        use_feature_selection=use_feature_selection,
+        fs_max_features=fs_max_features,
     )
 
     _log("Generating strict meta-labels by hard-threshold rule (binary) ...")
@@ -893,8 +1020,27 @@ def evaluate_on_holdout(
 
     # Fit base models on full training set
     _log("Fitting base models on the full training set ...")
-    mdl_global = _fit_cox(X_tr[global_cols], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
-    mdl_all = _fit_cox(X_tr[all_cols], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
+    # Optionally perform feature selection on the full training split before final fit
+    sel_global_final = list(global_cols)
+    sel_all_final = list(all_cols)
+    if use_feature_selection:
+        try:
+            sel_global_final = _forward_select_max_cindex(
+                X_tr, y_tr, global_cols, random_state=random_state, max_features=fs_max_features,
+                cox_alpha=cox_alpha, clip_value=cox_clip_value, verbose=True
+            ) or list(global_cols)
+        except Exception:
+            sel_global_final = list(global_cols)
+        try:
+            sel_all_final = _forward_select_max_cindex(
+                X_tr, y_tr, all_cols, random_state=random_state, max_features=fs_max_features,
+                cox_alpha=cox_alpha, clip_value=cox_clip_value, verbose=True
+            ) or list(all_cols)
+        except Exception:
+            sel_all_final = list(all_cols)
+
+    mdl_global = _fit_cox(X_tr[sel_global_final], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
+    mdl_all = _fit_cox(X_tr[sel_all_final], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
 
     # Predict on test set via learned gating
     _log("Applying gating to test set and computing metrics ...")
@@ -902,15 +1048,15 @@ def evaluate_on_holdout(
     gate_model: Pipeline = gating["model"]  # type: ignore
 
     # For test, gating uses only global features
-    gate_pred = gate_model.predict(X_te[global_cols])
+    gate_pred = gate_model.predict(X_te[sel_global_final])
 
     # Predict Cox linear predictors for test set
     if mdl_global:
-        lin_gl_te = np.asarray(mdl_global.predict(X_te[global_cols]), dtype=float).ravel()
+        lin_gl_te = np.asarray(mdl_global.predict(X_te[sel_global_final]), dtype=float).ravel()
     else:
         lin_gl_te = np.zeros(len(X_te), dtype=float)
     if mdl_all:
-        lin_all_te = np.asarray(mdl_all.predict(X_te[all_cols]), dtype=float).ravel()
+        lin_all_te = np.asarray(mdl_all.predict(X_te[sel_all_final]), dtype=float).ravel()
     else:
         lin_all_te = np.zeros(len(X_te), dtype=float)
 
@@ -1020,6 +1166,17 @@ def main() -> None:
         default=8.0,
         help="标准化后特征的裁剪阈值(避免线性预测过大导致溢出)",
     )
+    parser.add_argument(
+        "--use-feature-selection",
+        action="store_true",
+        help="是否对 global/all 基模型启用前向特征选择（仅在训练集/折内进行，避免泄漏）",
+    )
+    parser.add_argument(
+        "--fs-max-features",
+        type=int,
+        default=None,
+        help="前向特征选择的最大特征数（默认不限制）",
+    )
     args = parser.parse_args()
 
     global PROGRESS
@@ -1052,6 +1209,8 @@ def main() -> None:
         topk_importance=args.topk_importance,
         include_female=args.include_female,
         cox_clip_value=args.cox_clip_value,
+        use_feature_selection=args.use_feature_selection,
+        fs_max_features=args.fs_max_features,
     )
 
     print("\n=== Gating OOF (train) ===")
