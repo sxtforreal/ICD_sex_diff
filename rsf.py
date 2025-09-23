@@ -15,6 +15,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sklearn.exceptions import ConvergenceWarning
 
 from sksurv.linear_model import CoxPHSurvivalAnalysis
 from sksurv.metrics import concordance_index_censored
@@ -395,8 +396,9 @@ class CoxPHWithScaler:
     Provides predict_survival_function and predict consistent with scikit-survival's API.
     """
 
-    def __init__(self, alpha: float = 0.1):
+    def __init__(self, alpha: float = 0.1, clip_value: float = 8.0):
         self.alpha = float(alpha)
+        self.clip_value = float(clip_value)
         self.scaler: Optional[StandardScaler] = None
         self.model: Optional[CoxPHSurvivalAnalysis] = None
         self.columns: Optional[List[str]] = None
@@ -412,8 +414,37 @@ class CoxPHWithScaler:
         X_scaled = pd.DataFrame(
             self.scaler.fit_transform(X_use), columns=self.columns, index=X_use.index
         )
-        self.model = CoxPHSurvivalAnalysis(alpha=self.alpha)
-        self.model.fit(X_scaled, y)
+        # Clip scaled features to avoid extremely large linear predictors
+        if np.isfinite(self.clip_value) and self.clip_value > 0:
+            X_scaled = X_scaled.clip(lower=-self.clip_value, upper=self.clip_value)
+
+        # Try multiple constructor signatures for version compatibility
+        def _build_model(alpha: float) -> CoxPHSurvivalAnalysis:
+            for kwargs in (
+                {"alpha": alpha, "ties": "efron", "n_iter": 1024},
+                {"alpha": alpha, "tie_method": "efron", "n_iter": 1024},
+                {"alpha": alpha, "ties": "efron"},
+                {"alpha": alpha, "tie_method": "efron"},
+                {"alpha": alpha},
+            ):
+                try:
+                    return CoxPHSurvivalAnalysis(**kwargs)  # type: ignore[arg-type]
+                except TypeError:
+                    continue
+            return CoxPHSurvivalAnalysis(alpha=alpha)
+
+        self.model = _build_model(self.alpha)
+
+        # Attempt fit; if convergence warning occurs, refit with stronger regularization
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ConvergenceWarning)
+            try:
+                self.model.fit(X_scaled, y)
+            except ConvergenceWarning:
+                # Increase regularization and try again
+                stronger_alpha = max(self.alpha * 10.0, self.alpha + 0.9)
+                self.model = _build_model(stronger_alpha)
+                self.model.fit(X_scaled, y)
         return self
 
     def _ensure_ready(self) -> None:
