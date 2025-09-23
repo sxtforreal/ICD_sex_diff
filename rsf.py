@@ -508,7 +508,7 @@ def _ipcw_brier_per_sample(
 
 
 # =============================
-# Step 1: K 折 OOF 三模型损失
+# Step 1: K 折 OOF 双模型损失（global vs global+local）
 # =============================
 
 
@@ -531,110 +531,81 @@ def compute_oof_losses(
 
     n = len(X_all)
     # Collect R repetitions
-    losses_local_rep: List[np.ndarray] = []
     losses_global_rep: List[np.ndarray] = []
     losses_all_rep: List[np.ndarray] = []
-    risks_local_rep: List[np.ndarray] = []
-    risks_global_rep: List[np.ndarray] = []
-    risks_all_rep: List[np.ndarray] = []
 
     # For IPCW Brier, we will compute per-fold using KM G from training fold
 
     for r in range(max(1, int(repeats))):
         rng = int(random_state + r)
         kf = KFold(n_splits=k_folds, shuffle=True, random_state=rng)
-        L_lo = np.full(n, np.nan, dtype=float)
         L_gl = np.full(n, np.nan, dtype=float)
         L_all = np.full(n, np.nan, dtype=float)
-        R_lo = np.full(n, np.nan, dtype=float)
-        R_gl = np.full(n, np.nan, dtype=float)
-        R_all = np.full(n, np.nan, dtype=float)
 
         for tr_idx, va_idx in kf.split(X_all):
             X_tr, X_va = X_all.iloc[tr_idx], X_all.iloc[va_idx]
             y_tr, y_va = y_all[tr_idx], y_all[va_idx]
 
-            # Fit three Cox models
-            mdl_lo = _fit_cox(X_tr[local_cols], y_tr, alpha=cox_alpha)
+            # Fit two Cox models: global-only, and all (global+local)
             mdl_gl = _fit_cox(X_tr[global_cols], y_tr, alpha=cox_alpha)
             mdl_all = _fit_cox(X_tr[all_cols], y_tr, alpha=cox_alpha)
 
-            # Predict S(t0) and risk@t0
-            if mdl_lo:
-                survf_lo = mdl_lo.predict_survival_function(X_va[local_cols])
-                s_lo = np.array([sf(horizon_days) for sf in survf_lo], dtype=float)
-                risk_lo = np.clip(1.0 - s_lo, 0.0, 1.0)
-            else:
-                s_lo = np.ones(len(va_idx), dtype=float)
-                risk_lo = np.zeros(len(va_idx), dtype=float)
-
+            # Predict S(t0) for IPCW-Brier (used for meta-labels). C-index will use linear predictors.
             if mdl_gl:
                 survf_gl = mdl_gl.predict_survival_function(X_va[global_cols])
                 s_gl = np.array([sf(horizon_days) for sf in survf_gl], dtype=float)
-                risk_gl = np.clip(1.0 - s_gl, 0.0, 1.0)
             else:
                 s_gl = np.ones(len(va_idx), dtype=float)
-                risk_gl = np.zeros(len(va_idx), dtype=float)
 
             if mdl_all:
                 survf_all = mdl_all.predict_survival_function(X_va[all_cols])
                 s_all = np.array([sf(horizon_days) for sf in survf_all], dtype=float)
-                risk_all = np.clip(1.0 - s_all, 0.0, 1.0)
             else:
                 s_all = np.ones(len(va_idx), dtype=float)
-                risk_all = np.zeros(len(va_idx), dtype=float)
 
             # Per-sample IPCW Brier loss using KM from training fold
-            L_lo_fold, known_lo = _ipcw_brier_per_sample(y_tr, y_va, s_lo, horizon_days)
             L_gl_fold, known_gl = _ipcw_brier_per_sample(y_tr, y_va, s_gl, horizon_days)
             L_all_fold, known_all = _ipcw_brier_per_sample(y_tr, y_va, s_all, horizon_days)
 
-            L_lo[va_idx] = L_lo_fold
             L_gl[va_idx] = L_gl_fold
             L_all[va_idx] = L_all_fold
-
-            R_lo[va_idx] = risk_lo
-            R_gl[va_idx] = risk_gl
-            R_all[va_idx] = risk_all
 
             # Fold-level metrics
             e_field = y_va.dtype.names[0]
             t_field = y_va.dtype.names[1]
-            c_lo = concordance_index_censored(
-                y_va[e_field].astype(bool), y_va[t_field].astype(float), risk_lo
-            )[0]
+            # Use Cox linear predictors (risk scores) for C-index
+            if mdl_gl:
+                lin_gl = np.asarray(mdl_gl.predict(X_va[global_cols]), dtype=float).ravel()
+            else:
+                lin_gl = np.zeros(len(va_idx), dtype=float)
+            if mdl_all:
+                lin_all = np.asarray(mdl_all.predict(X_va[all_cols]), dtype=float).ravel()
+            else:
+                lin_all = np.zeros(len(va_idx), dtype=float)
+
             c_gl = concordance_index_censored(
-                y_va[e_field].astype(bool), y_va[t_field].astype(float), risk_gl
+                y_va[e_field].astype(bool), y_va[t_field].astype(float), lin_gl
             )[0]
             c_all = concordance_index_censored(
-                y_va[e_field].astype(bool), y_va[t_field].astype(float), risk_all
+                y_va[e_field].astype(bool), y_va[t_field].astype(float), lin_all
             )[0]
             # Mean IPCW Brier over valid samples
-            b_lo = float(np.nanmean(L_lo_fold))
             b_gl = float(np.nanmean(L_gl_fold))
             b_all = float(np.nanmean(L_all_fold))
 
             # init lists on first usage
-            if r == 0 and 'c_lo_list' not in locals():
-                c_lo_list = []
+            if r == 0 and 'c_gl_list' not in locals():
                 c_gl_list = []
                 c_all_list = []
-                b_lo_list = []
                 b_gl_list = []
                 b_all_list = []
-            c_lo_list.append(float(c_lo))
             c_gl_list.append(float(c_gl))
             c_all_list.append(float(c_all))
-            b_lo_list.append(b_lo)
             b_gl_list.append(b_gl)
             b_all_list.append(b_all)
 
-        losses_local_rep.append(L_lo)
         losses_global_rep.append(L_gl)
         losses_all_rep.append(L_all)
-        risks_local_rep.append(R_lo)
-        risks_global_rep.append(R_gl)
-        risks_all_rep.append(R_all)
 
     # Average across repeats when available
     def _nanmean_stack(arrs: List[np.ndarray]) -> np.ndarray:
@@ -649,37 +620,27 @@ def compute_oof_losses(
             return float('nan'), float('nan')
         return float(np.nanmean(vals)), float(np.nanstd(vals, ddof=1) if len(vals) > 1 else 0.0)
 
-    cv_cindex_local_mean, cv_cindex_local_std = _mean_std(c_lo_list if 'c_lo_list' in locals() else [])
     cv_cindex_global_mean, cv_cindex_global_std = _mean_std(c_gl_list if 'c_gl_list' in locals() else [])
     cv_cindex_all_mean, cv_cindex_all_std = _mean_std(c_all_list if 'c_all_list' in locals() else [])
-    cv_brier_local_mean, cv_brier_local_std = _mean_std(b_lo_list if 'b_lo_list' in locals() else [])
     cv_brier_global_mean, cv_brier_global_std = _mean_std(b_gl_list if 'b_gl_list' in locals() else [])
     cv_brier_all_mean, cv_brier_all_std = _mean_std(b_all_list if 'b_all_list' in locals() else [])
 
     # known mask: any model has known loss (not NaN)
-    known_mask = np.isfinite(np.nanmin(np.vstack([losses_local_rep[0], losses_global_rep[0], losses_all_rep[0]]), axis=0)) if len(losses_local_rep) > 0 else np.zeros(n, dtype=bool)
+    known_mask = np.isfinite(np.nanmin(np.vstack([losses_global_rep[0], losses_all_rep[0]]), axis=0)) if len(losses_global_rep) > 0 else np.zeros(n, dtype=bool)
 
     return {
-        "loss_local": _nanmean_stack(losses_local_rep),
         "loss_global": _nanmean_stack(losses_global_rep),
         "loss_all": _nanmean_stack(losses_all_rep),
-        "risk_local": _nanmean_stack(risks_local_rep),
-        "risk_global": _nanmean_stack(risks_global_rep),
-        "risk_all": _nanmean_stack(risks_all_rep),
         "known_mask": known_mask,
         "X": X_all,
         "y": y_all,
         "global_cols": global_cols,
         "local_cols": local_cols,
         "all_cols": all_cols,
-        "cv_cindex_local_mean": cv_cindex_local_mean,
-        "cv_cindex_local_std": cv_cindex_local_std,
         "cv_cindex_global_mean": cv_cindex_global_mean,
         "cv_cindex_global_std": cv_cindex_global_std,
         "cv_cindex_all_mean": cv_cindex_all_mean,
         "cv_cindex_all_std": cv_cindex_all_std,
-        "cv_brier_local_mean": cv_brier_local_mean,
-        "cv_brier_local_std": cv_brier_local_std,
         "cv_brier_global_mean": cv_brier_global_mean,
         "cv_brier_global_std": cv_brier_global_std,
         "cv_brier_all_mean": cv_brier_all_mean,
@@ -692,68 +653,48 @@ def compute_oof_losses(
 # =============================
 
 
-def apply_hard_threshold_rule(
-    loss_local: np.ndarray,
+def apply_hard_threshold_rule_binary(
     loss_global: np.ndarray,
     loss_all: np.ndarray,
     alpha_abs: float = 0.005,
     alpha_rel: float = 0.0,
     lambda_penalty: float = 0.0,
     complexity: Optional[Dict[str, float]] = None,
-    prefer_between_local_global: bool = True,
 ) -> Dict[str, np.ndarray]:
     """
-    返回基于三元 OOF 损失的严格标签 z_i ∈ {local, global, all} 以及 margin。
-
-    - alpha_abs: 绝对最小改进阈值 (L_second - L_best >= alpha_abs)
-    - alpha_rel: 相对改进阈值 ((L_second - L_best)/L_second >= alpha_rel)
-    - lambda_penalty: 复杂度惩罚系数；对每个模型加 λ*C_m
-    - complexity: {"local":C_l, "global":C_g, "all":C_a}
-    - prefer_between_local_global: 当改进不足时，只在 local/global 中二选一
+    基于双模型（global vs global+local）的 OOF 损失生成二元严格标签：
+    z_i ∈ {0: global, 1: all}，并返回 margin = L_second - L_best。
     """
     if complexity is None:
-        complexity = {"local": 1.0, "global": 1.0, "all": 1.2}
+        complexity = {"global": 1.0, "all": 1.2}
 
-    L_lo = loss_local.copy()
-    L_gl = loss_global.copy()
-    L_all = loss_all.copy()
+    L_gl = loss_global.copy() + lambda_penalty * complexity.get("global", 1.0)
+    L_all = loss_all.copy() + lambda_penalty * complexity.get("all", 1.0)
 
-    # Complexity penalty
-    L_lo = L_lo + lambda_penalty * complexity.get("local", 1.0)
-    L_gl = L_gl + lambda_penalty * complexity.get("global", 1.0)
-    L_all = L_all + lambda_penalty * complexity.get("all", 1.0)
-
-    n = len(L_lo)
+    n = len(L_gl)
     labels = np.full(n, fill_value=-1, dtype=int)
     margins = np.full(n, fill_value=np.nan, dtype=float)
 
-    stack = np.vstack([L_lo, L_gl, L_all])  # rows: 0 local, 1 global, 2 all
+    stack = np.vstack([L_gl, L_all])  # 0: global, 1: all
     for i in range(n):
         li = stack[:, i]
-        if np.any(~np.isfinite(li)):
-            # If any nan among three, skip this sample
-            if np.sum(np.isfinite(li)) < 2:
-                continue
+        if np.sum(np.isfinite(li)) < 2:
+            continue
         order = np.argsort(li)
         best = order[0]
         second = order[1]
-        Lb = li[best]
-        L2 = li[second]
+        Lb = float(li[best])
+        L2 = float(li[second])
         margin = float(L2 - Lb)
         margins[i] = margin
 
         cond_abs = margin >= alpha_abs
         cond_rel = (margin / max(L2, 1e-12)) >= alpha_rel
         if cond_abs and cond_rel:
-            labels[i] = int(best)
+            labels[i] = int(best)  # 0: global, 1: all
         else:
-            if prefer_between_local_global:
-                pair = np.nanargmin([li[0], li[1]])
-                labels[i] = int(pair)
-            else:
-                labels[i] = int(best)
+            labels[i] = int(np.nanargmin([li[0], li[1]]))
 
-    # 0->local,1->global,2->all
     return {"labels": labels, "margins": margins}
 
 
@@ -765,12 +706,15 @@ def apply_hard_threshold_rule(
 def train_gating_classifier(
     X: pd.DataFrame,
     labels: np.ndarray,
+    feature_cols: List[str],
     k_folds: int = 5,
     random_state: int = 42,
 ) -> Dict[str, object]:
     mask = labels >= 0
     Xy = X[mask]
     y = labels[mask]
+    # Use only specified features (global features only for gating)
+    Xy = Xy[feature_cols]
 
     if Xy.shape[0] == 0:
         raise ValueError("没有可用于训练 gating 的样本标签。")
@@ -778,15 +722,7 @@ def train_gating_classifier(
     pipe = Pipeline(
         steps=[
             ("scaler", StandardScaler()),
-            (
-                "clf",
-                LogisticRegression(
-                    max_iter=2000,
-                    multi_class="auto",
-                    class_weight="balanced",
-                    solver="lbfgs",
-                ),
-            ),
+            ("clf", LogisticRegression(max_iter=2000, class_weight="balanced", solver="lbfgs")),
         ]
     )
 
@@ -810,6 +746,7 @@ def train_gating_classifier(
         "oof_f1_macro": float(f1m),
         "report": rep,
         "mask": mask,
+        "features": feature_cols,
     }
 
 
@@ -867,9 +804,8 @@ def evaluate_on_holdout(
         cox_alpha=cox_alpha,
     )
 
-    _log("Generating strict meta-labels by hard-threshold rule ...")
-    lab_res = apply_hard_threshold_rule(
-        oof_tr["loss_local"],
+    _log("Generating strict meta-labels by hard-threshold rule (binary) ...")
+    lab_res = apply_hard_threshold_rule_binary(
         oof_tr["loss_global"],
         oof_tr["loss_all"],
         alpha_abs=alpha_abs,
@@ -877,14 +813,13 @@ def evaluate_on_holdout(
         lambda_penalty=lambda_penalty,
     )
 
-    _log("Training gating classifier on training set ...")
+    _log("Training gating classifier on training set (global-only features) ...")
     gating = train_gating_classifier(
-        oof_tr["X"], lab_res["labels"], k_folds=k_folds, random_state=random_state
+        oof_tr["X"], lab_res["labels"], feature_cols=global_cols, k_folds=k_folds, random_state=random_state
     )
 
     # Fit base models on full training set
     _log("Fitting base models on the full training set ...")
-    mdl_local = _fit_cox(X_tr[local_cols], y_tr, alpha=cox_alpha)
     mdl_global = _fit_cox(X_tr[global_cols], y_tr, alpha=cox_alpha)
     mdl_all = _fit_cox(X_tr[all_cols], y_tr, alpha=cox_alpha)
 
@@ -893,72 +828,40 @@ def evaluate_on_holdout(
     gate_mask = gating["mask"]
     gate_model: Pipeline = gating["model"]  # type: ignore
 
-    # For test, gating uses all features
-    gate_pred = gate_model.predict(
-        df_te.drop(columns=["VT/VF/SCD", "PE_Time"], errors="ignore")
-    )
+    # For test, gating uses only global features
+    gate_pred = gate_model.predict(X_te[global_cols])
 
-    # Predict survival and risk at t0 for test set using survival functions (stable)
-    if mdl_local:
-        s_lo_te = np.array([
-            sf(horizon_days) for sf in mdl_local.predict_survival_function(X_te[local_cols])
-        ], dtype=float)
-        risk_lo_te = np.clip(1.0 - s_lo_te, 0.0, 1.0)
-    else:
-        s_lo_te = np.ones(len(X_te), dtype=float)
-        risk_lo_te = np.zeros(len(X_te), dtype=float)
-
+    # Predict Cox linear predictors for test set
     if mdl_global:
-        s_gl_te = np.array([
-            sf(horizon_days) for sf in mdl_global.predict_survival_function(X_te[global_cols])
-        ], dtype=float)
-        risk_gl_te = np.clip(1.0 - s_gl_te, 0.0, 1.0)
+        lin_gl_te = np.asarray(mdl_global.predict(X_te[global_cols]), dtype=float).ravel()
     else:
-        s_gl_te = np.ones(len(X_te), dtype=float)
-        risk_gl_te = np.zeros(len(X_te), dtype=float)
-
+        lin_gl_te = np.zeros(len(X_te), dtype=float)
     if mdl_all:
-        s_all_te = np.array([
-            sf(horizon_days) for sf in mdl_all.predict_survival_function(X_te[all_cols])
-        ], dtype=float)
-        risk_all_te = np.clip(1.0 - s_all_te, 0.0, 1.0)
+        lin_all_te = np.asarray(mdl_all.predict(X_te[all_cols]), dtype=float).ravel()
     else:
-        s_all_te = np.ones(len(X_te), dtype=float)
-        risk_all_te = np.zeros(len(X_te), dtype=float)
+        lin_all_te = np.zeros(len(X_te), dtype=float)
 
-    # Compose mixture by gating decision: 0 local, 1 global, 2 all
-    mix_risk = np.zeros(len(X_te), dtype=float)
-    s_mix = np.zeros(len(X_te), dtype=float)
+    # Compose mixture by gating decision: 0->global, 1->all
+    mix_score = np.zeros(len(X_te), dtype=float)
     for i in range(len(X_te)):
         z = int(gate_pred[i])
-        if z == 0:
-            mix_risk[i] = risk_lo_te[i]
-            s_mix[i] = s_lo_te[i]
-        elif z == 1:
-            mix_risk[i] = risk_gl_te[i]
-            s_mix[i] = s_gl_te[i]
-        else:
-            mix_risk[i] = risk_all_te[i]
-            s_mix[i] = s_all_te[i]
+        mix_score[i] = lin_gl_te[i] if z == 0 else lin_all_te[i]
 
     # Metrics on test
     e_field = "event" if "event" in y_te.dtype.names else y_te.dtype.names[0]
     t_field = "time" if "time" in y_te.dtype.names else y_te.dtype.names[1]
     c_index = float(
         concordance_index_censored(
-            y_te[e_field].astype(bool), y_te[t_field].astype(float), mix_risk
+            y_te[e_field].astype(bool), y_te[t_field].astype(float), mix_score
         )[0]
     )
-    # IPCW Brier at t0 using training fold to estimate censoring
-    brier_mix = float(np.nanmean(_ipcw_brier_per_sample(y_tr, y_te, s_mix, horizon_days)[0]))
 
     # For reference: all-only model
     c_index_all = float(
         concordance_index_censored(
-            y_te[e_field].astype(bool), y_te[t_field].astype(float), risk_all_te
+            y_te[e_field].astype(bool), y_te[t_field].astype(float), lin_all_te
         )[0]
     )
-    brier_all = float(np.nanmean(_ipcw_brier_per_sample(y_tr, y_te, s_all_te, horizon_days)[0]))
 
     # Gating feature importance: coef norms across classes
     clf = None
@@ -966,7 +869,7 @@ def evaluate_on_holdout(
         clf = gate_model.named_steps.get("clf", None)
     except Exception:
         clf = None
-    feat_names = list(oof_tr["X"].columns)
+    feat_names = list(gating.get("features", [])) or list(oof_tr["X"].columns)
     gating_importance: List[Tuple[str, float]] = []
     if hasattr(clf, "coef_"):
         coef = np.asarray(getattr(clf, "coef_"), dtype=float)
@@ -983,9 +886,9 @@ def evaluate_on_holdout(
         "gating_oof_f1_macro": gating["oof_f1_macro"],
         "gating_report": gating["report"],
         "test_c_index_mix": c_index,
-        "test_brier_mix": brier_mix,
+        "test_brier_mix": float('nan'),
         "test_c_index_all": c_index_all,
-        "test_brier_all": brier_all,
+        "test_brier_all": float('nan'),
         "cv_cindex_local_mean": oof_tr.get("cv_cindex_local_mean", float("nan")),
         "cv_cindex_local_std": oof_tr.get("cv_cindex_local_std", float("nan")),
         "cv_cindex_global_mean": oof_tr.get("cv_cindex_global_mean", float("nan")),
@@ -1076,23 +979,15 @@ def main() -> None:
 
     print("\n=== Test (independent holdout) ===")
     print(f"C-index (mixture by gating): {results['test_c_index_mix']:.4f}")
-    print(f"Brier@t0 (mixture): {results['test_brier_mix']:.4f}")
     print(f"C-index (all-only baseline): {results['test_c_index_all']:.4f}")
-    print(f"Brier@t0 (all-only baseline): {results['test_brier_all']:.4f}")
 
-    # CV stats printout
+    # CV stats printout (C-index only)
     print("\n=== CV (train) Cox models ===")
     print(
-        f"Local:  C-index {results['cv_cindex_local_mean']:.4f} ± {results['cv_cindex_local_std']:.4f}, "
-        f"IPCW-Brier {results['cv_brier_local_mean']:.4f} ± {results['cv_brier_local_std']:.4f}"
+        f"Global: C-index {results['cv_cindex_global_mean']:.4f} ± {results['cv_cindex_global_std']:.4f}"
     )
     print(
-        f"Global: C-index {results['cv_cindex_global_mean']:.4f} ± {results['cv_cindex_global_std']:.4f}, "
-        f"IPCW-Brier {results['cv_brier_global_mean']:.4f} ± {results['cv_brier_global_std']:.4f}"
-    )
-    print(
-        f"All:    C-index {results['cv_cindex_all_mean']:.4f} ± {results['cv_cindex_all_std']:.4f}, "
-        f"IPCW-Brier {results['cv_brier_all_mean']:.4f} ± {results['cv_brier_all_std']:.4f}"
+        f"All:    C-index {results['cv_cindex_all_mean']:.4f} ± {results['cv_cindex_all_std']:.4f}"
     )
 
     # Gating feature importance
