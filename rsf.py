@@ -1045,7 +1045,7 @@ def _fit_cox_lifelines(
     corr_thresholds = [0.995, 0.98, 0.95, 0.90]
     penalizers = [0.1, 0.5, 1.0, 5.0, 10.0]
 
-    for corr_thr in _maybe_tqdm(corr_thresholds, total=len(corr_thresholds), desc="Cox sanitize", leave=False):
+    for corr_thr in corr_thresholds:
         try:
             X_sanitized = _sanitize_cox_features_matrix(
                 train_df[feature_cols], corr_threshold=corr_thr, verbose=False
@@ -1065,7 +1065,7 @@ def _fit_cox_lifelines(
             axis=1,
         )
 
-        for pen in _maybe_tqdm(penalizers, total=len(penalizers), desc=f"Cox penalizer(thr={corr_thr})", leave=False):
+        for pen in penalizers:
             cph = CoxPHFitter(penalizer=pen, l1_ratio=0.0)
             try:
                 with warnings.catch_warnings():
@@ -1501,10 +1501,22 @@ def evaluate_three_model_assignment_and_classifier(
     X_tr_cls = tr_df.drop(columns=["PE_Time", "VT/VF/SCD"], errors="ignore")
     X_te_cls = te_df.drop(columns=["PE_Time", "VT/VF/SCD"], errors="ignore")
     _log_progress("Training assignment classifier", True)
-    clf.fit(X_tr_cls, y_tr_assign)
-    y_pred = clf.predict(X_te_cls)
-    acc = float(accuracy_score(y_te_assign, y_pred))
-    f1_macro = float(f1_score(y_te_assign, y_pred, average="macro"))
+    unique_labels = np.unique(y_tr_assign)
+    if unique_labels.size < 2:
+        # Fallback: constant predictor when only one class present in training labels
+        const_label = int(unique_labels[0]) if unique_labels.size == 1 else 0
+        y_pred = np.full_like(y_te_assign, const_label)
+        acc = float(accuracy_score(y_te_assign, y_pred))
+        f1_macro = float(
+            f1_score(y_te_assign, y_pred, average="macro", zero_division=0)
+        )
+    else:
+        clf.fit(X_tr_cls, y_tr_assign)
+        y_pred = clf.predict(X_te_cls)
+        acc = float(accuracy_score(y_te_assign, y_pred))
+        f1_macro = float(
+            f1_score(y_te_assign, y_pred, average="macro", zero_division=0)
+        )
 
     print("\nThree-model assignment via lifelines CoxPH (full-data training/inference):")
     print(
