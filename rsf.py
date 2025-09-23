@@ -579,15 +579,18 @@ def compute_oof_losses(
     cox_alpha: float = 0.1,
     include_female: bool = False,
     cox_clip_value: float = 8.0,
+    cox_alpha_all_multiplier: float = 1.0,
 ) -> Dict[str, np.ndarray]:
     # Control whether Female is part of features
     drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
     if not include_female:
         drop_cols = drop_cols + ["Female"]
     X_all, y_all, feat_names = _prepare_survival_xy(clean_df, drop_cols=drop_cols)
-    all_cols = [c for c in feat_names]
-    global_cols = [c for c in global_cols if c in all_cols]
-    local_cols = [c for c in local_cols if c in all_cols]
+    feat_set = set(feat_names)
+    global_cols = [c for c in global_cols if c in feat_set]
+    local_cols = [c for c in local_cols if c in feat_set]
+    # Use curated union for 'all' instead of all available columns to avoid noise leakage
+    all_cols = sorted(set(global_cols) | set(local_cols))
     if len(global_cols) == 0 or len(local_cols) == 0:
         raise ValueError("GLOBAL_FEATURES 或 LOCAL_FEATURES 为空或与数据不匹配。")
 
@@ -610,7 +613,8 @@ def compute_oof_losses(
 
             # Fit two Cox models: global-only, and all (global+local)
             mdl_gl = _fit_cox(X_tr[global_cols], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
-            mdl_all = _fit_cox(X_tr[all_cols], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
+            alpha_all = float(cox_alpha) * float(cox_alpha_all_multiplier)
+            mdl_all = _fit_cox(X_tr[all_cols], y_tr, alpha=alpha_all, clip_value=cox_clip_value)
 
             # Predict S(t0) for IPCW-Brier (used for meta-labels). C-index will use linear predictors.
             if mdl_gl:
@@ -833,18 +837,20 @@ def evaluate_on_holdout(
     topk_importance: int = 20,
     include_female: bool = False,
     cox_clip_value: float = 8.0,
+    cox_alpha_all_multiplier: float = 1.0,
 ) -> Dict[str, object]:
     # Control whether Female is included as a feature throughout
     drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
     if not include_female:
         drop_cols = drop_cols + ["Female"]
     X_all, y_all, feat_names = _prepare_survival_xy(clean_df, drop_cols=drop_cols)
-    all_cols = [c for c in feat_names]
-    global_cols = [c for c in global_cols if c in all_cols]
+    feat_set = set(feat_names)
+    global_cols = [c for c in global_cols if c in feat_set]
     # Optionally include Female in the global feature set if requested and available
-    if include_female and "Female" in all_cols and "Female" not in global_cols:
+    all_cols = sorted(set(global_cols) | set([c for c in local_cols if c in feat_set]))
+    if include_female and "Female" in feat_set and "Female" not in global_cols:
         global_cols = list(global_cols) + ["Female"]
-    local_cols = [c for c in local_cols if c in all_cols]
+    local_cols = [c for c in local_cols if c in feat_set]
 
     X_tr, X_te, y_tr, y_te = train_test_split(
         X_all, y_all, test_size=test_size, random_state=random_state
@@ -894,7 +900,8 @@ def evaluate_on_holdout(
     # Fit base models on full training set
     _log("Fitting base models on the full training set ...")
     mdl_global = _fit_cox(X_tr[global_cols], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
-    mdl_all = _fit_cox(X_tr[all_cols], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
+    alpha_all = float(cox_alpha) * float(cox_alpha_all_multiplier)
+    mdl_all = _fit_cox(X_tr[all_cols], y_tr, alpha=alpha_all, clip_value=cox_clip_value)
 
     # Predict on test set via learned gating
     _log("Applying gating to test set and computing metrics ...")
@@ -1020,6 +1027,12 @@ def main() -> None:
         default=8.0,
         help="标准化后特征的裁剪阈值(避免线性预测过大导致溢出)",
     )
+    parser.add_argument(
+        "--cox-alpha-all-multiplier",
+        type=float,
+        default=1.0,
+        help="'all' 模型的 alpha 倍乘系数，用于特征更多时加大正则防止过拟合",
+    )
     args = parser.parse_args()
 
     global PROGRESS
@@ -1052,6 +1065,7 @@ def main() -> None:
         topk_importance=args.topk_importance,
         include_female=args.include_female,
         cox_clip_value=args.cox_clip_value,
+        cox_alpha_all_multiplier=args.cox_alpha_all_multiplier,
     )
 
     print("\n=== Gating OOF (train) ===")
