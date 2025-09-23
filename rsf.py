@@ -1185,6 +1185,171 @@ def _predict_risk_lifelines(model: CoxPHFitter, df: pd.DataFrame) -> np.ndarray:
         return np.zeros(len(df), dtype=float)
 
 
+def _forward_select_features_lifelines(
+    df: pd.DataFrame,
+    candidate_features: List[str],
+    time_col: str,
+    event_col: str,
+    random_state: int = 42,
+    max_features: Optional[int] = None,
+    verbose: bool = False,
+) -> List[str]:
+    """Greedy forward selection to maximize validation C-index (lifelines-based).
+
+    - Uses an inner 70/30 split for selection.
+    - Applies sanitization to avoid degenerate columns.
+    - Returns a subset (possibly empty).
+    """
+    df_local = df.dropna(subset=[time_col, event_col]).copy()
+    if df_local.empty:
+        return []
+
+    # Initial candidate pool after basic sanitization
+    try:
+        X_sanitized = _sanitize_cox_features_matrix(
+            df_local[candidate_features], corr_threshold=0.995, verbose=False
+        )
+        pool: List[str] = list(X_sanitized.columns)
+    except Exception:
+        pool = [f for f in candidate_features if f in df_local.columns]
+
+    if len(pool) <= 1:
+        return list(pool)
+
+    # Inner split
+    try:
+        tr_df, va_df = train_test_split(
+            df_local,
+            test_size=0.3,
+            random_state=random_state,
+            stratify=df_local[event_col] if df_local[event_col].nunique() > 1 else None,
+        )
+    except Exception:
+        tr_df, va_df = train_test_split(df_local, test_size=0.3, random_state=random_state)
+
+    selected: List[str] = []
+    best_val_cidx: float = -np.inf
+    remaining = list(pool)
+    max_iters = (
+        len(remaining) if max_features is None else max(0, min(len(remaining), max_features))
+    )
+
+    for step_idx in range(max_iters):
+        best_feat = None
+        best_feat_cidx = best_val_cidx
+        if verbose:
+            try:
+                print(
+                    f"[FS][Forward] seed={random_state} step={step_idx+1}/{max_iters} remaining={len(remaining)}"
+                )
+            except Exception:
+                pass
+        for feat in list(remaining):
+            trial_feats = selected + [feat]
+            try:
+                cph = _fit_cox_lifelines(tr_df, trial_feats, time_col, event_col)
+                if cph is None:
+                    cidx = np.nan
+                else:
+                    risk_val = _predict_risk_lifelines(cph, va_df)
+                    cidx = concordance_index(
+                        va_df[time_col].values, -risk_val, va_df[event_col].values
+                    )
+            except Exception:
+                cidx = np.nan
+            if np.isfinite(cidx) and (cidx > best_feat_cidx + 1e-12):
+                best_feat_cidx = float(cidx)
+                best_feat = feat
+
+        if best_feat is None:
+            break
+        selected.append(best_feat)
+        remaining.remove(best_feat)
+        best_val_cidx = best_feat_cidx
+        if verbose:
+            try:
+                print(f"[FS][Forward] + {best_feat} -> val c-index={best_val_cidx:.4f}")
+            except Exception:
+                pass
+
+    return selected
+
+
+def _stability_select_features_lifelines(
+    df: pd.DataFrame,
+    candidate_features: List[str],
+    time_col: str,
+    event_col: str,
+    seeds: List[int],
+    threshold: float = 0.5,
+    max_features: Optional[int] = None,
+    verbose: bool = False,
+) -> List[str]:
+    """Run forward selection across multiple seeds and keep features
+    with selection frequency >= threshold.
+    """
+    if df is None or df.empty:
+        return []
+
+    # Initial sanitized pool
+    try:
+        X_pool = _sanitize_cox_features_matrix(
+            df[candidate_features], corr_threshold=0.995, verbose=False
+        )
+        pool = list(X_pool.columns)
+    except Exception:
+        pool = [f for f in candidate_features if f in df.columns]
+
+    if len(pool) == 0:
+        return []
+
+    from collections import Counter
+
+    counter: Counter = Counter()
+    total_runs = 0
+    for idx, s in enumerate(seeds, start=1):
+        try:
+            if verbose:
+                try:
+                    print(f"[FS][Stability] seed {idx}/{len(seeds)} -> start")
+                except Exception:
+                    pass
+            sel = _forward_select_features_lifelines(
+                df=df,
+                candidate_features=list(pool),
+                time_col=time_col,
+                event_col=event_col,
+                random_state=s,
+                max_features=max_features,
+                verbose=verbose,
+            )
+            if sel:
+                counter.update(sel)
+            total_runs += 1
+        except Exception:
+            continue
+
+    if total_runs == 0 or not counter:
+        return list(pool)
+
+    ranked = list(counter.most_common())
+    kept: List[str] = []
+    for feat, count in ranked:
+        freq = count / total_runs
+        if freq >= threshold:
+            kept.append(feat)
+
+    # Final sanitization
+    if kept:
+        try:
+            X_final = _sanitize_cox_features_matrix(
+                df[kept], corr_threshold=0.995, verbose=False
+            )
+            return list(X_final.columns)
+        except Exception:
+            return kept
+    return []
+
 def _compute_oof_three_risks_lifelines(
     df: pd.DataFrame,
     global_cols: List[str],
@@ -1301,22 +1466,42 @@ def evaluate_three_model_assignment_and_classifier(
         axis=1,
     )
 
-    # OOF risks on full data (for assignment labels)
-    risk_gl_oof, risk_lo_oof, risk_all_oof = _compute_oof_three_risks_lifelines(
-        df_model,
-        global_cols,
-        local_cols,
-        time_col="PE_Time",
-        event_col="VT/VF/SCD",
-        n_splits=5,
-        random_state=random_state,
-    )
+    # Candidate feature sets for three models
+    cand_glob = [c for c in global_cols if c in df_model.columns]
+    cand_local = [c for c in local_cols if c in df_model.columns]
+    cand_all = [c for c in feat_all_cols if c in df_model.columns]
 
+    # Forward selection per model on an inner split; then refit on full data and infer on full data
+    seeds_for_stability = list(range(10))
+    sel_glob = _stability_select_features_lifelines(
+        df_model, cand_glob, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
+    ) if len(cand_glob) > 0 else []
+    sel_local = _stability_select_features_lifelines(
+        df_model, cand_local, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
+    ) if len(cand_local) > 0 else []
+    sel_all = _stability_select_features_lifelines(
+        df_model, cand_all, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
+    ) if len(cand_all) > 0 else []
+
+    # Ensure non-empty by falling back to candidate lists
+    use_glob = sel_glob if sel_glob else cand_glob
+    use_local = sel_local if sel_local else cand_local
+    use_all = sel_all if sel_all else cand_all
+
+    # Fit on all data
+    model_gl = _fit_cox_lifelines(df_model, use_glob, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_glob) > 0 else None
+    model_lo = _fit_cox_lifelines(df_model, use_local, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_local) > 0 else None
+    model_all = _fit_cox_lifelines(df_model, use_all, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_all) > 0 else None
+
+    # Inference on all data
+    risk_gl_full = _predict_risk_lifelines(model_gl, df_model) if model_gl is not None else np.zeros(len(df_model))
+    risk_lo_full = _predict_risk_lifelines(model_lo, df_model) if model_lo is not None else np.zeros(len(df_model))
+    risk_all_full = _predict_risk_lifelines(model_all, df_model) if model_all is not None else np.zeros(len(df_model))
+
+    # Assignment on all data based on events
     evt = df_model["VT/VF/SCD"].values.astype(int)
-    # Choose per-sample best model among 0=Global, 1=Local, 2=All
-    risks_stack = np.vstack([risk_gl_oof, risk_lo_oof, risk_all_oof])  # shape (3, n)
+    risks_stack = np.vstack([risk_gl_full, risk_lo_full, risk_all_full])
     best_idx = np.zeros(len(df_model), dtype=int)
-    # Event -> argmax risk; No-event -> argmin risk
     best_idx[evt == 1] = np.argmax(risks_stack[:, evt == 1], axis=0)
     best_idx[evt == 0] = np.argmin(risks_stack[:, evt == 0], axis=0)
 
@@ -1387,9 +1572,9 @@ def evaluate_three_model_assignment_and_classifier(
     acc = float(accuracy_score(y_te_assign, y_pred))
     f1_macro = float(f1_score(y_te_assign, y_pred, average="macro"))
 
-    print("\nThree-model assignment via lifelines CoxPH:")
+    print("\nThree-model assignment via lifelines CoxPH (full-data training/inference):")
     print(
-        f"- Global cols: {len(global_cols)}, Local cols: {len(local_cols)}, All cols: {len(feat_all_cols)}"
+        f"- Selected | Global: {len(use_glob)} | Local: {len(use_local)} | All: {len(use_all)}"
     )
     print(
         f"- Test C-index | Global: {cidx_gl:.4f} | Local: {cidx_lo:.4f} | All: {cidx_all:.4f}"
@@ -1478,6 +1663,10 @@ def evaluate_three_model_assignment_and_classifier(
             assign_df.to_csv(
                 os.path.join(output_dir, "assignment_labels_all.csv"), index=False
             )
+            with open(os.path.join(output_dir, "selected_features.txt"), "w") as f:
+                f.write("Global:\n" + ",".join(use_glob) + "\n")
+                f.write("Local:\n" + ",".join(use_local) + "\n")
+                f.write("All:\n" + ",".join(use_all) + "\n")
     except Exception:
         pass
 
@@ -1540,14 +1729,19 @@ def evaluate_three_model_assignment_and_classifier(
         "c_index_all": float(cidx_all),
         "accuracy": acc,
         "macro_f1": f1_macro,
-        "n_train": int(len(tr_df)),
-        "n_test": int(len(te_df)),
+        "n_train": int(len(df_model)),
+        "n_test": int(len(df_model)),
         "assignment_all_labels": [int(v) for v in best_idx.tolist()],
         "assignment_all_ids": (
             df_model["MRN"].tolist()
             if "MRN" in df_model.columns
             else list(range(len(df_model)))
         ),
+        "selected_features": {
+            "global": use_glob,
+            "local": use_local,
+            "all": use_all,
+        },
     }
 
 
