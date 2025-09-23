@@ -1350,7 +1350,7 @@ def _compute_oof_three_risks_lifelines(
 
 def evaluate_three_model_assignment_and_classifier(
     clean_df: pd.DataFrame,
-    test_size: float = 0.25,
+    test_size: float = 0.30,
     random_state: int = 42,
     output_dir: Optional[str] = None,
 ) -> Dict[str, object]:
@@ -1566,7 +1566,7 @@ def evaluate_three_model_assignment_and_classifier(
             f1_score(y_te_assign, y_pred, average="macro", zero_division=0)
         )
 
-    print("\nThree-model assignment via lifelines CoxPH (full-data training/inference):")
+    print("\nThree-model assignment via lifelines CoxPH (train/test split):")
     print(
         f"- Selected | Global: {len(use_glob)} | Local: {len(use_local)} | All: {len(use_all)}"
     )
