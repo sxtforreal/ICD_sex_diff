@@ -1151,8 +1151,10 @@ def evaluate_three_model_assignment_and_classifier(
 
     # Build a modeling DataFrame for lifelines containing all features
     feat_all_cols = [c for c in feature_names]
+    # 保留 MRN（若存在）用于输出标识；模型训练时会自动忽略 MRN
+    left_cols = ["PE_Time", "VT/VF/SCD"] + (["MRN"] if "MRN" in df.columns else [])
     df_model = pd.concat([
-        df[["PE_Time", "VT/VF/SCD"]].reset_index(drop=True),
+        df[left_cols].reset_index(drop=True),
         X_all[feat_all_cols].reset_index(drop=True)
     ], axis=1)
 
@@ -1169,7 +1171,7 @@ def evaluate_three_model_assignment_and_classifier(
     best_idx[evt == 1] = np.argmax(risks_stack[:, evt == 1], axis=0)
     best_idx[evt == 0] = np.argmin(risks_stack[:, evt == 0], axis=0)
 
-    # Train/test split for classifier and evaluation
+    # Train/test split for classifier and evaluation（用于评估，不影响全体标签的产生与保存）
     tr_idx, te_idx = train_test_split(
         np.arange(len(df_model)), test_size=test_size, random_state=random_state, stratify=evt
     )
@@ -1241,7 +1243,7 @@ def evaluate_three_model_assignment_and_classifier(
     except Exception:
         pass
 
-    # Counts plot of assigned groups
+    # Counts plot of assigned groups（基于全体 OOF 标签）
     try:
         counts = pd.Series({"Global": int((best_idx==0).sum()), "Local": int((best_idx==1).sum()), "All": int((best_idx==2).sum())})
         _plot_series_barh(
@@ -1256,6 +1258,56 @@ def evaluate_three_model_assignment_and_classifier(
     except Exception:
         pass
 
+    # Save and return per-sample assignment labels for the full dataset
+    try:
+        mapping = {0: "Global", 1: "Local", 2: "All"}
+        id_series = df_model["MRN"] if "MRN" in df_model.columns else pd.Series(np.arange(len(df_model)), name="index")
+        assign_df = pd.DataFrame({
+            id_series.name: id_series.values,
+            "assignment_label": best_idx.astype(int),
+            "assignment_group": pd.Series(best_idx).map(mapping).fillna("").values,
+        })
+        if output_dir:
+            _ensure_dir(output_dir)
+            assign_df.to_csv(os.path.join(output_dir, "assignment_labels_all.csv"), index=False)
+    except Exception:
+        pass
+
+    # Reverse feature analysis on ALL samples: train classifier on full X to predict assignment
+    try:
+        from sklearn.pipeline import Pipeline as SkPipeline
+        from sklearn.preprocessing import StandardScaler as SkStandardScaler
+        X_cls_all = df_model.drop(columns=["PE_Time", "VT/VF/SCD", "MRN"], errors="ignore")
+        y_cls_all = best_idx.astype(int)
+        clf_all = SkPipeline([
+            ("scaler", SkStandardScaler()),
+            ("clf", LogisticRegression(multi_class="multinomial", solver="lbfgs", max_iter=2000)),
+        ])
+        clf_all.fit(X_cls_all, y_cls_all)
+        lr_all = clf_all.named_steps.get("clf")
+        if lr_all is not None and hasattr(lr_all, "coef_"):
+            coef_all = lr_all.coef_
+            feat_all = X_cls_all.columns.to_list()
+            coef_df_all = pd.DataFrame(coef_all, columns=feat_all, index=["Global","Local","All"]).T
+            if output_dir:
+                _ensure_dir(output_dir)
+                coef_df_all.to_csv(os.path.join(output_dir, "assignment_coefficients_all.csv"))
+            # Plot top features per class
+            topk = 20
+            for cls in ["Global","Local","All"]:
+                ser = coef_df_all[cls].abs().sort_values(ascending=False).head(topk)
+                _plot_series_barh(
+                    ser,
+                    topn=len(ser),
+                    title=f"Assignment predictor (ALL data): top features for {cls}",
+                    xlabel="|coefficient|",
+                    output_dir=output_dir,
+                    filename=f"assignment_full_top_{cls.lower()}.png",
+                    color="#2ca02c" if cls=="Global" else ("#ff7f0e" if cls=="Local" else "#1f77b4"),
+                )
+    except Exception:
+        pass
+
     return {
         "c_index_global": float(cidx_gl),
         "c_index_local": float(cidx_lo),
@@ -1264,6 +1316,8 @@ def evaluate_three_model_assignment_and_classifier(
         "macro_f1": f1_macro,
         "n_train": int(len(tr_df)),
         "n_test": int(len(te_df)),
+        "assignment_all_labels": [int(v) for v in best_idx.tolist()],
+        "assignment_all_ids": (df_model["MRN"].tolist() if "MRN" in df_model.columns else list(range(len(df_model)))),
     }
 
 
@@ -1993,9 +2047,9 @@ def train_assignment_classifier_and_tableone(
 
 def main():
     clean_df = load_dataframes()
-    figs_dir = os.path.join("figures", "coxph_baseline")
-    # 仅运行基础 CoxPH 训练评估，不再进行门控/二阶段/三分区规则等步骤
-    _ = train_coxph_model(
+    figs_dir = os.path.join("figures", "three_model_assignment")
+    # 运行三模型+指派+反向特征分析
+    _ = evaluate_three_model_assignment_and_classifier(
         clean_df,
         output_dir=figs_dir,
     )
