@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
+from collections import Counter
 
 import argparse
 import os
@@ -662,6 +663,68 @@ def _forward_select_max_cindex(
                 pass
     return selected
 
+
+def _stability_select_features(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    candidate_cols: List[str],
+    seeds: List[int],
+    max_features: Optional[int] = None,
+    threshold: float = 0.4,
+    cox_alpha: float = 0.1,
+    clip_value: float = 8.0,
+    verbose: bool = False,
+) -> List[str]:
+    """Run forward selection across multiple seeds and keep features with
+    selection frequency >= threshold, mirroring cox.py's stability scheme.
+
+    Returns a possibly empty list; callers should fallback appropriately.
+    """
+    pool = _sanitize_feature_pool(X, candidate_cols, corr_threshold=0.995)
+    if len(pool) == 0:
+        return []
+
+    counter: Counter = Counter()
+    total_runs = 0
+    for idx, s in enumerate(list(seeds)):
+        try:
+            if verbose:
+                try:
+                    _log(f"[FS][Stability] seed {idx+1}/{len(seeds)}")
+                except Exception:
+                    pass
+            sel = _forward_select_max_cindex(
+                X,
+                y,
+                candidate_cols=list(pool),
+                random_state=int(s),
+                max_features=max_features,
+                cox_alpha=cox_alpha,
+                clip_value=clip_value,
+                verbose=False,
+            )
+            if sel:
+                counter.update(sel)
+            total_runs += 1
+        except Exception:
+            continue
+
+    if total_runs == 0 or not counter:
+        return list(pool)
+
+    kept: List[str] = []
+    for feat, cnt in counter.most_common():
+        freq = float(cnt) / float(total_runs)
+        if freq >= float(threshold):
+            kept.append(str(feat))
+
+    if not kept:
+        return list(pool)
+
+    # Final sanitization to avoid collinearity
+    kept_final = _sanitize_feature_pool(X, kept, corr_threshold=0.995)
+    return list(kept_final)
+
 # =============================
 # Step 1: K 折 OOF 双模型损失（global vs global+local）
 # =============================
@@ -975,6 +1038,9 @@ def evaluate_on_holdout(
     cox_clip_value: float = 8.0,
     use_feature_selection: bool = False,
     fs_max_features: Optional[int] = None,
+    use_stability_selection: bool = False,
+    stability_seeds: int = 20,
+    stability_threshold: float = 0.4,
 ) -> Dict[str, object]:
     # Control whether Female is included as a feature throughout
     drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
@@ -1006,6 +1072,45 @@ def evaluate_on_holdout(
     df_te["VT/VF/SCD"] = y_te[e_field_te].astype(int)
     df_te["PE_Time"] = y_te[t_field_te].astype(float)
 
+    # Optional stability selection on training split to freeze feature specs (align with cox.py)
+    if use_stability_selection:
+        try:
+            seeds = list(range(max(1, int(stability_seeds))))
+            _log(
+                f"Running stability selection on training split ... seeds={len(seeds)}, threshold={stability_threshold}"
+            )
+            stable_global = _stability_select_features(
+                X_tr,
+                y_tr,
+                candidate_cols=list(global_cols),
+                seeds=seeds,
+                max_features=fs_max_features,
+                threshold=float(stability_threshold),
+                cox_alpha=cox_alpha,
+                clip_value=cox_clip_value,
+                verbose=False,
+            )
+            if stable_global:
+                global_cols = list(stable_global)
+            stable_all = _stability_select_features(
+                X_tr,
+                y_tr,
+                candidate_cols=list(all_cols),
+                seeds=seeds,
+                max_features=fs_max_features,
+                threshold=float(stability_threshold),
+                cox_alpha=cox_alpha,
+                clip_value=cox_clip_value,
+                verbose=False,
+            )
+            if stable_all:
+                all_cols = list(stable_all)
+            _log(
+                f"Stability-selected feature counts -> global={len(global_cols)}, all={len(all_cols)}"
+            )
+        except Exception:
+            pass
+
     _log("Computing OOF losses on training set for meta-labels ...")
     oof_tr = compute_oof_losses(
         clean_df=df_tr,
@@ -1018,7 +1123,7 @@ def evaluate_on_holdout(
         cox_alpha=cox_alpha,
         include_female=include_female,
         cox_clip_value=cox_clip_value,
-        use_feature_selection=use_feature_selection,
+        use_feature_selection=use_feature_selection and not use_stability_selection,
         fs_max_features=fs_max_features,
     )
 
@@ -1041,7 +1146,8 @@ def evaluate_on_holdout(
     # Optionally perform feature selection on the full training split before final fit
     sel_global_final = list(global_cols)
     sel_all_final = list(all_cols)
-    if use_feature_selection:
+    # If stability selection is enabled, we already froze global_cols/all_cols above.
+    if use_feature_selection and not use_stability_selection:
         try:
             sel_global_final = _forward_select_max_cindex(
                 X_tr, y_tr, global_cols, random_state=random_state, max_features=fs_max_features,
@@ -1204,6 +1310,23 @@ def main() -> None:
         help="关闭前向特征选择以加速调试（覆盖默认开启）",
     )
     parser.add_argument(
+        "--use-stability-selection",
+        action="store_true",
+        help="启用稳定性选择：多随机种子重复前向选择，保留高频特征（与 cox.py 一致）",
+    )
+    parser.add_argument(
+        "--stability-seeds",
+        type=int,
+        default=20,
+        help="稳定性选择使用的随机种子数量（默认 20）",
+    )
+    parser.add_argument(
+        "--stability-threshold",
+        type=float,
+        default=0.4,
+        help="特征保留频率阈值（默认 0.4）",
+    )
+    parser.add_argument(
         "--fs-max-features",
         type=int,
         default=None,
@@ -1243,14 +1366,20 @@ def main() -> None:
         cox_clip_value=args.cox_clip_value,
         use_feature_selection=args.use_feature_selection,
         fs_max_features=args.fs_max_features,
+        use_stability_selection=args.use_stability_selection,
+        stability_seeds=args.stability_seeds,
+        stability_threshold=args.stability_threshold,
     )
 
     # Print basic run configuration
     try:
         print("\n=== Run configuration ===")
         print(f"Feature selection: {'ON' if args.use_feature_selection else 'OFF'}")
+        print(f"Stability selection: {'ON' if args.use_stability_selection else 'OFF'}")
         if args.fs_max_features is not None:
             print(f"FS max features: {args.fs_max_features}")
+        if args.use_stability_selection:
+            print(f"Stability seeds: {args.stability_seeds}, threshold: {args.stability_threshold}")
         print(f"Cox alpha: {args.cox_alpha}")
         print(f"Horizon days: {args.horizon_days}")
         print(f"KFold: {args.kfold}, Repeats: {args.repeats}")
