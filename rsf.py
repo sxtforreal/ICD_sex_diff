@@ -1353,6 +1353,8 @@ def evaluate_three_model_assignment_and_classifier(
     test_size: float = 0.30,
     random_state: int = 42,
     output_dir: Optional[str] = None,
+    quiet: bool = False,
+    produce_outputs: bool = True,
 ) -> Dict[str, object]:
     """Lifelines CoxPH for three feature sets (Global/Local/All),
     assign per-patient best model without fixed horizon, and train a classifier to predict the assignment.
@@ -1566,156 +1568,161 @@ def evaluate_three_model_assignment_and_classifier(
             f1_score(y_te_assign, y_pred, average="macro", zero_division=0)
         )
 
-    print("\nThree-model assignment via lifelines CoxPH (train/test split):")
-    print(
-        f"- Selected | Global: {len(use_glob)} | Local: {len(use_local)} | All: {len(use_all)}"
-    )
-    print(
-        f"- Test C-index | Global: {cidx_gl:.4f} | Local: {cidx_lo:.4f} | All: {cidx_all:.4f}"
-    )
-    print(f"- Assignment classifier | Acc: {acc:.4f} | F1-macro: {f1_macro:.4f}")
-    try:
+    if not quiet:
+        print("\nThree-model assignment via lifelines CoxPH (train/test split):")
         print(
-            classification_report(
-                y_te_assign, y_pred, target_names=["Global", "Local", "All"]
-            )
+            f"- Selected | Global: {len(use_glob)} | Local: {len(use_local)} | All: {len(use_all)}"
         )
-    except Exception:
-        pass
+        print(
+            f"- Test C-index | Global: {cidx_gl:.4f} | Local: {cidx_lo:.4f} | All: {cidx_all:.4f}"
+        )
+        print(f"- Assignment classifier | Acc: {acc:.4f} | F1-macro: {f1_macro:.4f}")
+        try:
+            print(
+                classification_report(
+                    y_te_assign, y_pred, target_names=["Global", "Local", "All"]
+                )
+            )
+        except Exception:
+            pass
 
     # Visualize classifier top coefficients per class
-    try:
-        lr = clf.named_steps.get("clf")
-        if lr is not None and hasattr(lr, "coef_"):
-            coef = lr.coef_
-            feat = X_tr_cls.columns.to_list()
-            coef_df = pd.DataFrame(
-                coef, columns=feat, index=["Global", "Local", "All"]
-            ).T
-            if output_dir:
-                _ensure_dir(output_dir)
-                coef_df.to_csv(
-                    os.path.join(output_dir, "assignment_lifelines_coef.csv")
-                )
-            topk = 15
-            for cls in ["Global", "Local", "All"]:
-                ser = coef_df[cls].abs().sort_values(ascending=False).head(topk)
-                _plot_series_barh(
-                    ser,
-                    topn=len(ser),
-                    title=f"Assignment classifier top features for {cls}",
-                    xlabel="|coefficient|",
-                    output_dir=output_dir,
-                    filename=f"assignment_lifelines_top_{cls.lower()}.png",
-                    color=(
-                        "#2ca02c"
-                        if cls == "Global"
-                        else ("#ff7f0e" if cls == "Local" else "#1f77b4")
-                    ),
-                )
-    except Exception:
-        pass
+    if produce_outputs:
+        try:
+            lr = clf.named_steps.get("clf")
+            if lr is not None and hasattr(lr, "coef_"):
+                coef = lr.coef_
+                feat = X_tr_cls.columns.to_list()
+                coef_df = pd.DataFrame(
+                    coef, columns=feat, index=["Global", "Local", "All"]
+                ).T
+                if output_dir:
+                    _ensure_dir(output_dir)
+                    coef_df.to_csv(
+                        os.path.join(output_dir, "assignment_lifelines_coef.csv")
+                    )
+                topk = 15
+                for cls in ["Global", "Local", "All"]:
+                    ser = coef_df[cls].abs().sort_values(ascending=False).head(topk)
+                    _plot_series_barh(
+                        ser,
+                        topn=len(ser),
+                        title=f"Assignment classifier top features for {cls}",
+                        xlabel="|coefficient|",
+                        output_dir=output_dir,
+                        filename=f"assignment_lifelines_top_{cls.lower()}.png",
+                        color=(
+                            "#2ca02c"
+                            if cls == "Global"
+                            else ("#ff7f0e" if cls == "Local" else "#1f77b4")
+                        ),
+                    )
+        except Exception:
+            pass
 
     # Counts plot of assigned groups (based on all OOF labels)
-    try:
-        counts = pd.Series(
-            {
-                "Global": int((best_idx == 0).sum()),
-                "Local": int((best_idx == 1).sum()),
-                "All": int((best_idx == 2).sum()),
-            }
-        )
-        _plot_series_barh(
-            counts,
-            topn=len(counts),
-            title="Assigned best model counts (OOF)",
-            xlabel="Count",
-            output_dir=output_dir,
-            filename="assignment_lifelines_counts.png",
-            color="#9467bd",
-        )
-    except Exception:
-        pass
+    if produce_outputs:
+        try:
+            counts = pd.Series(
+                {
+                    "Global": int((best_idx == 0).sum()),
+                    "Local": int((best_idx == 1).sum()),
+                    "All": int((best_idx == 2).sum()),
+                }
+            )
+            _plot_series_barh(
+                counts,
+                topn=len(counts),
+                title="Assigned best model counts (OOF)",
+                xlabel="Count",
+                output_dir=output_dir,
+                filename="assignment_lifelines_counts.png",
+                color="#9467bd",
+            )
+        except Exception:
+            pass
 
     # Save and return per-sample assignment labels for the full dataset
-    try:
-        mapping = {0: "Global", 1: "Local", 2: "All"}
-        id_series = (
-            df_model["MRN"]
-            if "MRN" in df_model.columns
-            else pd.Series(np.arange(len(df_model)), name="index")
-        )
-        assign_df = pd.DataFrame(
-            {
-                id_series.name: id_series.values,
-                "assignment_label": best_idx.astype(int),
-                "assignment_group": pd.Series(best_idx).map(mapping).fillna("").values,
-            }
-        )
-        if output_dir:
-            _ensure_dir(output_dir)
-            assign_df.to_csv(
-                os.path.join(output_dir, "assignment_labels_all.csv"), index=False
+    if produce_outputs:
+        try:
+            mapping = {0: "Global", 1: "Local", 2: "All"}
+            id_series = (
+                df_model["MRN"]
+                if "MRN" in df_model.columns
+                else pd.Series(np.arange(len(df_model)), name="index")
             )
-            with open(os.path.join(output_dir, "selected_features.txt"), "w") as f:
-                f.write("Global:\n" + ",".join(use_glob) + "\n")
-                f.write("Local:\n" + ",".join(use_local) + "\n")
-                f.write("All:\n" + ",".join(use_all) + "\n")
-    except Exception:
-        pass
-
-    # Reverse feature analysis on ALL samples: train classifier on full X to predict assignment
-    try:
-        from sklearn.pipeline import Pipeline as SkPipeline
-        from sklearn.preprocessing import StandardScaler as SkStandardScaler
-
-        X_cls_all = df_model.drop(
-            columns=["PE_Time", "VT/VF/SCD", "MRN"], errors="ignore"
-        )
-        y_cls_all = best_idx.astype(int)
-        clf_all = SkPipeline(
-            [
-                ("scaler", SkStandardScaler()),
-                (
-                    "clf",
-                    LogisticRegression(
-                        multi_class="multinomial", solver="lbfgs", max_iter=2000
-                    ),
-                ),
-            ]
-        )
-        clf_all.fit(X_cls_all, y_cls_all)
-        lr_all = clf_all.named_steps.get("clf")
-        if lr_all is not None and hasattr(lr_all, "coef_"):
-            coef_all = lr_all.coef_
-            feat_all = X_cls_all.columns.to_list()
-            coef_df_all = pd.DataFrame(
-                coef_all, columns=feat_all, index=["Global", "Local", "All"]
-            ).T
+            assign_df = pd.DataFrame(
+                {
+                    id_series.name: id_series.values,
+                    "assignment_label": best_idx.astype(int),
+                    "assignment_group": pd.Series(best_idx).map(mapping).fillna("").values,
+                }
+            )
             if output_dir:
                 _ensure_dir(output_dir)
-                coef_df_all.to_csv(
-                    os.path.join(output_dir, "assignment_coefficients_all.csv")
+                assign_df.to_csv(
+                    os.path.join(output_dir, "assignment_labels_all.csv"), index=False
                 )
-            # Plot top features per class
-            topk = 20
-            for cls in ["Global", "Local", "All"]:
-                ser = coef_df_all[cls].abs().sort_values(ascending=False).head(topk)
-                _plot_series_barh(
-                    ser,
-                    topn=len(ser),
-                    title=f"Assignment predictor (ALL data): top features for {cls}",
-                    xlabel="|coefficient|",
-                    output_dir=output_dir,
-                    filename=f"assignment_full_top_{cls.lower()}.png",
-                    color=(
-                        "#2ca02c"
-                        if cls == "Global"
-                        else ("#ff7f0e" if cls == "Local" else "#1f77b4")
+                with open(os.path.join(output_dir, "selected_features.txt"), "w") as f:
+                    f.write("Global:\n" + ",".join(use_glob) + "\n")
+                    f.write("Local:\n" + ",".join(use_local) + "\n")
+                    f.write("All:\n" + ",".join(use_all) + "\n")
+        except Exception:
+            pass
+
+    # Reverse feature analysis on ALL samples: train classifier on full X to predict assignment
+    if produce_outputs:
+        try:
+            from sklearn.pipeline import Pipeline as SkPipeline
+            from sklearn.preprocessing import StandardScaler as SkStandardScaler
+
+            X_cls_all = df_model.drop(
+                columns=["PE_Time", "VT/VF/SCD", "MRN"], errors="ignore"
+            )
+            y_cls_all = best_idx.astype(int)
+            clf_all = SkPipeline(
+                [
+                    ("scaler", SkStandardScaler()),
+                    (
+                        "clf",
+                        LogisticRegression(
+                            multi_class="multinomial", solver="lbfgs", max_iter=2000
+                        ),
                     ),
-                )
-    except Exception:
-        pass
+                ]
+            )
+            clf_all.fit(X_cls_all, y_cls_all)
+            lr_all = clf_all.named_steps.get("clf")
+            if lr_all is not None and hasattr(lr_all, "coef_"):
+                coef_all = lr_all.coef_
+                feat_all = X_cls_all.columns.to_list()
+                coef_df_all = pd.DataFrame(
+                    coef_all, columns=feat_all, index=["Global", "Local", "All"]
+                ).T
+                if output_dir:
+                    _ensure_dir(output_dir)
+                    coef_df_all.to_csv(
+                        os.path.join(output_dir, "assignment_coefficients_all.csv")
+                    )
+                # Plot top features per class
+                topk = 20
+                for cls in ["Global", "Local", "All"]:
+                    ser = coef_df_all[cls].abs().sort_values(ascending=False).head(topk)
+                    _plot_series_barh(
+                        ser,
+                        topn=len(ser),
+                        title=f"Assignment predictor (ALL data): top features for {cls}",
+                        xlabel="|coefficient|",
+                        output_dir=output_dir,
+                        filename=f"assignment_full_top_{cls.lower()}.png",
+                        color=(
+                            "#2ca02c"
+                            if cls == "Global"
+                            else ("#ff7f0e" if cls == "Local" else "#1f77b4")
+                        ),
+                    )
+        except Exception:
+            pass
 
     return {
         "c_index_global": float(cidx_gl),
@@ -1759,7 +1766,9 @@ def run_assignment_experiments(
             clean_df=clean_df,
             test_size=test_size,
             random_state=s,
-            output_dir=output_dir,
+            output_dir=None,
+            quiet=True,
+            produce_outputs=False,
         )
         per_run.append(
             {
@@ -1823,10 +1832,22 @@ def run_assignment_experiments(
     except Exception:
         pass
 
+    # Final single run on full dataset with outputs (plots/CSVs)
+    _log_progress("Final full-data run for outputs", True)
+    final_run = evaluate_three_model_assignment_and_classifier(
+        clean_df=clean_df,
+        test_size=test_size,
+        random_state=random_state,
+        output_dir=output_dir,
+        quiet=False,
+        produce_outputs=True,
+    )
+
     return {
         "per_run": per_run,
         "summary": summary,
         "runs": int(len(seeds)),
+        "final_run": final_run,
     }
 
 
