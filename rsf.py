@@ -24,23 +24,33 @@ from lifelines import CoxPHFitter
 from lifelines.utils import concordance_index
 from lifelines.exceptions import ConvergenceWarning
 
-# Optional progress bars
-try:
-    from tqdm.auto import tqdm as _tqdm
-    _HAS_TQDM = True
-except Exception:
-    _HAS_TQDM = False
-
-# Global control for showing progress bars
+# Global control for showing progress logs
 PROGRESS = True
 
 def _maybe_tqdm(iterable, total=None, desc=None, leave=False):
-    if _HAS_TQDM and PROGRESS:
-        try:
-            return _tqdm(iterable, total=total, desc=desc, leave=leave)
-        except Exception:
-            return iterable
-    return iterable
+    """Lightweight progress wrapper that prints textual progress instead of tqdm bars."""
+    if not PROGRESS:
+        return iterable
+    # Try to infer total if not provided and iterable is sized
+    try:
+        inferred_total = len(iterable) if total is None and hasattr(iterable, "__len__") else total
+    except Exception:
+        inferred_total = total
+
+    def _generator():
+        count = 0
+        for item in iterable:
+            count += 1
+            if desc:
+                if inferred_total is not None:
+                    _log_progress(f"{desc}: {count}/{inferred_total}", True)
+                else:
+                    _log_progress(f"{desc}: {count}", True)
+            yield item
+        if desc and leave:
+            _log_progress(f"{desc}: done", True)
+
+    return _generator()
 
 # Global max iterations for lifelines CoxPHFitter (None = library default)
 MAX_LIFELINES_STEPS: Optional[int] = None
@@ -212,131 +222,7 @@ def _plot_series_barh(
     _save_fig(fig, output_dir, filename)
 
 
-def _plot_cindex_bars(metrics: Dict[str, float], output_dir: Optional[str]) -> None:
-    labels = ["All", "Global", "Local"]
-    keys = [
-        "c_index_all",
-        "c_index_global",
-        "c_index_local",
-    ]
-    vals = [float(metrics.get(k, np.nan)) for k in keys]
-    fig, ax = plt.subplots(figsize=(6.5, 4.2))
-    ax.bar(labels, vals, color=["#e41a1c", "#4daf4a", "#377eb8"])
-    ax.set_ylabel("C-index (test)")
-    ax.set_ylim(0.0, 1.0)
-    ax.set_title("C-index comparison (CoxPH)")
-    for i, v in enumerate(vals):
-        if np.isfinite(v):
-            ax.text(i, v + 0.02, f"{v:.3f}", ha="center", va="bottom", fontsize=10)
-    fig.tight_layout()
-    _save_fig(fig, output_dir, "cindex_comparison.png")
-
-
-def _plot_gating_hist(
-    values: np.ndarray,
-    thr_low: float,
-    thr_high: float,
-    label: str,
-    output_dir: Optional[str],
-) -> None:
-    # Gating functionality removed; keep as no-op for backward compatibility.
-    return
-
-
-def _plot_zone_counts(metrics: Dict[str, float], output_dir: Optional[str]) -> None:
-    n_low = int(metrics.get("n_zone_low", 0))
-    n_mid = int(metrics.get("n_zone_mid", 0))
-    n_high = int(metrics.get("n_zone_high", 0))
-    if (n_low + n_mid + n_high) == 0:
-        return
-    fig, ax = plt.subplots(figsize=(5.8, 4.0))
-    labels = ["Low", "Mid", "High"]
-    vals = [n_low, n_mid, n_high]
-    colors = ["#4daf4a", "#377eb8", "#e41a1c"]
-    ax.bar(labels, vals, color=colors)
-    ax.set_ylabel("Count (test)")
-    ax.set_title("Zone counts by gating thresholds")
-    for i, v in enumerate(vals):
-        ax.text(i, v + max(1, 0.02 * max(vals)), str(v), ha="center", va="bottom")
-    fig.tight_layout()
-    _save_fig(fig, output_dir, "zone_counts.png")
-
-
-def _plot_cindex_bars_generic(
-    labels: List[str],
-    vals: List[float],
-    title: str,
-    output_dir: Optional[str],
-    filename: str,
-) -> None:
-    fig, ax = plt.subplots(figsize=(6.8, 4.4))
-    ax.bar(labels, vals, color="#1f77b4")
-    ax.set_ylabel("C-index (test)")
-    ax.set_ylim(0.0, 1.0)
-    ax.set_title(title)
-    for i, v in enumerate(vals):
-        if np.isfinite(v):
-            ax.text(i, v + 0.02, f"{v:.3f}", ha="center", va="bottom", fontsize=10)
-    fig.tight_layout()
-    _save_fig(fig, output_dir, filename)
-
-
-def _plot_gating_hist_by_best(
-    gate_values: np.ndarray,
-    best_idx: np.ndarray,
-    thr_low: float,
-    thr_high: float,
-    label: str,
-    output_dir: Optional[str],
-    filename: str = "gating_by_best_hist.png",
-) -> None:
-    # Gating functionality removed; keep as no-op for backward compatibility.
-    return
-
-
-def _plot_zone_best_model_stack(
-    counts_per_zone: Dict[str, Dict[str, int]],
-    output_dir: Optional[str],
-    filename: str = "zone_best_model_stack.png",
-) -> None:
-    # counts_per_zone: {"low": {"Global": n, "Local": n, "All": n}, ...}
-    zones = ["Low", "Mid", "High"]
-    keys_norm = {"Low": "low", "Mid": "mid", "High": "high"}
-    models = ["Global", "Local", "All"]
-    data = []
-    for z in zones:
-        zkey = keys_norm[z]
-        sub = counts_per_zone.get(zkey, {})
-        total = float(sum(int(sub.get(m, 0)) for m in models))
-        if total <= 0:
-            data.append([0.0, 0.0, 0.0])
-        else:
-            data.append([int(sub.get(m, 0)) / total for m in models])
-
-    fig, ax = plt.subplots(figsize=(6.8, 4.6))
-    bottoms = np.zeros(len(zones))
-    colors = {"Global": "#4daf4a", "Local": "#377eb8", "All": "#e41a1c"}
-    for i, m in enumerate(models):
-        vals = [row[i] for row in data]
-        ax.bar(zones, vals, bottom=bottoms, color=colors.get(m, None), label=m)
-        bottoms += np.array(vals)
-        # annotate
-        for xi, v, b in zip(range(len(zones)), vals, bottoms):
-            if v > 0.02:
-                ax.text(
-                    xi,
-                    b - v / 2.0,
-                    f"{int(round(v*100))}%",
-                    ha="center",
-                    va="center",
-                    color="white",
-                )
-    ax.set_ylim(0.0, 1.0)
-    ax.set_ylabel("Proportion within zone")
-    ax.set_title("Best model composition by zone (train, OOF)")
-    ax.legend(loc="upper right")
-    fig.tight_layout()
-    _save_fig(fig, output_dir, filename)
+ 
 
 
 def conversion_and_imputation(df, features, labels):
@@ -631,21 +517,7 @@ def search_best_gating_feature_by_cv(
     except Exception:
         pass
 
-    try:
-        _plot_gating_hist_by_best(
-            gate_values=x_full,
-            best_idx=best_idx,
-            thr_low=thr_low,
-            thr_high=thr_high,
-            label=str(best_feature),
-            output_dir=output_dir,
-            filename="gating_best_feature_hist.png",
-        )
-        _plot_zone_best_model_stack(
-            comp_counts, output_dir, filename="gating_zone_composition.png"
-        )
-    except Exception:
-        pass
+    # (Deprecated visuals removed)
 
     # Package outputs (unreachable in current deprecated flow)
     human_mapping = {k: ["Global", "Local", "All"][int(v)] for k, v in mapping.items()}
@@ -1213,8 +1085,11 @@ def _fit_cox_lifelines(
 
 
 def _predict_risk_lifelines(model: CoxPHFitter, df: pd.DataFrame) -> np.ndarray:
-    if model is None or df is None or len(df) == 0:
+    # Ensure output length matches input rows to avoid shape mismatches downstream
+    if df is None or len(df) == 0:
         return np.zeros(0, dtype=float)
+    if model is None:
+        return np.zeros(len(df), dtype=float)
     try:
         model_features = list(model.params_.index)
         X = df.copy()
@@ -2209,7 +2084,8 @@ def evaluate_two_stage_strategy(
     output_dir: Optional[str] = None,
 ) -> Dict[str, float]:
     """Deprecated: two-stage model and gating removed. Returns a marker dict."""
-    print("[INFO] Two-stage strategy evaluation has been removed and is disabled.")
+    # Removed in simplified codebase; kept as stub for backward compatibility
+    print("[INFO] Two-stage strategy evaluation is not available in the simplified script.")
     return {"removed": True}
 
 
@@ -2308,9 +2184,8 @@ def evaluate_three_model_grouping_and_rule(
     output_dir: Optional[str] = None,
 ) -> Dict[str, object]:
     """Deprecated: three-zone gating rule removed. Returns a marker dict."""
-    print(
-        "[INFO] Three-model grouping and gating rule has been removed and is disabled."
-    )
+    # Removed in simplified codebase; kept as stub for backward compatibility
+    print("[INFO] Three-model grouping and gating rule is not available in the simplified script.")
     return {"removed": True}
 
 
