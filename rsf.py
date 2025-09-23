@@ -1445,32 +1445,80 @@ def evaluate_three_model_assignment_and_classifier(
     _log_progress("Splitting data for classifier evaluation", True)
     tr_df = df_model.iloc[tr_idx].copy()
     te_df = df_model.iloc[te_idx].copy()
-    y_tr_assign = best_idx[tr_idx]
-    y_te_assign = best_idx[te_idx]
+
+    # Generate assignment labels without leakage:
+    # - Train OOF risks on the TRAIN split using the previously selected features
+    # - Assign TRAIN labels from OOF risks; TEST labels from models trained on TRAIN
+    from sklearn.model_selection import KFold as _KFold
+
+    n_tr = len(tr_df)
+    n_splits_tr = max(2, min(5, n_tr))
+    risk_gl_tr = np.full(n_tr, np.nan, dtype=float)
+    risk_lo_tr = np.full(n_tr, np.nan, dtype=float)
+    risk_all_tr = np.full(n_tr, np.nan, dtype=float)
+    kf_tr = _KFold(n_splits=n_splits_tr, shuffle=True, random_state=random_state)
+
+    use_glob_tr = [c for c in use_glob if c in tr_df.columns]
+    use_local_tr = [c for c in use_local if c in tr_df.columns]
+    use_all_tr = [c for c in use_all if c in tr_df.columns]
+
+    for _fold_idx, (tr_i, va_i) in enumerate(kf_tr.split(tr_df), start=1):
+        tr_part = tr_df.iloc[tr_i]
+        va_part = tr_df.iloc[va_i]
+        m_gl = _fit_cox_lifelines(tr_part, use_glob_tr, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_glob_tr) > 0 else None
+        m_lo = _fit_cox_lifelines(tr_part, use_local_tr, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_local_tr) > 0 else None
+        m_all = _fit_cox_lifelines(tr_part, use_all_tr, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_all_tr) > 0 else None
+        risk_gl_tr[va_i] = _predict_risk_lifelines(m_gl, va_part) if m_gl is not None else 0.0
+        risk_lo_tr[va_i] = _predict_risk_lifelines(m_lo, va_part) if m_lo is not None else 0.0
+        risk_all_tr[va_i] = _predict_risk_lifelines(m_all, va_part) if m_all is not None else 0.0
+
+    # Replace NaNs with zeros to keep downstream logic simple
+    for arr in (risk_gl_tr, risk_lo_tr, risk_all_tr):
+        mask = ~np.isfinite(arr)
+        if mask.any():
+            arr[mask] = 0.0
+
+    evt_tr = tr_df["VT/VF/SCD"].values.astype(int)
+    risks_stack_tr = np.vstack([risk_gl_tr, risk_lo_tr, risk_all_tr])
+    y_tr_assign = np.zeros(n_tr, dtype=int)
+    y_tr_assign[evt_tr == 1] = np.argmax(risks_stack_tr[:, evt_tr == 1], axis=0)
+    y_tr_assign[evt_tr == 0] = np.argmin(risks_stack_tr[:, evt_tr == 0], axis=0)
 
     # Fit three lifelines Cox models on training set for test-time metrics
     _log_progress("Fitting three lifelines models on training split", True)
+    feat_gl_tr = [c for c in use_glob if c in tr_df.columns]
+    feat_lo_tr = [c for c in use_local if c in tr_df.columns]
+    feat_all_cols_tr = [c for c in use_all if c in tr_df.columns]
     model_gl = _fit_cox_lifelines(
         tr_df,
-        [c for c in global_cols if c in tr_df.columns],
+        feat_gl_tr,
         time_col="PE_Time",
         event_col="VT/VF/SCD",
-    )
+    ) if len(feat_gl_tr) > 0 else None
     model_lo = _fit_cox_lifelines(
         tr_df,
-        [c for c in local_cols if c in tr_df.columns],
+        feat_lo_tr,
         time_col="PE_Time",
         event_col="VT/VF/SCD",
-    )
-    feat_all_cols_tr = [c for c in feat_all_cols if c in tr_df.columns]
+    ) if len(feat_lo_tr) > 0 else None
     model_all = _fit_cox_lifelines(
-        tr_df, feat_all_cols_tr, time_col="PE_Time", event_col="VT/VF/SCD"
-    )
+        tr_df,
+        feat_all_cols_tr,
+        time_col="PE_Time",
+        event_col="VT/VF/SCD",
+    ) if len(feat_all_cols_tr) > 0 else None
 
     _log_progress("Predicting risks on test split", True)
     risk_gl_te = _predict_risk_lifelines(model_gl, te_df)
     risk_lo_te = _predict_risk_lifelines(model_lo, te_df)
     risk_all_te = _predict_risk_lifelines(model_all, te_df)
+
+    # Derive TEST assignment labels from trained TRAIN models (no leakage)
+    evt_te = te_df["VT/VF/SCD"].values.astype(int)
+    risks_stack_te = np.vstack([risk_gl_te, risk_lo_te, risk_all_te])
+    y_te_assign = np.zeros(len(te_df), dtype=int)
+    y_te_assign[evt_te == 1] = np.argmax(risks_stack_te[:, evt_te == 1], axis=0)
+    y_te_assign[evt_te == 0] = np.argmin(risks_stack_te[:, evt_te == 0], axis=0)
 
     # Test-set C-index for three models
     cidx_gl = concordance_index(
@@ -1498,8 +1546,8 @@ def evaluate_three_model_assignment_and_classifier(
             ),
         ]
     )
-    X_tr_cls = tr_df.drop(columns=["PE_Time", "VT/VF/SCD"], errors="ignore")
-    X_te_cls = te_df.drop(columns=["PE_Time", "VT/VF/SCD"], errors="ignore")
+    X_tr_cls = tr_df.drop(columns=["PE_Time", "VT/VF/SCD", "MRN"], errors="ignore")
+    X_te_cls = te_df.drop(columns=["PE_Time", "VT/VF/SCD", "MRN"], errors="ignore")
     _log_progress("Training assignment classifier", True)
     unique_labels = np.unique(y_tr_assign)
     if unique_labels.size < 2:
