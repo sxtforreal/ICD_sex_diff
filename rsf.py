@@ -1350,7 +1350,7 @@ def _compute_oof_three_risks_lifelines(
 
 def evaluate_three_model_assignment_and_classifier(
     clean_df: pd.DataFrame,
-    test_size: float = 0.25,
+    test_size: float = 0.30,
     random_state: int = 42,
     output_dir: Optional[str] = None,
 ) -> Dict[str, object]:
@@ -1445,32 +1445,80 @@ def evaluate_three_model_assignment_and_classifier(
     _log_progress("Splitting data for classifier evaluation", True)
     tr_df = df_model.iloc[tr_idx].copy()
     te_df = df_model.iloc[te_idx].copy()
-    y_tr_assign = best_idx[tr_idx]
-    y_te_assign = best_idx[te_idx]
+
+    # Generate assignment labels without leakage:
+    # - Train OOF risks on the TRAIN split using the previously selected features
+    # - Assign TRAIN labels from OOF risks; TEST labels from models trained on TRAIN
+    from sklearn.model_selection import KFold as _KFold
+
+    n_tr = len(tr_df)
+    n_splits_tr = max(2, min(5, n_tr))
+    risk_gl_tr = np.full(n_tr, np.nan, dtype=float)
+    risk_lo_tr = np.full(n_tr, np.nan, dtype=float)
+    risk_all_tr = np.full(n_tr, np.nan, dtype=float)
+    kf_tr = _KFold(n_splits=n_splits_tr, shuffle=True, random_state=random_state)
+
+    use_glob_tr = [c for c in use_glob if c in tr_df.columns]
+    use_local_tr = [c for c in use_local if c in tr_df.columns]
+    use_all_tr = [c for c in use_all if c in tr_df.columns]
+
+    for _fold_idx, (tr_i, va_i) in enumerate(kf_tr.split(tr_df), start=1):
+        tr_part = tr_df.iloc[tr_i]
+        va_part = tr_df.iloc[va_i]
+        m_gl = _fit_cox_lifelines(tr_part, use_glob_tr, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_glob_tr) > 0 else None
+        m_lo = _fit_cox_lifelines(tr_part, use_local_tr, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_local_tr) > 0 else None
+        m_all = _fit_cox_lifelines(tr_part, use_all_tr, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_all_tr) > 0 else None
+        risk_gl_tr[va_i] = _predict_risk_lifelines(m_gl, va_part) if m_gl is not None else 0.0
+        risk_lo_tr[va_i] = _predict_risk_lifelines(m_lo, va_part) if m_lo is not None else 0.0
+        risk_all_tr[va_i] = _predict_risk_lifelines(m_all, va_part) if m_all is not None else 0.0
+
+    # Replace NaNs with zeros to keep downstream logic simple
+    for arr in (risk_gl_tr, risk_lo_tr, risk_all_tr):
+        mask = ~np.isfinite(arr)
+        if mask.any():
+            arr[mask] = 0.0
+
+    evt_tr = tr_df["VT/VF/SCD"].values.astype(int)
+    risks_stack_tr = np.vstack([risk_gl_tr, risk_lo_tr, risk_all_tr])
+    y_tr_assign = np.zeros(n_tr, dtype=int)
+    y_tr_assign[evt_tr == 1] = np.argmax(risks_stack_tr[:, evt_tr == 1], axis=0)
+    y_tr_assign[evt_tr == 0] = np.argmin(risks_stack_tr[:, evt_tr == 0], axis=0)
 
     # Fit three lifelines Cox models on training set for test-time metrics
     _log_progress("Fitting three lifelines models on training split", True)
+    feat_gl_tr = [c for c in use_glob if c in tr_df.columns]
+    feat_lo_tr = [c for c in use_local if c in tr_df.columns]
+    feat_all_cols_tr = [c for c in use_all if c in tr_df.columns]
     model_gl = _fit_cox_lifelines(
         tr_df,
-        [c for c in global_cols if c in tr_df.columns],
+        feat_gl_tr,
         time_col="PE_Time",
         event_col="VT/VF/SCD",
-    )
+    ) if len(feat_gl_tr) > 0 else None
     model_lo = _fit_cox_lifelines(
         tr_df,
-        [c for c in local_cols if c in tr_df.columns],
+        feat_lo_tr,
         time_col="PE_Time",
         event_col="VT/VF/SCD",
-    )
-    feat_all_cols_tr = [c for c in feat_all_cols if c in tr_df.columns]
+    ) if len(feat_lo_tr) > 0 else None
     model_all = _fit_cox_lifelines(
-        tr_df, feat_all_cols_tr, time_col="PE_Time", event_col="VT/VF/SCD"
-    )
+        tr_df,
+        feat_all_cols_tr,
+        time_col="PE_Time",
+        event_col="VT/VF/SCD",
+    ) if len(feat_all_cols_tr) > 0 else None
 
     _log_progress("Predicting risks on test split", True)
     risk_gl_te = _predict_risk_lifelines(model_gl, te_df)
     risk_lo_te = _predict_risk_lifelines(model_lo, te_df)
     risk_all_te = _predict_risk_lifelines(model_all, te_df)
+
+    # Derive TEST assignment labels from trained TRAIN models (no leakage)
+    evt_te = te_df["VT/VF/SCD"].values.astype(int)
+    risks_stack_te = np.vstack([risk_gl_te, risk_lo_te, risk_all_te])
+    y_te_assign = np.zeros(len(te_df), dtype=int)
+    y_te_assign[evt_te == 1] = np.argmax(risks_stack_te[:, evt_te == 1], axis=0)
+    y_te_assign[evt_te == 0] = np.argmin(risks_stack_te[:, evt_te == 0], axis=0)
 
     # Test-set C-index for three models
     cidx_gl = concordance_index(
@@ -1498,8 +1546,8 @@ def evaluate_three_model_assignment_and_classifier(
             ),
         ]
     )
-    X_tr_cls = tr_df.drop(columns=["PE_Time", "VT/VF/SCD"], errors="ignore")
-    X_te_cls = te_df.drop(columns=["PE_Time", "VT/VF/SCD"], errors="ignore")
+    X_tr_cls = tr_df.drop(columns=["PE_Time", "VT/VF/SCD", "MRN"], errors="ignore")
+    X_te_cls = te_df.drop(columns=["PE_Time", "VT/VF/SCD", "MRN"], errors="ignore")
     _log_progress("Training assignment classifier", True)
     unique_labels = np.unique(y_tr_assign)
     if unique_labels.size < 2:
@@ -1518,7 +1566,7 @@ def evaluate_three_model_assignment_and_classifier(
             f1_score(y_te_assign, y_pred, average="macro", zero_division=0)
         )
 
-    print("\nThree-model assignment via lifelines CoxPH (full-data training/inference):")
+    print("\nThree-model assignment via lifelines CoxPH (train/test split):")
     print(
         f"- Selected | Global: {len(use_glob)} | Local: {len(use_local)} | All: {len(use_all)}"
     )
@@ -1688,6 +1736,97 @@ def evaluate_three_model_assignment_and_classifier(
             "local": use_local,
             "all": use_all,
         },
+    }
+
+
+def run_assignment_experiments(
+    clean_df: pd.DataFrame,
+    runs: int = 50,
+    test_size: float = 0.30,
+    random_state: int = 42,
+    output_dir: Optional[str] = None,
+) -> Dict[str, object]:
+    """Run multiple seeds of three-model assignment and aggregate metrics.
+
+    Aggregates mean and 95% CI (normal approx) for C-index and classifier metrics.
+    """
+    seeds = [int(random_state + i) for i in range(max(1, int(runs)))]
+    per_run: List[Dict[str, float]] = []
+
+    for i, s in enumerate(seeds, start=1):
+        _log_progress(f"Run {i}/{len(seeds)} (seed={s})", True)
+        res = evaluate_three_model_assignment_and_classifier(
+            clean_df=clean_df,
+            test_size=test_size,
+            random_state=s,
+            output_dir=output_dir,
+        )
+        per_run.append(
+            {
+                "seed": float(s),
+                "c_index_global": float(res.get("c_index_global", np.nan)),
+                "c_index_local": float(res.get("c_index_local", np.nan)),
+                "c_index_all": float(res.get("c_index_all", np.nan)),
+                "accuracy": float(res.get("accuracy", np.nan)),
+                "macro_f1": float(res.get("macro_f1", np.nan)),
+            }
+        )
+
+    def _mean_ci(x: List[float]) -> Tuple[float, float, float]:
+        arr = np.asarray(x, dtype=float)
+        mask = np.isfinite(arr)
+        if not mask.any():
+            return float("nan"), float("nan"), float("nan")
+        vals = arr[mask]
+        n = len(vals)
+        mu = float(np.nanmean(vals))
+        if n <= 1:
+            return mu, float("nan"), float("nan")
+        se = float(np.nanstd(vals, ddof=1) / np.sqrt(n))
+        ci = 1.96 * se
+        return mu, mu - ci, mu + ci
+
+    # Build summary
+    keys = [
+        "c_index_global",
+        "c_index_local",
+        "c_index_all",
+        "accuracy",
+        "macro_f1",
+    ]
+    summary: Dict[str, Tuple[float, float, float]] = {}
+    for k in keys:
+        summary[k] = _mean_ci([r.get(k, np.nan) for r in per_run])
+
+    # Print summary
+    print("\n=== Multi-seed summary (mean [95% CI]) ===")
+    for k in keys:
+        mu, lo, hi = summary[k]
+        if np.isfinite(mu) and np.isfinite(lo) and np.isfinite(hi):
+            print(f"- {k}: {mu:.3f} ({lo:.3f}, {hi:.3f})")
+        else:
+            print(f"- {k}: {mu}")
+
+    # Optional export
+    try:
+        if output_dir:
+            _ensure_dir(output_dir)
+            runs_df = pd.DataFrame(per_run)
+            runs_df.to_csv(os.path.join(output_dir, "assignment_multi_seed_runs.csv"), index=False)
+            # Expand summary to a table for convenient saving
+            sm_rows = []
+            for k, (mu, lo, hi) in summary.items():
+                sm_rows.append({"metric": k, "mean": mu, "ci_lower": lo, "ci_upper": hi})
+            pd.DataFrame(sm_rows).to_csv(
+                os.path.join(output_dir, "assignment_multi_seed_summary.csv"), index=False
+            )
+    except Exception:
+        pass
+
+    return {
+        "per_run": per_run,
+        "summary": summary,
+        "runs": int(len(seeds)),
     }
 
 
@@ -2486,6 +2625,18 @@ def main():
         action="store_true",
         help="Disable tqdm progress bars and progress logs.",
     )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Number of random seeds to run for aggregation (1 = single run).",
+    )
+    parser.add_argument(
+        "--seed-base",
+        type=int,
+        default=42,
+        help="Base random seed; seeds will be seed_base + i per run.",
+    )
     args = parser.parse_args()
 
     clean_df = load_dataframes()
@@ -2507,11 +2658,20 @@ def main():
             PROGRESS = False
         except Exception:
             pass
-    # Run three-model assignment and reverse feature analysis
-    _ = evaluate_three_model_assignment_and_classifier(
-        clean_df,
-        output_dir=figs_dir,
-    )
+    # Run experiments: multi-seed aggregation when --runs > 1, else single run
+    if int(args.runs) > 1:
+        _ = run_assignment_experiments(
+            clean_df,
+            runs=int(args.runs),
+            test_size=0.30,
+            random_state=int(args.seed_base),
+            output_dir=figs_dir,
+        )
+    else:
+        _ = evaluate_three_model_assignment_and_classifier(
+            clean_df,
+            output_dir=figs_dir,
+        )
 
 
 if __name__ == "__main__":
