@@ -4,6 +4,7 @@ import pandas as pd
 import os
 import argparse
 import matplotlib.pyplot as plt
+import warnings
 
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.pipeline import Pipeline
@@ -21,6 +22,7 @@ from sksurv.metrics import concordance_index_censored
 from sksurv.util import Surv
 from lifelines import CoxPHFitter
 from lifelines.utils import concordance_index
+from lifelines.exceptions import ConvergenceWarning
 
 try:
     from missingpy import MissForest
@@ -1124,47 +1126,50 @@ def _sanitize_cox_features_matrix(
 def _fit_cox_lifelines(
     train_df: pd.DataFrame, feature_cols: List[str], time_col: str, event_col: str
 ) -> Optional[CoxPHFitter]:
-    """Fit CoxPH via lifelines with sanitization to avoid singularities/overflows."""
+    """Fit CoxPH via lifelines with sanitization and automatic retries on convergence issues."""
     if train_df is None or len(train_df) == 0 or not feature_cols:
         return None
-    # Sanitize feature matrix
-    X_sanitized = _sanitize_cox_features_matrix(
-        train_df[feature_cols], corr_threshold=0.995, verbose=False
-    )
-    kept_features = list(X_sanitized.columns)
-    if len(kept_features) == 0:
-        return None
-    df_fit = pd.concat(
-        [
-            train_df[[time_col, event_col]].reset_index(drop=True),
-            X_sanitized.reset_index(drop=True),
-        ],
-        axis=1,
-    )
-    cph = CoxPHFitter(penalizer=0.1, l1_ratio=0.0)
-    try:
-        cph.fit(df_fit, duration_col=time_col, event_col=event_col, robust=True)
-        return cph
-    except Exception:
-        # Retry with stronger sanitization and regularization
-        X_sanitized2 = _sanitize_cox_features_matrix(
-            train_df[feature_cols], corr_threshold=0.95, verbose=False
-        )
-        if X_sanitized2.shape[1] == 0:
-            return None
-        df_fit2 = pd.concat(
+
+    # Try a sequence of (corr_threshold, penalizer) settings; treat convergence warnings as errors
+    corr_thresholds = [0.995, 0.98, 0.95, 0.90]
+    penalizers = [0.1, 0.5, 1.0, 5.0, 10.0]
+
+    for corr_thr in corr_thresholds:
+        try:
+            X_sanitized = _sanitize_cox_features_matrix(
+                train_df[feature_cols], corr_threshold=corr_thr, verbose=False
+            )
+        except Exception:
+            X_sanitized = train_df[feature_cols].copy()
+
+        kept_features = list(X_sanitized.columns)
+        if len(kept_features) == 0:
+            continue
+
+        df_fit = pd.concat(
             [
                 train_df[[time_col, event_col]].reset_index(drop=True),
-                X_sanitized2.reset_index(drop=True),
+                X_sanitized.reset_index(drop=True),
             ],
             axis=1,
         )
-        try:
-            cph2 = CoxPHFitter(penalizer=1.0, l1_ratio=0.0)
-            cph2.fit(df_fit2, duration_col=time_col, event_col=event_col, robust=True)
-            return cph2
-        except Exception:
-            return None
+
+        for pen in penalizers:
+            cph = CoxPHFitter(penalizer=pen, l1_ratio=0.0)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", ConvergenceWarning)
+                    cph.fit(
+                        df_fit,
+                        duration_col=time_col,
+                        event_col=event_col,
+                        robust=True,
+                    )
+                return cph
+            except Exception:
+                continue
+
+    return None
 
 
 def _predict_risk_lifelines(model: CoxPHFitter, df: pd.DataFrame) -> np.ndarray:
