@@ -74,13 +74,13 @@ LOCAL_FEATURES: List[str] = [
     "LGE_Basal inferoseptum",
     "LGE_Basal inferio",
     "LGE_Basal inferolateral",
-    "LGE_Basal anterolateral ",
+    "LGE_Basal anterolateral",
     "LGE_mid anterior",
     "LGE_mid anterior septum",
     "LGE_mid inferoseptum",
     "LGE_mid inferior",
-    "LGE_mid inferolateral ",
-    "LGE_mid anterolateral ",
+    "LGE_mid inferolateral",
+    "LGE_mid anterolateral",
     "LGE_apical anterior",
     "LGE_apical septum",
     "LGE_apical inferior",
@@ -98,7 +98,9 @@ LOCAL_FEATURES = [str(c).strip() for c in LOCAL_FEATURES]
 # =============================
 
 
-def conversion_and_imputation(df: pd.DataFrame, features: List[str], labels: List[str]) -> pd.DataFrame:
+def conversion_and_imputation(
+    df: pd.DataFrame, features: List[str], labels: List[str]
+) -> pd.DataFrame:
     df = df.copy()
     df = df[features + labels]
 
@@ -128,7 +130,9 @@ def conversion_and_imputation(df: pd.DataFrame, features: List[str], labels: Lis
     exist_bin = [c for c in binary_cols if c in df.columns]
     for c in exist_bin:
         if df[c].dtype == "object":
-            _tmp = df[c].replace({"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0})
+            _tmp = df[c].replace(
+                {"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0}
+            )
             try:
                 df[c] = _tmp.infer_objects(copy=False)
             except Exception:
@@ -163,7 +167,11 @@ def conversion_and_imputation(df: pd.DataFrame, features: List[str], labels: Lis
     return imputed_X
 
 
-def load_dataframes(data_file: Optional[str] = None, sheet_icd: str = "ICD", sheet_no_icd: str = "No_ICD") -> pd.DataFrame:
+def load_dataframes(
+    data_file: Optional[str] = None,
+    sheet_icd: str = "ICD",
+    sheet_no_icd: str = "No_ICD",
+) -> pd.DataFrame:
     """
     读取原始 Excel, 合并 ICD/No_ICD, 计算随访时间, 丢弃无用列, 并做基本类型规范化与简单插补。
 
@@ -194,9 +202,13 @@ def load_dataframes(data_file: Optional[str] = None, sheet_icd: str = "ICD", she
     nicm["PE_Time"] = nicm.apply(
         lambda row: (
             (row["Date VT/VF/SCD"] - row["MRI Date"]).days
-            if row["VT/VF/SCD"] == 1 and pd.notna(row["Date VT/VF/SCD"]) and pd.notna(row["MRI Date"]) else (
+            if row["VT/VF/SCD"] == 1
+            and pd.notna(row["Date VT/VF/SCD"])
+            and pd.notna(row["MRI Date"])
+            else (
                 (row["End follow-up date"] - row["MRI Date"]).days
-                if pd.notna(row["End follow-up date"]) and pd.notna(row["MRI Date"]) else None
+                if pd.notna(row["End follow-up date"]) and pd.notna(row["MRI Date"])
+                else None
             )
         ),
         axis=1,
@@ -248,13 +260,13 @@ def load_dataframes(data_file: Optional[str] = None, sheet_icd: str = "ICD", she
         "LGE_Basal inferoseptum",
         "LGE_Basal inferio",
         "LGE_Basal inferolateral",
-        "LGE_Basal anterolateral ",
+        "LGE_Basal anterolateral",
         "LGE_mid anterior",
         "LGE_mid anterior septum",
         "LGE_mid inferoseptum",
         "LGE_mid inferior",
-        "LGE_mid inferolateral ",
-        "LGE_mid anterolateral ",
+        "LGE_mid inferolateral",
+        "LGE_mid anterolateral",
         "LGE_apical anterior",
         "LGE_apical septum",
         "LGE_apical inferior",
@@ -276,13 +288,13 @@ def load_dataframes(data_file: Optional[str] = None, sheet_icd: str = "ICD", she
         "LGE_Basal inferoseptum",
         "LGE_Basal inferio",
         "LGE_Basal inferolateral",
-        "LGE_Basal anterolateral ",
+        "LGE_Basal anterolateral",
         "LGE_mid anterior",
         "LGE_mid anterior septum",
         "LGE_mid inferoseptum",
         "LGE_mid inferior",
-        "LGE_mid inferolateral ",
-        "LGE_mid anterolateral ",
+        "LGE_mid inferolateral",
+        "LGE_mid anterolateral",
         "LGE_apical anterior",
         "LGE_apical septum",
         "LGE_apical inferior",
@@ -308,7 +320,9 @@ def load_dataframes(data_file: Optional[str] = None, sheet_icd: str = "ICD", she
 # =============================
 
 
-def _prepare_survival_xy(clean_df: pd.DataFrame, drop_cols: Optional[List[str]] = None) -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+def _prepare_survival_xy(
+    clean_df: pd.DataFrame, drop_cols: Optional[List[str]] = None
+) -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
     if drop_cols is None:
         drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time", "Female"]
 
@@ -348,7 +362,9 @@ def _event_by_horizon(y: np.ndarray, t0: float) -> Tuple[np.ndarray, np.ndarray]
     return label, known
 
 
-def _risk_at_time(model: CoxPHSurvivalAnalysis, X: pd.DataFrame, t0: float) -> np.ndarray:
+def _risk_at_time(
+    model: CoxPHSurvivalAnalysis, X: pd.DataFrame, t0: float
+) -> np.ndarray:
     if model is None or X is None or len(X) == 0:
         return np.zeros(0, dtype=float)
     try:
@@ -439,9 +455,21 @@ def compute_oof_losses(
             mdl_all = _fit_cox(X_tr[all_cols], y_tr)
 
             # Predict risk@t0
-            risk_lo = _risk_at_time(mdl_lo, X_va[local_cols], horizon_days) if mdl_lo else np.zeros(len(va_idx))
-            risk_gl = _risk_at_time(mdl_gl, X_va[global_cols], horizon_days) if mdl_gl else np.zeros(len(va_idx))
-            risk_all = _risk_at_time(mdl_all, X_va[all_cols], horizon_days) if mdl_all else np.zeros(len(va_idx))
+            risk_lo = (
+                _risk_at_time(mdl_lo, X_va[local_cols], horizon_days)
+                if mdl_lo
+                else np.zeros(len(va_idx))
+            )
+            risk_gl = (
+                _risk_at_time(mdl_gl, X_va[global_cols], horizon_days)
+                if mdl_gl
+                else np.zeros(len(va_idx))
+            )
+            risk_all = (
+                _risk_at_time(mdl_all, X_va[all_cols], horizon_days)
+                if mdl_all
+                else np.zeros(len(va_idx))
+            )
 
             # Per-sample Brier-like loss
             lab_va = labels_t0[va_idx]
@@ -606,7 +634,13 @@ def train_gating_classifier(
     # Fit on all labelled data for downstream use
     pipe.fit(Xy, y)
 
-    return {"model": pipe, "oof_acc": float(acc), "oof_f1_macro": float(f1m), "report": rep, "mask": mask}
+    return {
+        "model": pipe,
+        "oof_acc": float(acc),
+        "oof_f1_macro": float(f1m),
+        "report": rep,
+        "mask": mask,
+    }
 
 
 # =============================
@@ -666,7 +700,9 @@ def evaluate_on_holdout(
     )
 
     _log("Training gating classifier on training set ...")
-    gating = train_gating_classifier(oof_tr["X"], lab_res["labels"], k_folds=k_folds, random_state=random_state)
+    gating = train_gating_classifier(
+        oof_tr["X"], lab_res["labels"], k_folds=k_folds, random_state=random_state
+    )
 
     # Fit base models on full training set
     _log("Fitting base models on the full training set ...")
@@ -680,11 +716,25 @@ def evaluate_on_holdout(
     gate_model: Pipeline = gating["model"]  # type: ignore
 
     # For test, gating uses all features
-    gate_pred = gate_model.predict(df_te.drop(columns=["VT/VF/SCD", "PE_Time"], errors="ignore"))
+    gate_pred = gate_model.predict(
+        df_te.drop(columns=["VT/VF/SCD", "PE_Time"], errors="ignore")
+    )
 
-    risk_lo_te = _risk_at_time(mdl_local, X_te[local_cols], horizon_days) if mdl_local else np.zeros(len(X_te))
-    risk_gl_te = _risk_at_time(mdl_global, X_te[global_cols], horizon_days) if mdl_global else np.zeros(len(X_te))
-    risk_all_te = _risk_at_time(mdl_all, X_te[all_cols], horizon_days) if mdl_all else np.zeros(len(X_te))
+    risk_lo_te = (
+        _risk_at_time(mdl_local, X_te[local_cols], horizon_days)
+        if mdl_local
+        else np.zeros(len(X_te))
+    )
+    risk_gl_te = (
+        _risk_at_time(mdl_global, X_te[global_cols], horizon_days)
+        if mdl_global
+        else np.zeros(len(X_te))
+    )
+    risk_all_te = (
+        _risk_at_time(mdl_all, X_te[all_cols], horizon_days)
+        if mdl_all
+        else np.zeros(len(X_te))
+    )
 
     # Compose mixture by gating decision: 0 local, 1 global, 2 all
     mix_risk = np.zeros(len(X_te), dtype=float)
@@ -743,14 +793,22 @@ def main() -> None:
             "4) 在独立测试集上评估混合模型 (C-index/Brier)。"
         )
     )
-    parser.add_argument("--data-file", type=str, default=None, help="Excel 路径，默认与旧脚本一致")
-    parser.add_argument("--horizon-days", type=float, default=1825.0, help="评估时点 t0 (天)")
+    parser.add_argument(
+        "--data-file", type=str, default=None, help="Excel 路径，默认与旧脚本一致"
+    )
+    parser.add_argument(
+        "--horizon-days", type=float, default=1825.0, help="评估时点 t0 (天)"
+    )
     parser.add_argument("--kfold", type=int, default=5, help="K 折数")
     parser.add_argument("--repeats", type=int, default=1, help="重复 CV 次数")
     parser.add_argument("--test-size", type=float, default=0.25, help="独立测试集占比")
-    parser.add_argument("--alpha-abs", type=float, default=0.005, help="最小绝对改进阈值")
+    parser.add_argument(
+        "--alpha-abs", type=float, default=0.005, help="最小绝对改进阈值"
+    )
     parser.add_argument("--alpha-rel", type=float, default=0.0, help="最小相对改进阈值")
-    parser.add_argument("--lambda-penalty", type=float, default=0.0, help="复杂度惩罚系数 λ")
+    parser.add_argument(
+        "--lambda-penalty", type=float, default=0.0, help="复杂度惩罚系数 λ"
+    )
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度输出")
     args = parser.parse_args()
@@ -797,4 +855,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
