@@ -1213,8 +1213,11 @@ def _fit_cox_lifelines(
 
 
 def _predict_risk_lifelines(model: CoxPHFitter, df: pd.DataFrame) -> np.ndarray:
-    if model is None or df is None or len(df) == 0:
+    # Ensure output length matches input rows to avoid shape mismatches downstream
+    if df is None or len(df) == 0:
         return np.zeros(0, dtype=float)
+    if model is None:
+        return np.zeros(len(df), dtype=float)
     try:
         model_features = list(model.params_.index)
         X = df.copy()
