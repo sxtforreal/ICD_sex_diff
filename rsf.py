@@ -4,11 +4,8 @@ import pandas as pd
 import os
 import argparse
 import matplotlib.pyplot as plt
-import seaborn as sns
 
-from sklearn.model_selection import train_test_split, GridSearchCV, KFold
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.inspection import permutation_importance
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -17,7 +14,6 @@ from sklearn.metrics import (
     accuracy_score,
     f1_score,
     classification_report,
-    confusion_matrix,
 )
 
 from sksurv.linear_model import CoxPHSurvivalAnalysis
@@ -35,10 +31,10 @@ except Exception:
 
 
 # ========================= User-configurable feature groups =========================
-# 显式定义全局(global)与局部(local)特征集合；两者并集即为 all features。
-# 使用方式：
-# 1) 直接编辑下方列表；或
-# 2) 运行时调用 set_feature_groups(["featA",...], ["featB",...])
+# Explicitly define global and local feature name collections; their union is all features.
+# Usage:
+# 1) Edit the lists below directly; or
+# 2) Call set_feature_groups(["featA", ...], ["featB", ...]) at runtime
 GLOBAL_FEATURES: List[str] = [
     "Age at CMR",
     "BMI",
@@ -92,13 +88,13 @@ LOCAL_FEATURES: List[str] = [
 
 
 def set_feature_groups(global_features: List[str], local_features: List[str]) -> None:
-    """显式设置全局/局部特征名列表（不在数据中的名字会被忽略）。"""
+    """Set the global/local feature name lists explicitly (unknown names are ignored)."""
     global GLOBAL_FEATURES, LOCAL_FEATURES
     GLOBAL_FEATURES = list(global_features)
     LOCAL_FEATURES = list(local_features)
 
 
-# 显式控制图片保存目录（可通过 set_figures_dir 或命令行 --figs-dir 或环境变量 FIGURES_DIR 指定）
+# Figure output directory (can be set via set_figures_dir, CLI --figs-dir, or env FIGURES_DIR)
 FIGURES_DIR: Optional[str] = None
 
 
@@ -178,17 +174,15 @@ def _plot_series_barh(
 
 
 def _plot_cindex_bars(metrics: Dict[str, float], output_dir: Optional[str]) -> None:
-    labels = ["All", "Global", "Local", "Two-stage"]
+    labels = ["All", "Global", "Local"]
     keys = [
         "c_index_all",
-        "c_index_global_only",
-        "c_index_local_only",
-        "c_index_two_stage",
+        "c_index_global",
+        "c_index_local",
     ]
     vals = [float(metrics.get(k, np.nan)) for k in keys]
     fig, ax = plt.subplots(figsize=(6.5, 4.2))
-    # Avoid seaborn deprecation of palette without hue
-    sns.barplot(x=labels, y=vals, hue=labels, ax=ax, palette="Set2", legend=False)
+    ax.bar(labels, vals, color=["#e41a1c", "#4daf4a", "#377eb8"])
     ax.set_ylabel("C-index (test)")
     ax.set_ylim(0.0, 1.0)
     ax.set_title("C-index comparison (CoxPH)")
@@ -206,7 +200,7 @@ def _plot_gating_hist(
     label: str,
     output_dir: Optional[str],
 ) -> None:
-    # 门控功能已移除：保留空实现以兼容旧调用（不再绘制）。
+    # Gating functionality removed; keep as no-op for backward compatibility.
     return
 
 
@@ -219,14 +213,8 @@ def _plot_zone_counts(metrics: Dict[str, float], output_dir: Optional[str]) -> N
     fig, ax = plt.subplots(figsize=(5.8, 4.0))
     labels = ["Low", "Mid", "High"]
     vals = [n_low, n_mid, n_high]
-    sns.barplot(
-        x=labels,
-        y=vals,
-        hue=labels,
-        ax=ax,
-        palette=["#4daf4a", "#377eb8", "#e41a1c"],
-        legend=False,
-    )
+    colors = ["#4daf4a", "#377eb8", "#e41a1c"]
+    ax.bar(labels, vals, color=colors)
     ax.set_ylabel("Count (test)")
     ax.set_title("Zone counts by gating thresholds")
     for i, v in enumerate(vals):
@@ -243,7 +231,7 @@ def _plot_cindex_bars_generic(
     filename: str,
 ) -> None:
     fig, ax = plt.subplots(figsize=(6.8, 4.4))
-    sns.barplot(x=labels, y=vals, hue=labels, ax=ax, palette="Set2", legend=False)
+    ax.bar(labels, vals, color="#1f77b4")
     ax.set_ylabel("C-index (test)")
     ax.set_ylim(0.0, 1.0)
     ax.set_title(title)
@@ -263,7 +251,7 @@ def _plot_gating_hist_by_best(
     output_dir: Optional[str],
     filename: str = "gating_by_best_hist.png",
 ) -> None:
-    # 门控功能已移除：保留空实现以兼容旧调用（不再绘制）。
+    # Gating functionality removed; keep as no-op for backward compatibility.
     return
 
 
@@ -391,20 +379,7 @@ def search_best_gating_feature_by_cv(
     output_dir: Optional[str] = None,
     topk_report: int = 10,
 ) -> Dict[str, object]:
-    """
-    Find a single gating feature and two thresholds (low/high quantiles) that best separate
-    the three best-model groups (Global/Local/All) using repeated KFold CV on the full data.
-
-    Steps:
-    - Compute OOF risks for Global/Local/All lifelines CoxPH models on the full dataset
-      and derive per-sample best model labels (0=Global,1=Local,2=All) via event-based rule.
-    - For each numeric feature, evaluate quantile threshold pairs on train folds and score
-      validation accuracy using majority label mapping per zone (low/mid/high).
-    - Select the feature and (q_low, q_high) with highest mean CV accuracy.
-    - Compute final thresholds on all data using the selected quantiles, generate visuals,
-      and return a summary including per-sample zones and predicted labels.
-    """
-    # 已移除门控功能：此函数禁用
+    """Deprecated: gating functionality removed. Returns a marker dict."""
     print("[INFO] Gating feature search has been removed and is disabled.")
     return {"removed": True}
     # Prepare X/y and feature names
@@ -605,7 +580,7 @@ def search_best_gating_feature_by_cv(
         else float("nan")
     )
 
-    # Visualizations
+    # Visualizations (deprecated; kept for compatibility but will no-op if called)
     try:
         if output_dir:
             _ensure_dir(output_dir)
@@ -633,7 +608,7 @@ def search_best_gating_feature_by_cv(
     except Exception:
         pass
 
-    # Package outputs
+    # Package outputs (unreachable in current deprecated flow)
     human_mapping = {k: ["Global", "Local", "All"][int(v)] for k, v in mapping.items()}
     result: Dict[str, object] = {
         "selected_feature": best_feature,
@@ -795,7 +770,7 @@ def load_dataframes() -> pd.DataFrame:
     ]
     nicm = nicm.dropna(subset=granularity)
     features = [v for v in var if v not in labels]
-    # 明确将 Female 和 ICD 作为 label（从特征中移除）
+    # Explicitly treat Female and ICD as labels (remove from feature list)
     for lab in ["Female", "ICD"]:
         if lab in features:
             features.remove(lab)
@@ -816,7 +791,7 @@ def _prepare_survival_xy(
     Expects columns: "VT/VF/SCD" (event, 0/1) and "PE_Time" (time in days).
     """
     if drop_cols is None:
-        # 将 Female 与 ICD 视为 label（不作为特征）；同时排除基础标识与时间/事件列
+        # Treat Female and ICD as labels; also drop identifiers and time/event columns
         drop_cols = ["MRN", "VT/VF/SCD", "ICD", "PE_Time", "Female"]
 
     df = clean_df.copy()
@@ -939,22 +914,23 @@ def _find_feature_groups(
     feature_names: List[str],
 ) -> Tuple[List[str], List[str], Optional[str]]:
     """
-    返回 (global_cols, local_cols, gating_feature)；已移除门控逻辑，gating 恒为 None。
+    Return (global_cols, local_cols, gating_feature); gating is always None.
 
-    优先使用用户显式配置的 GLOBAL_FEATURES 与 LOCAL_FEATURES（与现有列求交集）。
-    若未配置，则回退到基于列名的启发式拆分（但仍不返回 gating）。
+    Priority:
+    - Use user-configured GLOBAL_FEATURES and LOCAL_FEATURES (intersection with existing columns).
+    - Otherwise, fall back to simple name-heuristics (still no gating).
     """
     names = list(feature_names)
 
-    # 1) 显式配置优先（与现有列求交集）
+    # 1) User-configured lists first (intersect with existing columns)
     if GLOBAL_FEATURES or LOCAL_FEATURES:
         g = [c for c in GLOBAL_FEATURES if c in names]
         l = [c for c in LOCAL_FEATURES if c in names]
-        # 去重并避免交叉
+        # Deduplicate and avoid overlap
         l = [c for c in l if c not in g]
         return g, l, None
 
-    # 2) 启发式回退（不返回 gating）
+    # 2) Heuristic fallback (no gating)
     lower = [n.lower() for n in names]
 
     def has(substr: str) -> List[str]:
@@ -1209,6 +1185,171 @@ def _predict_risk_lifelines(model: CoxPHFitter, df: pd.DataFrame) -> np.ndarray:
         return np.zeros(len(df), dtype=float)
 
 
+def _forward_select_features_lifelines(
+    df: pd.DataFrame,
+    candidate_features: List[str],
+    time_col: str,
+    event_col: str,
+    random_state: int = 42,
+    max_features: Optional[int] = None,
+    verbose: bool = False,
+) -> List[str]:
+    """Greedy forward selection to maximize validation C-index (lifelines-based).
+
+    - Uses an inner 70/30 split for selection.
+    - Applies sanitization to avoid degenerate columns.
+    - Returns a subset (possibly empty).
+    """
+    df_local = df.dropna(subset=[time_col, event_col]).copy()
+    if df_local.empty:
+        return []
+
+    # Initial candidate pool after basic sanitization
+    try:
+        X_sanitized = _sanitize_cox_features_matrix(
+            df_local[candidate_features], corr_threshold=0.995, verbose=False
+        )
+        pool: List[str] = list(X_sanitized.columns)
+    except Exception:
+        pool = [f for f in candidate_features if f in df_local.columns]
+
+    if len(pool) <= 1:
+        return list(pool)
+
+    # Inner split
+    try:
+        tr_df, va_df = train_test_split(
+            df_local,
+            test_size=0.3,
+            random_state=random_state,
+            stratify=df_local[event_col] if df_local[event_col].nunique() > 1 else None,
+        )
+    except Exception:
+        tr_df, va_df = train_test_split(df_local, test_size=0.3, random_state=random_state)
+
+    selected: List[str] = []
+    best_val_cidx: float = -np.inf
+    remaining = list(pool)
+    max_iters = (
+        len(remaining) if max_features is None else max(0, min(len(remaining), max_features))
+    )
+
+    for step_idx in range(max_iters):
+        best_feat = None
+        best_feat_cidx = best_val_cidx
+        if verbose:
+            try:
+                print(
+                    f"[FS][Forward] seed={random_state} step={step_idx+1}/{max_iters} remaining={len(remaining)}"
+                )
+            except Exception:
+                pass
+        for feat in list(remaining):
+            trial_feats = selected + [feat]
+            try:
+                cph = _fit_cox_lifelines(tr_df, trial_feats, time_col, event_col)
+                if cph is None:
+                    cidx = np.nan
+                else:
+                    risk_val = _predict_risk_lifelines(cph, va_df)
+                    cidx = concordance_index(
+                        va_df[time_col].values, -risk_val, va_df[event_col].values
+                    )
+            except Exception:
+                cidx = np.nan
+            if np.isfinite(cidx) and (cidx > best_feat_cidx + 1e-12):
+                best_feat_cidx = float(cidx)
+                best_feat = feat
+
+        if best_feat is None:
+            break
+        selected.append(best_feat)
+        remaining.remove(best_feat)
+        best_val_cidx = best_feat_cidx
+        if verbose:
+            try:
+                print(f"[FS][Forward] + {best_feat} -> val c-index={best_val_cidx:.4f}")
+            except Exception:
+                pass
+
+    return selected
+
+
+def _stability_select_features_lifelines(
+    df: pd.DataFrame,
+    candidate_features: List[str],
+    time_col: str,
+    event_col: str,
+    seeds: List[int],
+    threshold: float = 0.5,
+    max_features: Optional[int] = None,
+    verbose: bool = False,
+) -> List[str]:
+    """Run forward selection across multiple seeds and keep features
+    with selection frequency >= threshold.
+    """
+    if df is None or df.empty:
+        return []
+
+    # Initial sanitized pool
+    try:
+        X_pool = _sanitize_cox_features_matrix(
+            df[candidate_features], corr_threshold=0.995, verbose=False
+        )
+        pool = list(X_pool.columns)
+    except Exception:
+        pool = [f for f in candidate_features if f in df.columns]
+
+    if len(pool) == 0:
+        return []
+
+    from collections import Counter
+
+    counter: Counter = Counter()
+    total_runs = 0
+    for idx, s in enumerate(seeds, start=1):
+        try:
+            if verbose:
+                try:
+                    print(f"[FS][Stability] seed {idx}/{len(seeds)} -> start")
+                except Exception:
+                    pass
+            sel = _forward_select_features_lifelines(
+                df=df,
+                candidate_features=list(pool),
+                time_col=time_col,
+                event_col=event_col,
+                random_state=s,
+                max_features=max_features,
+                verbose=verbose,
+            )
+            if sel:
+                counter.update(sel)
+            total_runs += 1
+        except Exception:
+            continue
+
+    if total_runs == 0 or not counter:
+        return list(pool)
+
+    ranked = list(counter.most_common())
+    kept: List[str] = []
+    for feat, count in ranked:
+        freq = count / total_runs
+        if freq >= threshold:
+            kept.append(feat)
+
+    # Final sanitization
+    if kept:
+        try:
+            X_final = _sanitize_cox_features_matrix(
+                df[kept], corr_threshold=0.995, verbose=False
+            )
+            return list(X_final.columns)
+        except Exception:
+            return kept
+    return []
+
 def _compute_oof_three_risks_lifelines(
     df: pd.DataFrame,
     global_cols: List[str],
@@ -1315,7 +1456,7 @@ def evaluate_three_model_assignment_and_classifier(
 
     # Build a modeling DataFrame for lifelines containing all features
     feat_all_cols = [c for c in feature_names]
-    # 保留 MRN（若存在）用于输出标识；模型训练时会自动忽略 MRN
+    # Keep MRN (if present) for identification in outputs; models ignore MRN
     left_cols = ["PE_Time", "VT/VF/SCD"] + (["MRN"] if "MRN" in df.columns else [])
     df_model = pd.concat(
         [
@@ -1325,22 +1466,42 @@ def evaluate_three_model_assignment_and_classifier(
         axis=1,
     )
 
-    # OOF risks on full data (for assignment labels)
-    risk_gl_oof, risk_lo_oof, risk_all_oof = _compute_oof_three_risks_lifelines(
-        df_model,
-        global_cols,
-        local_cols,
-        time_col="PE_Time",
-        event_col="VT/VF/SCD",
-        n_splits=5,
-        random_state=random_state,
-    )
+    # Candidate feature sets for three models
+    cand_glob = [c for c in global_cols if c in df_model.columns]
+    cand_local = [c for c in local_cols if c in df_model.columns]
+    cand_all = [c for c in feat_all_cols if c in df_model.columns]
 
+    # Forward selection per model on an inner split; then refit on full data and infer on full data
+    seeds_for_stability = list(range(10))
+    sel_glob = _stability_select_features_lifelines(
+        df_model, cand_glob, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
+    ) if len(cand_glob) > 0 else []
+    sel_local = _stability_select_features_lifelines(
+        df_model, cand_local, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
+    ) if len(cand_local) > 0 else []
+    sel_all = _stability_select_features_lifelines(
+        df_model, cand_all, time_col="PE_Time", event_col="VT/VF/SCD", seeds=seeds_for_stability, threshold=0.4, verbose=False
+    ) if len(cand_all) > 0 else []
+
+    # Ensure non-empty by falling back to candidate lists
+    use_glob = sel_glob if sel_glob else cand_glob
+    use_local = sel_local if sel_local else cand_local
+    use_all = sel_all if sel_all else cand_all
+
+    # Fit on all data
+    model_gl = _fit_cox_lifelines(df_model, use_glob, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_glob) > 0 else None
+    model_lo = _fit_cox_lifelines(df_model, use_local, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_local) > 0 else None
+    model_all = _fit_cox_lifelines(df_model, use_all, time_col="PE_Time", event_col="VT/VF/SCD") if len(use_all) > 0 else None
+
+    # Inference on all data
+    risk_gl_full = _predict_risk_lifelines(model_gl, df_model) if model_gl is not None else np.zeros(len(df_model))
+    risk_lo_full = _predict_risk_lifelines(model_lo, df_model) if model_lo is not None else np.zeros(len(df_model))
+    risk_all_full = _predict_risk_lifelines(model_all, df_model) if model_all is not None else np.zeros(len(df_model))
+
+    # Assignment on all data based on events
     evt = df_model["VT/VF/SCD"].values.astype(int)
-    # Choose per-sample best model among 0=Global, 1=Local, 2=All
-    risks_stack = np.vstack([risk_gl_oof, risk_lo_oof, risk_all_oof])  # shape (3, n)
+    risks_stack = np.vstack([risk_gl_full, risk_lo_full, risk_all_full])
     best_idx = np.zeros(len(df_model), dtype=int)
-    # Event -> argmax risk; No-event -> argmin risk
     best_idx[evt == 1] = np.argmax(risks_stack[:, evt == 1], axis=0)
     best_idx[evt == 0] = np.argmin(risks_stack[:, evt == 0], axis=0)
 
@@ -1411,9 +1572,9 @@ def evaluate_three_model_assignment_and_classifier(
     acc = float(accuracy_score(y_te_assign, y_pred))
     f1_macro = float(f1_score(y_te_assign, y_pred, average="macro"))
 
-    print("\nThree-model assignment via lifelines CoxPH:")
+    print("\nThree-model assignment via lifelines CoxPH (full-data training/inference):")
     print(
-        f"- Global cols: {len(global_cols)}, Local cols: {len(local_cols)}, All cols: {len(feat_all_cols)}"
+        f"- Selected | Global: {len(use_glob)} | Local: {len(use_local)} | All: {len(use_all)}"
     )
     print(
         f"- Test C-index | Global: {cidx_gl:.4f} | Local: {cidx_lo:.4f} | All: {cidx_all:.4f}"
@@ -1461,7 +1622,7 @@ def evaluate_three_model_assignment_and_classifier(
     except Exception:
         pass
 
-    # Counts plot of assigned groups（基于全体 OOF 标签）
+    # Counts plot of assigned groups (based on all OOF labels)
     try:
         counts = pd.Series(
             {
@@ -1502,6 +1663,10 @@ def evaluate_three_model_assignment_and_classifier(
             assign_df.to_csv(
                 os.path.join(output_dir, "assignment_labels_all.csv"), index=False
             )
+            with open(os.path.join(output_dir, "selected_features.txt"), "w") as f:
+                f.write("Global:\n" + ",".join(use_glob) + "\n")
+                f.write("Local:\n" + ",".join(use_local) + "\n")
+                f.write("All:\n" + ",".join(use_all) + "\n")
     except Exception:
         pass
 
@@ -1564,14 +1729,19 @@ def evaluate_three_model_assignment_and_classifier(
         "c_index_all": float(cidx_all),
         "accuracy": acc,
         "macro_f1": f1_macro,
-        "n_train": int(len(tr_df)),
-        "n_test": int(len(te_df)),
+        "n_train": int(len(df_model)),
+        "n_test": int(len(df_model)),
         "assignment_all_labels": [int(v) for v in best_idx.tolist()],
         "assignment_all_ids": (
             df_model["MRN"].tolist()
             if "MRN" in df_model.columns
             else list(range(len(df_model)))
         ),
+        "selected_features": {
+            "global": use_glob,
+            "local": use_local,
+            "all": use_all,
+        },
     }
 
 
@@ -1676,105 +1846,8 @@ def _optimize_gate_quantiles(
     min_gap: float = 0.10,
     inner_val_size: float = 0.33,
 ) -> Tuple[Optional[float], Optional[float], Dict[str, float]]:
-    """
-    Choose (q_low, q_high) by maximizing validation C-index on an inner split of the training set.
-
-    Returns (best_q_low, best_q_high, info_dict). If not applicable, returns (None, None, {}).
-    """
-    # Basic availability checks
-    have_global = len(global_cols) > 0
-    have_local = len(local_cols) > 0
-    if gating is None and not have_local:
-        return None, None, {}
-
-    # Default grids
-    if q_low_grid is None:
-        q_low_grid = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
-    if q_high_grid is None:
-        q_high_grid = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
-
-    # Inner split for threshold tuning
-    X_tr, X_val, y_tr, y_val = train_test_split(
-        X_train, y_train, test_size=inner_val_size, random_state=random_state + 1
-    )
-
-    # Helper: robust field names for y
-    def _get_surv_field_names(y_arr) -> Tuple[str, str]:
-        names = getattr(y_arr.dtype, "names", None)
-        if not names or len(names) < 2:
-            return "event", "time"
-        event_field = "event" if "event" in names else names[0]
-        time_candidates = [n for n in names if n != event_field]
-        time_field = "time" if "time" in names else time_candidates[0]
-        return event_field, time_field
-
-    def _c_index(y, risk):
-        e_field, t_field = _get_surv_field_names(y)
-        evt = y[e_field].astype(bool)
-        tm = y[t_field].astype(float)
-        c = concordance_index_censored(evt, tm, risk)[0]
-        return float(c)
-
-    # Prepare gating values
-    if gating is not None and gating in X_tr.columns and gating in X_val.columns:
-        gate_tr_vals = X_tr[gating].astype(float).values
-        gate_val_vals = X_val[gating].astype(float).values
-    else:
-        if have_local:
-            gate_tr_vals = X_tr[local_cols].astype(float).sum(axis=1).values
-            gate_val_vals = X_val[local_cols].astype(float).sum(axis=1).values
-        else:
-            return None, None, {}
-
-    # Fit inner models on X_tr
-    def _fit(X, y) -> Optional[object]:
-        return _fit_coxph_clean(X, y)
-
-    model_glob_in = _fit(X_tr[global_cols], y_tr) if have_global else None
-    model_loc_in = _fit(X_tr[local_cols], y_tr) if have_local else None
-
-    # Precompute validation risks
-    risk_glob_val = (
-        _risk_at_time(model_glob_in, X_val[global_cols], time_horizon_days)
-        if model_glob_in is not None
-        else np.zeros(len(X_val), dtype=float)
-    )
-    risk_loc_val = (
-        _risk_at_time(model_loc_in, X_val[local_cols], time_horizon_days)
-        if model_loc_in is not None
-        else np.zeros(len(X_val), dtype=float)
-    )
-
-    # Grid search
-    best_score = -np.inf
-    best_pair: Tuple[Optional[float], Optional[float]] = (None, None)
-    tried = 0
-    for ql in q_low_grid:
-        for qh in q_high_grid:
-            if qh - ql < min_gap:
-                continue
-            thr_l = float(np.nanquantile(gate_tr_vals, ql))
-            thr_h = float(np.nanquantile(gate_tr_vals, qh))
-            if not np.isfinite(thr_l) or not np.isfinite(thr_h) or thr_l >= thr_h:
-                continue
-            zone_high = gate_val_vals >= thr_h
-            zone_low = gate_val_vals < thr_l
-            zone_mid = ~(zone_high | zone_low)
-            risk_two = np.zeros(len(X_val), dtype=float)
-            risk_two[zone_high] = risk_glob_val[zone_high]
-            risk_two[zone_low] = risk_glob_val[zone_low]
-            risk_two[zone_mid] = risk_loc_val[zone_mid]
-            score = _c_index(y_val, risk_two)
-            tried += 1
-            if score > best_score:
-                best_score = score
-                best_pair = (ql, qh)
-
-    info: Dict[str, float] = {
-        "tried": float(tried),
-        "best_c_index_val": float(best_score),
-    }
-    return best_pair[0], best_pair[1], info
+    """Deprecated: gating functionality removed. Keep signature for backward compatibility."""
+    return None, None, {}
 
 
 def analyze_benefit_subgroup(
@@ -2074,9 +2147,7 @@ def evaluate_two_stage_strategy(
     inner_val_size: float = 0.33,
     output_dir: Optional[str] = None,
 ) -> Dict[str, float]:
-    """
-    二阶段模型与门控已移除：此函数禁用。
-    """
+    """Deprecated: two-stage model and gating removed. Returns a marker dict."""
     print("[INFO] Two-stage strategy evaluation has been removed and is disabled.")
     return {"removed": True}
 
@@ -2175,9 +2246,7 @@ def evaluate_three_model_grouping_and_rule(
     min_gap: float = 0.10,
     output_dir: Optional[str] = None,
 ) -> Dict[str, object]:
-    """
-    三分区门控规则已移除：此函数禁用。
-    """
+    """Deprecated: three-zone gating rule removed. Returns a marker dict."""
     print(
         "[INFO] Three-model grouping and gating rule has been removed and is disabled."
     )
@@ -2456,12 +2525,12 @@ def main():
         "--figs-dir",
         type=str,
         default="/home/sunx/data/aiiih/projects/sunx/projects/ICD/fig",
-        help="输出图片与CSV的根目录；优先级高于环境变量 FIGURES_DIR",
+        help="Output directory for figures and CSVs; takes precedence over env FIGURES_DIR",
     )
     args = parser.parse_args()
 
     clean_df = load_dataframes()
-    # 解析图片目录：命令行 > 全局设置 > 环境变量 > 默认
+    # Resolve figures directory: CLI > global setting > environment variable > default
     figs_dir_cli = args.figs_dir
     figs_dir_env = os.environ.get("FIGURES_DIR")
     figs_dir_glb = FIGURES_DIR
@@ -2471,7 +2540,7 @@ def main():
         or figs_dir_env
         or os.path.join("figures", "three_model_assignment")
     )
-    # 运行三模型+指派+反向特征分析
+    # Run three-model assignment and reverse feature analysis
     _ = evaluate_three_model_assignment_and_classifier(
         clean_df,
         output_dir=figs_dir,
