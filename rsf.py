@@ -250,13 +250,14 @@ def load_dataframes(
             "Date VT/VF/SCD",
             "End follow-up date",
             "CRT Date",
-            # retain LGE Burden 5SD and CG CrCl for engineered features
+            "LGE Burden 5SD",
             "LGE_Unnamed: 1",
             "LGE_Notes",
             "LGE_RV insertion sites (0 No, 1 yes)",
             "LGE_Score",
             "LGE_Unnamed: 27",
             "LGE_Unnamed: 28",
+            "Cockcroft-Gault Creatinine Clearance (mL/min)",
         ],
         axis=1,
         inplace=True,
@@ -337,31 +338,6 @@ def load_dataframes(
     # Imputation
     clean_df = conversion_and_imputation(nicm, features, labels)
     clean_df["NYHA Class"] = clean_df["NYHA Class"].replace({5: 4, 0: 1})
-
-    # Engineered features to mirror cox.py
-    if "Age at CMR" in clean_df.columns:
-        try:
-            clean_df["Age by decade"] = (pd.to_numeric(clean_df["Age at CMR"], errors="coerce") // 10).astype(float)
-        except Exception:
-            pass
-    if "Cockcroft-Gault Creatinine Clearance (mL/min)" in clean_df.columns:
-        try:
-            crcl = pd.to_numeric(clean_df["Cockcroft-Gault Creatinine Clearance (mL/min)"], errors="coerce")
-            clean_df["CrCl>45"] = (crcl > 45).astype(float)
-        except Exception:
-            pass
-    if "NYHA Class" in clean_df.columns:
-        try:
-            nyha_num = pd.to_numeric(clean_df["NYHA Class"], errors="coerce")
-            clean_df["NYHA>2"] = (nyha_num > 2).astype(float)
-        except Exception:
-            pass
-    if "LGE Burden 5SD" in clean_df.columns:
-        try:
-            lge = pd.to_numeric(clean_df["LGE Burden 5SD"], errors="coerce")
-            clean_df["Significant LGE"] = (lge > 2).astype(float)
-        except Exception:
-            pass
     return clean_df
 
 
