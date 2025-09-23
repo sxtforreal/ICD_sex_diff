@@ -35,12 +35,29 @@ except Exception:
 PROGRESS = True
 
 def _maybe_tqdm(iterable, total=None, desc=None, leave=False):
-    if _HAS_TQDM and PROGRESS:
-        try:
-            return _tqdm(iterable, total=total, desc=desc, leave=leave)
-        except Exception:
-            return iterable
-    return iterable
+    """Lightweight progress wrapper that prints textual progress instead of tqdm bars."""
+    if not PROGRESS:
+        return iterable
+    # Try to infer total if not provided and iterable is sized
+    try:
+        inferred_total = len(iterable) if total is None and hasattr(iterable, "__len__") else total
+    except Exception:
+        inferred_total = total
+
+    def _generator():
+        count = 0
+        for item in iterable:
+            count += 1
+            if desc:
+                if inferred_total is not None:
+                    _log_progress(f"{desc}: {count}/{inferred_total}", True)
+                else:
+                    _log_progress(f"{desc}: {count}", True)
+            yield item
+        if desc and leave:
+            _log_progress(f"{desc}: done", True)
+
+    return _generator()
 
 # Global max iterations for lifelines CoxPHFitter (None = library default)
 MAX_LIFELINES_STEPS: Optional[int] = None
