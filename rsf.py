@@ -42,14 +42,12 @@ def _log(msg: str) -> None:
 # These names match the original dataset columns. You can edit them if necessary.
 GLOBAL_FEATURES: List[str] = [
     "Age at CMR",
-    "Age by decade",
     "BMI",
     "DM",
     "HTN",
     "HLP",
     "AF",
     "NYHA Class",
-    "NYHA>2",
     "LVEDVi",
     "LVEF",
     "LV Mass Index",
@@ -69,9 +67,6 @@ GLOBAL_FEATURES: List[str] = [
     "QRS",
     "QTc",
     "LGE_LGE Burden 5SD",
-    "LGE Burden 5SD",
-    "CrCl>45",
-    "Significant LGE",
 ]
 
 LOCAL_FEATURES: List[str] = [
@@ -450,7 +445,7 @@ class CoxPHWithScaler:
     Provides predict_survival_function and predict consistent with scikit-survival's API.
     """
 
-    def __init__(self, alpha: float = 0.1, clip_value: float = 8.0):
+    def __init__(self, alpha: float = 0.1, clip_value: float = float("inf")):
         self.alpha = float(alpha)
         self.clip_value = float(clip_value)
         self.scaler: Optional[StandardScaler] = None
