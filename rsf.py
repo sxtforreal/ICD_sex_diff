@@ -695,6 +695,19 @@ def compute_oof_losses(
         raise ValueError("GLOBAL_FEATURES 或 LOCAL_FEATURES 为空或与数据不匹配。")
 
     n = len(X_all)
+    # Progress: feature selection status and pools
+    if use_feature_selection:
+        try:
+            _log(
+                f"Feature selection ON (max_features={fs_max_features}); pools -> global={len(global_cols)}, all={len(all_cols)}"
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            _log("Feature selection OFF; using full provided feature lists.")
+        except Exception:
+            pass
     # Collect R repetitions
     losses_global_rep: List[np.ndarray] = []
     losses_all_rep: List[np.ndarray] = []
@@ -729,6 +742,11 @@ def compute_oof_losses(
                     ) or list(all_cols)
                 except Exception:
                     sel_all = list(all_cols)
+            # Light progress per fold (counts only)
+            try:
+                _log(f"Fold selected features -> global={len(sel_global)}, all={len(sel_all)}")
+            except Exception:
+                pass
 
             # Fit two Cox models: global-only, and all (global+local)
             mdl_gl = _fit_cox(X_tr[sel_global], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
@@ -1039,6 +1057,11 @@ def evaluate_on_holdout(
         except Exception:
             sel_all_final = list(all_cols)
 
+    try:
+        _log(f"Final selected features -> global={len(sel_global_final)}, all={len(sel_all_final)}")
+    except Exception:
+        pass
+
     mdl_global = _fit_cox(X_tr[sel_global_final], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
     mdl_all = _fit_cox(X_tr[sel_all_final], y_tr, alpha=cox_alpha, clip_value=cox_clip_value)
 
@@ -1047,8 +1070,9 @@ def evaluate_on_holdout(
     gate_mask = gating["mask"]
     gate_model: Pipeline = gating["model"]  # type: ignore
 
-    # For test, gating uses only global features
-    gate_pred = gate_model.predict(X_te[sel_global_final])
+    # For test, gating must use the same features it was trained on
+    gate_features: List[str] = list(gating.get("features", []))
+    gate_pred = gate_model.predict(X_te[gate_features])
 
     # Predict Cox linear predictors for test set
     if mdl_global:
@@ -1168,8 +1192,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--use-feature-selection",
+        dest="use_feature_selection",
         action="store_true",
-        help="是否对 global/all 基模型启用前向特征选择（仅在训练集/折内进行，避免泄漏）",
+        default=True,
+        help="是否对 global/all 基模型启用前向特征选择（仅在训练集/折内进行，避免泄漏）[默认开启]",
+    )
+    parser.add_argument(
+        "--no-feature-selection",
+        dest="use_feature_selection",
+        action="store_false",
+        help="关闭前向特征选择以加速调试（覆盖默认开启）",
     )
     parser.add_argument(
         "--fs-max-features",
@@ -1212,6 +1244,18 @@ def main() -> None:
         use_feature_selection=args.use_feature_selection,
         fs_max_features=args.fs_max_features,
     )
+
+    # Print basic run configuration
+    try:
+        print("\n=== Run configuration ===")
+        print(f"Feature selection: {'ON' if args.use_feature_selection else 'OFF'}")
+        if args.fs_max_features is not None:
+            print(f"FS max features: {args.fs_max_features}")
+        print(f"Cox alpha: {args.cox_alpha}")
+        print(f"Horizon days: {args.horizon_days}")
+        print(f"KFold: {args.kfold}, Repeats: {args.repeats}")
+    except Exception:
+        pass
 
     print("\n=== Gating OOF (train) ===")
     print(f"Accuracy: {results['gating_oof_acc']:.4f}")
