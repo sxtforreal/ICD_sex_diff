@@ -42,6 +42,17 @@ def _maybe_tqdm(iterable, total=None, desc=None, leave=False):
             return iterable
     return iterable
 
+# Global max iterations for lifelines CoxPHFitter (None = library default)
+MAX_LIFELINES_STEPS: Optional[int] = None
+
+def set_max_iterations(n: Optional[int]) -> None:
+    """Set global max Newton–Raphson steps for lifelines Cox fitting."""
+    global MAX_LIFELINES_STEPS
+    try:
+        MAX_LIFELINES_STEPS = int(n) if n is not None and int(n) > 0 else None
+    except Exception:
+        MAX_LIFELINES_STEPS = None
+
 try:
     from missingpy import MissForest
 
@@ -1192,6 +1203,7 @@ def _fit_cox_lifelines(
                         duration_col=time_col,
                         event_col=event_col,
                         robust=True,
+                        max_steps=MAX_LIFELINES_STEPS,
                     )
                 return cph
             except Exception:
@@ -2576,6 +2588,17 @@ def main():
         default="/home/sunx/data/aiiih/projects/sunx/projects/ICD/fig",
         help="Output directory for figures and CSVs; takes precedence over env FIGURES_DIR",
     )
+    parser.add_argument(
+        "--max-iter",
+        type=int,
+        default=None,
+        help="Maximum iterations for lifelines CoxPH (Newton–Raphson steps).",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars and progress logs.",
+    )
     args = parser.parse_args()
 
     clean_df = load_dataframes()
@@ -2589,6 +2612,14 @@ def main():
         or figs_dir_env
         or os.path.join("figures", "three_model_assignment")
     )
+    # Apply CLI controls
+    set_max_iterations(args.max_iter)
+    if args.no_progress:
+        try:
+            global PROGRESS
+            PROGRESS = False
+        except Exception:
+            pass
     # Run three-model assignment and reverse feature analysis
     _ = evaluate_three_model_assignment_and_classifier(
         clean_df,
