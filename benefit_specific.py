@@ -614,6 +614,16 @@ def run_stabilized_two_model_pipeline(
     base_pool = list(FEATURE_SETS.get("Proposed", []))
     plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
 
+    # Exclude specified features from both pools
+    exclude_features = {"Age by decade", "CrCl>45", "NYHA>2", "Significant LGE"}
+    base_pool = [f for f in base_pool if f not in exclude_features]
+    plus_pool = [f for f in plus_pool if f not in exclude_features]
+
+    # Exclude specified features from both pools
+    exclude_features = {"Age by decade", "CrCl>45", "NYHA>2", "Significant LGE"}
+    base_pool = [f for f in base_pool if f not in exclude_features]
+    plus_pool = [f for f in plus_pool if f not in exclude_features]
+
     # Print feature pools used in experiments pipeline
     try:
         print("==== Feature Pools (Experiments) ====")
