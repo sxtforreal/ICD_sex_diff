@@ -93,6 +93,28 @@ def create_undersampled_dataset(
     )
 
 
+def drop_rows_with_missing_local_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows where any local categorical feature is missing.
+
+    This ensures fair comparison across models by training on identical subsets
+    that have complete local-feature information.
+    """
+    cols = [c for c in LOCAL_CATEGORICAL_FEATURES if c in df.columns]
+    if not cols:
+        return df
+    before = len(df)
+    out = df.dropna(subset=cols)
+    after = len(out)
+    if after < before:
+        try:
+            print(
+                f"[Fairness] Dropped {before - after} rows due to missing in local features: {cols}"
+            )
+        except Exception:
+            pass
+    return out
+
+
 def plot_cox_coefficients(
     model: CoxPHFitter,
     title: str,
@@ -839,6 +861,10 @@ def sex_specific_inference(
     """
     used_features = [f for f in features if f != "Female"]
 
+    # Enforce fairness: drop rows with missing local features
+    train_df = drop_rows_with_missing_local_features(train_df)
+    test_df = drop_rows_with_missing_local_features(test_df)
+
     train_m = (
         train_df[train_df["Female"] == 0].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
     )
@@ -915,6 +941,9 @@ def sex_specific_full_inference(
     - Dichotomizes by sex-specific median risks
     """
     used_features = [f for f in features if f != "Female"]
+
+    # Enforce fairness: drop rows with missing local features
+    df = drop_rows_with_missing_local_features(df)
 
     data_m = df[df["Female"] == 0].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
     data_f = df[df["Female"] == 1].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
@@ -1062,6 +1091,10 @@ def sex_agnostic_inference(
     Female is INCLUDED in features for agnostic model.
     """
     used_features = features
+
+    # Enforce fairness: drop rows with missing local features
+    train_df = drop_rows_with_missing_local_features(train_df)
+    test_df = drop_rows_with_missing_local_features(test_df)
     tr_base = (
         create_undersampled_dataset(train_df, label_col, 42)
         if use_undersampling
@@ -1112,6 +1145,9 @@ def sex_agnostic_full_inference(
     - Includes Female in features
     - Dichotomizes risk by overall median
     """
+    # Enforce fairness: drop rows with missing local features
+    df = drop_rows_with_missing_local_features(df)
+
     df_base = (
         create_undersampled_dataset(df, label_col, 42) if use_undersampling else df
     )
@@ -1204,6 +1240,9 @@ def evaluate_split(
     if mode == "sex_agnostic":
         # In agnostic model, Female is included
         used_features = feature_cols
+        # Enforce fairness on both train and test
+        train_df = drop_rows_with_missing_local_features(train_df)
+        test_df = drop_rows_with_missing_local_features(test_df)
         tr = (
             create_undersampled_dataset(train_df, event_col, seed)
             if use_undersampling
@@ -1236,6 +1275,8 @@ def evaluate_split(
     if mode == "male_only":
         # For single-sex model, exclude Female from features
         used_features = [f for f in feature_cols if f != "Female"]
+        train_df = drop_rows_with_missing_local_features(train_df)
+        test_df = drop_rows_with_missing_local_features(test_df)
         tr_m = train_df[train_df["Female"] == 0]
         te_m = test_df[test_df["Female"] == 0]
         if tr_m.empty or te_m.empty:
@@ -1259,6 +1300,8 @@ def evaluate_split(
     if mode == "female_only":
         # For single-sex model, exclude Female from features
         used_features = [f for f in feature_cols if f != "Female"]
+        train_df = drop_rows_with_missing_local_features(train_df)
+        test_df = drop_rows_with_missing_local_features(test_df)
         tr_f = train_df[train_df["Female"] == 1]
         te_f = test_df[test_df["Female"] == 1]
         if tr_f.empty or te_f.empty:
@@ -1282,6 +1325,8 @@ def evaluate_split(
     if mode == "sex_specific":
         # For single-sex submodels inside sex_specific, exclude Female from features
         used_features = [f for f in feature_cols if f != "Female"]
+        train_df = drop_rows_with_missing_local_features(train_df)
+        test_df = drop_rows_with_missing_local_features(test_df)
         # male branch
         tr_m = train_df[train_df["Female"] == 0]
         te_m = test_df[test_df["Female"] == 0]
@@ -1415,14 +1460,15 @@ def conversion_and_imputation(
         le = LabelEncoder()
         df[ordinal] = le.fit_transform(df[ordinal].astype(str))
 
-    # Encode local categorical features as label-encoded integers
+    # Encode local categorical features, preserving NaNs (do not impute here)
     for col in LOCAL_CATEGORICAL_FEATURES:
         if col in df.columns:
             try:
-                le_local = LabelEncoder()
-                df[col] = le_local.fit_transform(df[col].astype(str))
+                series = df[col]
+                cat = series.astype("category")
+                codes = cat.cat.codes.replace({-1: np.nan})
+                df[col] = pd.to_numeric(codes, errors="coerce")
             except Exception:
-                # Fallback to numeric coercion if label encoding fails
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # Convert binary columns to numeric
@@ -1448,13 +1494,14 @@ def conversion_and_imputation(
             )
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Imputation on feature matrix
+    # Imputation on feature matrix (exclude local categorical features)
     X = df[features].copy()
     missing_cols = X.columns[X.isnull().any()].tolist()
-    if missing_cols:
-        imputed_part = impute_misforest(X[missing_cols], 0)
+    impute_cols = [c for c in missing_cols if c not in LOCAL_CATEGORICAL_FEATURES]
+    if impute_cols:
+        imputed_part = impute_misforest(X[impute_cols], 0)
         imputed_X = X.copy()
-        imputed_X[missing_cols] = imputed_part
+        imputed_X[impute_cols] = imputed_part
     else:
         imputed_X = X.copy()
 
