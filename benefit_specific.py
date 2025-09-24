@@ -1200,15 +1200,7 @@ def run_benefit_specific_experiments(
         axis=1,
     )
     summary_table = formatted.unstack(level=1)
-    summary_table = summary_table.rename(
-        columns={
-            "c_index_all": "all",
-            "c_index_male": "male",
-            "c_index_female": "female",
-            "c_index_benefit": "benefit",
-            "c_index_non_benefit": "non_benefit",
-        }
-    )
+    summary_table = summary_table.rename(columns={"c_index_all": "all"})
 
     if export_excel_path is not None:
         os.makedirs(os.path.dirname(export_excel_path), exist_ok=True)
