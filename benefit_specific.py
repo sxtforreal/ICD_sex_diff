@@ -21,6 +21,7 @@ from ACC import (
 
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
 
 # Optional progress bar
 try:
@@ -118,9 +119,12 @@ class BenefitClassifier:
                     y_va = y[val_idx]
                     lr.fit(X_tr, y_tr)
                     p = lr.predict_proba(X_va)[:, 1]
-                    # Use Rank-based metric robust to threshold; fall back if degenerate
+                    # Use ROC AUC for binary benefit classification; safe if only one class in fold
                     try:
-                        auc = concordance_index(y_va, p, y_va)
+                        if np.unique(y_va).size < 2:
+                            auc = np.nan
+                        else:
+                            auc = roc_auc_score(y_va, p)
                     except Exception:
                         auc = np.nan
                     aucs.append(auc)
