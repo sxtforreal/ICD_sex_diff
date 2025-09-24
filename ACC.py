@@ -1824,8 +1824,19 @@ def run_cox_experiments(
         tr = tr.dropna(subset=[time_col, event_col])
         te = te.dropna(subset=[time_col, event_col])
 
-        for featset_name, feature_cols in feature_sets.items():
-            for cfg in model_configs:
+        outer_items = list(feature_sets.items())
+        outer_iter = (
+            tqdm(outer_items, desc="[Cox] Feature sets", leave=False)
+            if _HAS_TQDM
+            else outer_items
+        )
+        for featset_name, feature_cols in outer_iter:
+            inner_iter = (
+                tqdm(model_configs, desc=f"[Cox] {featset_name} configs", leave=False)
+                if _HAS_TQDM
+                else model_configs
+            )
+            for cfg in inner_iter:
                 name = f"{featset_name} - {cfg['name']}"
                 use_undersampling = cfg["mode"] == "sex_agnostic"
                 # Use stabilized features and disable per-split selection

@@ -211,7 +211,13 @@ def compute_oof_risks(
             for f in folds
         ]
 
-    for tr_idx_local, va_idx_local in splits:
+    # Optional inner progress over OOF folds
+    iter_splits = (
+        tqdm(splits, desc="[Benefit] OOF folds", leave=False)
+        if _HAS_TQDM
+        else splits
+    )
+    for tr_idx_local, va_idx_local in iter_splits:
         tr_part = tr_local.iloc[tr_idx_local]
         va_part = tr_local.iloc[va_idx_local]
 
@@ -254,40 +260,17 @@ def _train_group_model(
 ) -> Optional[GroupModel]:
     if df_group is None or df_group.empty:
         return None
-    # Stability selection first
-    try:
-        kept = stability_select_features(
-            df=df_group,
-            candidate_features=list(candidate_features),
-            time_col=time_col,
-            event_col=event_col,
-            seeds=stability_seeds,
-            max_features=None,
-            threshold=0.4,
-            min_features=None,
-            verbose=verbose,
-        )
-    except Exception:
-        kept = []
-    if not kept:
-        try:
-            kept = select_features_max_cindex_forward(
-                df_group,
-                list(candidate_features),
-                time_col,
-                event_col,
-                random_state=42,
-                verbose=verbose,
-            )
-        except Exception:
-            kept = [f for f in candidate_features if f in df_group.columns]
+    # No feature selection: use full candidate features; rely on fit_cox_model sanitization
+    kept = [f for f in candidate_features if f in df_group.columns]
     if not kept:
         return None
     try:
         cph = fit_cox_model(df_group, kept, time_col, event_col)
-        risk_tr = predict_risk(cph, df_group, kept)
+        # Use model's learned features to ensure consistency
+        model_feats = list(getattr(cph, "params_", pd.Series()).index)
+        risk_tr = predict_risk(cph, df_group, model_feats if model_feats else kept)
         thr = float(np.nanmedian(risk_tr))
-        return GroupModel(features=list(kept), threshold=thr, model=cph)
+        return GroupModel(features=(model_feats if model_feats else list(kept)), threshold=thr, model=cph)
     except Exception:
         return None
 
