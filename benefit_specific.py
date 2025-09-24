@@ -192,6 +192,37 @@ def _standardize_by_train(risk_tr: np.ndarray, risk_va: np.ndarray) -> np.ndarra
     return (risk_va - mu) / sd
 
 
+def _make_joint_stratify_labels(df: pd.DataFrame, cols: List[str]) -> Optional[pd.Series]:
+    """Build a joint stratification label from multiple discrete columns.
+
+    Returns a Series of string labels like "ICD|Female|Event" or None if any column missing.
+    Robust to numeric/boolean/categorical types; missing values are labeled as "NA".
+    """
+    try:
+        for c in cols:
+            if c not in df.columns:
+                return None
+        parts: List[pd.Series] = []
+        for c in cols:
+            s = df[c]
+            try:
+                s_num = pd.to_numeric(s, errors="coerce")
+                s_int = s_num.round().astype("Int64")
+                parts.append(s_int.astype(str).fillna("NA"))
+            except Exception:
+                try:
+                    s_cat = s.astype("category").cat.codes.astype("Int64")
+                    parts.append(s_cat.astype(str).fillna("NA"))
+                except Exception:
+                    parts.append(s.astype("string").fillna("NA"))
+        label = parts[0]
+        for p in parts[1:]:
+            label = label.str.cat(p, sep="|")
+        return label
+    except Exception:
+        return None
+
+
 def compute_oof_risks(
     train_df: pd.DataFrame,
     base_features: List[str],
@@ -318,6 +349,7 @@ def evaluate_benefit_specific_split(
     min_group_n: int = 100,
     min_events: int = 30,
     verbose: bool = False,
+    use_base_features_only_for_group_models: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
     """Train benefit-specific models on train_df and evaluate on test_df.
 
@@ -383,10 +415,11 @@ def evaluate_benefit_specific_split(
     plus_model: Optional[GroupModel] = None
 
     if group_ok:
-        # Benefit group uses Plus pool
+        # Benefit group model: optionally restrict to Base features only
+        plus_candidate_pool = base_pool if use_base_features_only_for_group_models else plus_pool
         plus_model = _train_group_model(
             df_group=df_benefit,
-            candidate_features=plus_pool,
+            candidate_features=plus_candidate_pool,
             time_col=time_col,
             event_col=event_col,
             stability_seeds=stability_seeds,
@@ -425,7 +458,12 @@ def evaluate_benefit_specific_split(
             np.nan_to_num(cidx_plus, nan=-np.inf)
             > np.nan_to_num(cidx_base, nan=-np.inf)
         )
-        pool = plus_pool if use_plus else base_pool
+        # If using base-only variant, force Base pool
+        if use_base_features_only_for_group_models:
+            pool = base_pool
+            use_plus = False
+        else:
+            pool = plus_pool if use_plus else base_pool
         try:
             single_model = _train_group_model(
                 df_group=train_df,
@@ -571,9 +609,15 @@ def _train_two_models_on_split(
     except Exception:
         risk_plus_test = np.zeros(len(test_df), dtype=float)
 
-    # Choose model with lower predicted risk per sample
+    # Choose better model per sample based on true label:
+    # If event==1 -> higher risk is better; if event==0 -> lower risk is better.
     try:
-        choose_plus_mask = np.asarray(risk_plus_test) < np.asarray(risk_base_test)
+        diff = np.asarray(risk_plus_test) - np.asarray(risk_base_test)
+        events = np.asarray(test_df[event_col]).astype(int)
+        choose_plus_mask = np.zeros(len(test_df), dtype=bool)
+        finite_idx = np.isfinite(diff) & np.isfinite(events.astype(float))
+        # For events==1, choose plus when diff>0; for events==0, choose plus when diff<0
+        choose_plus_mask[finite_idx] = np.where(events[finite_idx] == 1, diff[finite_idx] > 0.0, diff[finite_idx] < 0.0)
     except Exception:
         choose_plus_mask = np.zeros(len(test_df), dtype=bool)
 
@@ -600,6 +644,7 @@ def run_stabilized_two_model_pipeline(
     enforce_fair_subset: bool = True,
     tableone_excel_path: Optional[str] = None,
     clf_importance_excel_path: Optional[str] = None,
+    train_benefit_classifier: bool = False,
 ) -> Dict[str, object]:
     """Run N random splits to stabilize Base and Plus models, then finalize and evaluate.
 
@@ -614,6 +659,32 @@ def run_stabilized_two_model_pipeline(
     base_pool = list(FEATURE_SETS.get("Proposed", []))
     plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
 
+    # Exclude specified features from both pools
+    exclude_features = {"Age by decade", "CrCl>45", "NYHA>2", "Significant LGE"}
+    base_pool = [f for f in base_pool if f not in exclude_features]
+    plus_pool = [f for f in plus_pool if f not in exclude_features]
+
+    # Exclude specified features from both pools
+    exclude_features = {"Age by decade", "CrCl>45", "NYHA>2", "Significant LGE"}
+    base_pool = [f for f in base_pool if f not in exclude_features]
+    plus_pool = [f for f in plus_pool if f not in exclude_features]
+
+    # Print feature pools used in experiments pipeline
+    try:
+        print("==== Feature Pools (Experiments) ====")
+        print(f"Base (Proposed) features ({len(base_pool)}): {base_pool}")
+        print(f"Plus (Proposed Plus) features ({len(plus_pool)}): {plus_pool}")
+    except Exception:
+        pass
+
+    # Print feature pools used in stabilized pipeline
+    try:
+        print("==== Feature Pools (Stabilized Pipeline) ====")
+        print(f"Base (Proposed) features ({len(base_pool)}): {base_pool}")
+        print(f"Plus (Proposed Plus) features ({len(plus_pool)}): {plus_pool}")
+    except Exception:
+        pass
+
     if enforce_fair_subset:
         df_use = drop_rows_with_missing_local_features(df)
     else:
@@ -625,11 +696,17 @@ def run_stabilized_two_model_pipeline(
     iterator = tqdm(range(N), desc="[Stabilize] Splits", leave=True) if _HAS_TQDM else range(N)
     for seed in iterator:
         try:
+            data_use = df_use.dropna(subset=[time_col, event_col]).copy()
+            strat_labels = _make_joint_stratify_labels(data_use, ["ICD", "Female", event_col])
+            if strat_labels is not None and strat_labels.nunique() > 1:
+                stratify_arg = strat_labels
+            else:
+                stratify_arg = data_use[event_col] if data_use[event_col].nunique() > 1 else None
             tr, te = train_test_split(
-                df_use.dropna(subset=[time_col, event_col]).copy(),
+                data_use,
                 test_size=0.3,
                 random_state=seed,
-                stratify=df_use[event_col] if df_use[event_col].nunique() > 1 else None,
+                stratify=stratify_arg,
             )
         except Exception:
             continue
@@ -655,6 +732,14 @@ def run_stabilized_two_model_pipeline(
     plus_major = _majority_features(plus_feat_runs, min_frac=0.5)
     if not plus_major:
         plus_major = [f for f in plus_pool if f in df_use.columns]
+
+    # Print final selected feature sets
+    try:
+        print("==== Final Selected Features (Stabilized Pipeline) ====")
+        print(f"Final Base features ({len(base_major)}): {base_major}")
+        print(f"Final Plus features ({len(plus_major)}): {plus_major}")
+    except Exception:
+        pass
 
     # Train final models on full dataset
     final_base = _train_group_model(
@@ -720,77 +805,78 @@ def run_stabilized_two_model_pipeline(
     except Exception:
         pass
 
-    # Train a classifier (Base features only) to predict benefit group
+    # Train a classifier (Base features only) to predict benefit group (optional)
     clf_model: Optional[LogisticRegression] = None
     clf_importance: Optional[pd.DataFrame] = None
-    try:
-        X = df_use[[f for f in base_pool if f in df_use.columns]].copy()
-        y = benefit_mask.astype(int)
-        if X.shape[1] > 0 and len(np.unique(y)) == 2:
-            best_auc = -np.inf
-            best_lr: Optional[LogisticRegression] = None
-            Cs = [0.1, 0.5, 1.0]
-            skf = StratifiedKFold(
-                n_splits=min(5, int(np.bincount(y).min())) if np.bincount(y).size > 1 else 3,
-                shuffle=True,
-                random_state=0,
-            )
-            for C in Cs:
-                try:
-                    lr = LogisticRegression(
-                        penalty="l1",
-                        C=C,
-                        solver="liblinear",
-                        class_weight="balanced",
-                        random_state=0,
-                        max_iter=200,
-                    )
-                    aucs: List[float] = []
-                    for tr_idx, va_idx in skf.split(X, y):
-                        X_tr = X.iloc[tr_idx]
-                        y_tr = y[tr_idx]
-                        X_va = X.iloc[va_idx]
-                        y_va = y[va_idx]
-                        lr.fit(X_tr, y_tr)
-                        p = lr.predict_proba(X_va)[:, 1]
-                        try:
-                            if np.unique(y_va).size < 2:
+    if train_benefit_classifier:
+        try:
+            X = df_use[[f for f in base_pool if f in df_use.columns]].copy()
+            y = benefit_mask.astype(int)
+            if X.shape[1] > 0 and len(np.unique(y)) == 2:
+                best_auc = -np.inf
+                best_lr: Optional[LogisticRegression] = None
+                Cs = [0.1, 0.5, 1.0]
+                skf = StratifiedKFold(
+                    n_splits=min(5, int(np.bincount(y).min())) if np.bincount(y).size > 1 else 3,
+                    shuffle=True,
+                    random_state=0,
+                )
+                for C in Cs:
+                    try:
+                        lr = LogisticRegression(
+                            penalty="l1",
+                            C=C,
+                            solver="liblinear",
+                            class_weight="balanced",
+                            random_state=0,
+                            max_iter=200,
+                        )
+                        aucs: List[float] = []
+                        for tr_idx, va_idx in skf.split(X, y):
+                            X_tr = X.iloc[tr_idx]
+                            y_tr = y[tr_idx]
+                            X_va = X.iloc[va_idx]
+                            y_va = y[va_idx]
+                            lr.fit(X_tr, y_tr)
+                            p = lr.predict_proba(X_va)[:, 1]
+                            try:
+                                if np.unique(y_va).size < 2:
+                                    auc = np.nan
+                                else:
+                                    auc = roc_auc_score(y_va, p)
+                            except Exception:
                                 auc = np.nan
-                            else:
-                                auc = roc_auc_score(y_va, p)
-                        except Exception:
-                            auc = np.nan
-                        aucs.append(auc)
-                    finite_aucs = np.asarray(aucs, dtype=float)
-                    finite_aucs = finite_aucs[np.isfinite(finite_aucs)]
-                    mean_auc = float(np.mean(finite_aucs)) if finite_aucs.size > 0 else -np.inf
-                    if mean_auc > best_auc:
-                        best_auc = mean_auc
-                        best_lr = lr
-                except Exception:
-                    continue
-            clf_model = best_lr
-            if clf_model is not None:
-                clf_model.fit(X, y)
-                try:
-                    coefs = clf_model.coef_.reshape(-1)
-                    feats = list(X.columns)
-                    df_imp = pd.DataFrame({"feature": feats, "coef": coefs})
-                    df_imp["abs_coef"] = df_imp["coef"].abs()
-                    with np.errstate(over="ignore"):
-                        df_imp["odds_ratio"] = np.exp(df_imp["coef"])  # may overflow
-                    clf_importance = df_imp.sort_values("abs_coef", ascending=False).reset_index(drop=True)
-                    if clf_importance_excel_path is not None:
-                        try:
-                            os.makedirs(os.path.dirname(clf_importance_excel_path), exist_ok=True)
-                            clf_importance.to_excel(clf_importance_excel_path, index=False)
-                        except Exception:
-                            pass
-                except Exception:
-                    clf_importance = None
-    except Exception:
-        clf_model = None
-        clf_importance = None
+                            aucs.append(auc)
+                        finite_aucs = np.asarray(aucs, dtype=float)
+                        finite_aucs = finite_aucs[np.isfinite(finite_aucs)]
+                        mean_auc = float(np.mean(finite_aucs)) if finite_aucs.size > 0 else -np.inf
+                        if mean_auc > best_auc:
+                            best_auc = mean_auc
+                            best_lr = lr
+                    except Exception:
+                        continue
+                clf_model = best_lr
+                if clf_model is not None:
+                    clf_model.fit(X, y)
+                    try:
+                        coefs = clf_model.coef_.reshape(-1)
+                        feats = list(X.columns)
+                        df_imp = pd.DataFrame({"feature": feats, "coef": coefs})
+                        df_imp["abs_coef"] = df_imp["coef"].abs()
+                        with np.errstate(over="ignore"):
+                            df_imp["odds_ratio"] = np.exp(df_imp["coef"])  # may overflow
+                        clf_importance = df_imp.sort_values("abs_coef", ascending=False).reset_index(drop=True)
+                        if clf_importance_excel_path is not None:
+                            try:
+                                os.makedirs(os.path.dirname(clf_importance_excel_path), exist_ok=True)
+                                clf_importance.to_excel(clf_importance_excel_path, index=False)
+                            except Exception:
+                                pass
+                    except Exception:
+                        clf_importance = None
+        except Exception:
+            clf_model = None
+            clf_importance = None
 
     return {
         "final_base_features": base_major,
@@ -811,10 +897,13 @@ def run_benefit_specific_experiments(
     k_splits: int = 5,
     enforce_fair_subset: bool = True,
     export_excel_path: Optional[str] = None,
+    print_first_split_preview: bool = False,
 ) -> Tuple[Dict[str, Dict[str, List[float]]], pd.DataFrame]:
     """Run outer-loop evaluation for benefit-specific vs Proposed sex-specific baselines.
 
     Returns (results_dict, summary_table)
+
+    If print_first_split_preview=True, print classifier importance and TableOne for the first split.
     """
     base_pool = list(FEATURE_SETS.get("Proposed", []))
     plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
@@ -822,6 +911,7 @@ def run_benefit_specific_experiments(
     model_configs = [
         {"name": "Proposed Plus (benefit-specific)", "mode": "benefit_specific"},
         {"name": "Proposed (sex-specific)", "mode": "sex_specific_baseline"},
+        {"name": "Proposed Plus (benefit-specific, base-only)", "mode": "benefit_specific_base_only"},
     ]
     metrics = [
         "c_index_all",
@@ -836,14 +926,17 @@ def run_benefit_specific_experiments(
 
     iterator = tqdm(range(N), desc="[Benefit] Splits", leave=True) if _HAS_TQDM else range(N)
     for seed in iterator:
+        data_use = df.dropna(subset=[time_col, event_col]).copy()
+        strat_labels = _make_joint_stratify_labels(data_use, ["ICD", "Female", event_col])
+        stratify_arg = strat_labels if (strat_labels is not None and strat_labels.nunique() > 1) else (data_use[event_col] if data_use[event_col].nunique() > 1 else None)
         tr, te = train_test_split(
-            df.dropna(subset=[time_col, event_col]).copy(),
+            data_use,
             test_size=0.3,
             random_state=seed,
-            stratify=df[event_col] if df[event_col].nunique() > 1 else None,
+            stratify=stratify_arg,
         )
 
-        # Benefit-specific
+        # Benefit-specific (full Plus features)
         pred_b, risk_b, met_b = evaluate_benefit_specific_split(
             tr,
             te,
@@ -867,6 +960,20 @@ def run_benefit_specific_experiments(
             seed=seed,
             use_undersampling=False,
             disable_within_split_feature_selection=False,
+        )
+
+        # Benefit-specific (base-only variant)
+        pred_bb, risk_bb, met_bb = evaluate_benefit_specific_split(
+            tr,
+            te,
+            time_col,
+            event_col,
+            base_pool,
+            plus_pool,
+            random_state=seed,
+            k_splits=k_splits,
+            enforce_fair_subset=enforce_fair_subset,
+            use_base_features_only_for_group_models=True,
         )
 
         # Collect metrics consistently (per-sex c-index computed from risk arrays)
@@ -903,7 +1010,7 @@ def run_benefit_specific_experiments(
             else np.zeros(len(te_eval_s), dtype=bool)
         )
 
-        # Benefit-specific
+        # Benefit-specific (full)
         results["Proposed Plus (benefit-specific)"]["c_index_all"].append(
             met_b.get("c_index", np.nan)
         )
@@ -923,6 +1030,23 @@ def run_benefit_specific_experiments(
             _safe_cidx(non_benefit_mask, risk_b, te_eval_b)
         )
 
+        # Benefit-specific (base-only)
+        results["Proposed Plus (benefit-specific, base-only)"]["c_index_all"].append(
+            met_bb.get("c_index", np.nan)
+        )
+        benefit_mask_bb = met_bb.get("benefit_mask", np.zeros(len(te_eval_b), dtype=bool))
+        if benefit_mask_bb.shape[0] != len(te_eval_b):
+            min_len = min(benefit_mask_bb.shape[0], len(te_eval_b))
+            benefit_mask_bb = np.asarray(benefit_mask_bb).astype(bool)[:min_len]
+            risk_bb = np.asarray(risk_bb)[:min_len]
+        non_benefit_mask_bb = ~benefit_mask_bb
+        results["Proposed Plus (benefit-specific, base-only)"]["c_index_benefit"].append(
+            _safe_cidx(benefit_mask_bb, risk_bb, te_eval_b)
+        )
+        results["Proposed Plus (benefit-specific, base-only)"]["c_index_non_benefit"].append(
+            _safe_cidx(non_benefit_mask_bb, risk_bb, te_eval_b)
+        )
+
         # Sex-specific baseline
         results["Proposed (sex-specific)"]["c_index_all"].append(
             met_s.get("c_index", np.nan)
@@ -933,15 +1057,8 @@ def run_benefit_specific_experiments(
         results["Proposed (sex-specific)"]["c_index_female"].append(
             _safe_cidx(mask_f, risk_s, te_eval_s)
         )
-        # On the first split, generate TableOne for Benefit vs Non-benefit and print classifier importance
-        if seed == 0:
-            try:
-                benefit_importance = met_b.get("benefit_importance", None)
-                if benefit_importance is not None:
-                    print("==== Benefit Classifier Feature Importance (top 20 by |coef|) ====")
-                    print(benefit_importance.head(20))
-            except Exception:
-                pass
+        # On the first split, optionally generate TableOne only (classifier importance disabled)
+        if print_first_split_preview and seed == 0:
             try:
                 te_b_tab = te_eval_b.copy()
                 te_b_tab["BenefitGroup"] = np.where(benefit_mask, "Benefit", "Non-Benefit")
