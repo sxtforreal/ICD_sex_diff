@@ -530,15 +530,8 @@ def _train_two_models_on_split(
 ) -> Tuple[
     Optional[GroupModel],
     Optional[GroupModel],
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
 ]:
-    """Train Base and Plus Cox models on train_df and apply to test_df.
-
-    Returns (base_model, plus_model, risk_base_test, risk_plus_test, choose_plus_mask)
-    where choose_plus_mask indicates samples where Plus model yields lower predicted risk.
-    """
+    """Train Base and Plus Cox models on train_df and return the models."""
     base_model = _train_group_model(
         df_group=train_df,
         candidate_features=base_pool,
@@ -556,28 +549,7 @@ def _train_two_models_on_split(
         verbose=verbose,
     )
 
-    risk_base_test = np.zeros(len(test_df), dtype=float)
-    risk_plus_test = np.zeros(len(test_df), dtype=float)
-    choose_plus_mask = np.zeros(len(test_df), dtype=bool)
-
-    try:
-        if base_model is not None:
-            risk_base_test = predict_risk(base_model.model, test_df, base_model.features)
-    except Exception:
-        risk_base_test = np.zeros(len(test_df), dtype=float)
-    try:
-        if plus_model is not None:
-            risk_plus_test = predict_risk(plus_model.model, test_df, plus_model.features)
-    except Exception:
-        risk_plus_test = np.zeros(len(test_df), dtype=float)
-
-    # Choose model with lower predicted risk per sample
-    try:
-        choose_plus_mask = np.asarray(risk_plus_test) < np.asarray(risk_base_test)
-    except Exception:
-        choose_plus_mask = np.zeros(len(test_df), dtype=bool)
-
-    return base_model, plus_model, risk_base_test, risk_plus_test, choose_plus_mask
+    return base_model, plus_model
 
 
 def _majority_features(feature_lists: List[List[str]], min_frac: float = 0.5) -> List[str]:
@@ -634,7 +606,7 @@ def run_stabilized_two_model_pipeline(
         except Exception:
             continue
 
-        base_model, plus_model, _, _, _ = _train_two_models_on_split(
+        base_model, plus_model = _train_two_models_on_split(
             tr,
             te,
             time_col,
