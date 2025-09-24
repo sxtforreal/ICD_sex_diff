@@ -22,6 +22,14 @@ from ACC import (
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.linear_model import LogisticRegression
 
+# Optional progress bar
+try:
+    from tqdm import tqdm  # type: ignore
+
+    _HAS_TQDM = True
+except Exception:
+    _HAS_TQDM = False
+
 
 @dataclass
 class GroupModel:
@@ -116,7 +124,10 @@ class BenefitClassifier:
                     except Exception:
                         auc = np.nan
                     aucs.append(auc)
-                mean_auc = float(np.nanmean(aucs))
+                # Avoid RuntimeWarning when all values are NaN
+                finite_aucs = np.asarray(aucs, dtype=float)
+                finite_aucs = finite_aucs[np.isfinite(finite_aucs)]
+                mean_auc = float(np.mean(finite_aucs)) if finite_aucs.size > 0 else -np.inf
                 if mean_auc > best_auc:
                     best_auc = mean_auc
                     best_model = lr
@@ -499,7 +510,8 @@ def run_benefit_specific_experiments(
         cfg["name"]: {m: [] for m in metrics} for cfg in model_configs
     }
 
-    for seed in range(N):
+    iterator = tqdm(range(N), desc="[Benefit] Splits", leave=True) if _HAS_TQDM else range(N)
+    for seed in iterator:
         tr, te = train_test_split(
             df.dropna(subset=[time_col, event_col]).copy(),
             test_size=0.3,
@@ -584,10 +596,23 @@ def run_benefit_specific_experiments(
         summary[model] = {}
         for metric, values in mvals.items():
             arr = np.array(values, dtype=float)
-            mu = np.nanmean(arr)
-            se = np.nanstd(arr, ddof=1) / np.sqrt(np.sum(~np.isnan(arr)))
-            ci = 1.96 * se
-            summary[model][metric] = (mu, mu - ci, mu + ci)
+            finite = np.isfinite(arr)
+            n = int(finite.sum())
+            if n == 0:
+                mu = np.nan
+                ci_lower = np.nan
+                ci_upper = np.nan
+            else:
+                vals = arr[finite]
+                mu = float(np.mean(vals))
+                if n > 1:
+                    se = float(np.std(vals, ddof=1)) / np.sqrt(n)
+                    ci = 1.96 * se
+                else:
+                    ci = 0.0
+                ci_lower = mu - ci
+                ci_upper = mu + ci
+            summary[model][metric] = (mu, ci_lower, ci_upper)
 
     summary_df = pd.concat(
         {

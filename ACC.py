@@ -75,6 +75,14 @@ try:
 except Exception:
     _HAS_TABLEONE = False
 
+# Optional progress bar
+try:
+    from tqdm import tqdm  # type: ignore
+
+    _HAS_TQDM = True
+except Exception:
+    _HAS_TQDM = False
+
 
 # ==========================================
 # Utilities
@@ -1513,10 +1521,17 @@ def conversion_and_imputation(
     exist_bin = [c for c in binary_cols if c in df.columns]
     for c in exist_bin:
         if df[c].dtype == "object":
-            df[c] = df[c].replace(
+            mapped = df[c].replace(
                 {"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0}
             )
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+            # Retain old pandas downcasting behavior explicitly to avoid FutureWarning
+            try:
+                mapped = mapped.infer_objects(copy=False)
+            except Exception:
+                pass
+            df[c] = pd.to_numeric(mapped, errors="coerce")
+        else:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # Imputation on feature matrix (exclude local categorical features)
     X = df[features].copy()
@@ -1797,8 +1812,12 @@ def run_cox_experiments(
         except Exception:
             pass
 
-    for seed in range(N):
-        print(seed)
+    iterator = (
+        tqdm(range(N), desc="[Cox] Splits", leave=True)
+        if _HAS_TQDM
+        else range(N)
+    )
+    for seed in iterator:
         tr, te = train_test_split(
             df, test_size=0.3, random_state=seed, stratify=df[event_col]
         )
