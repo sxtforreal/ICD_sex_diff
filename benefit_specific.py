@@ -614,6 +614,22 @@ def run_stabilized_two_model_pipeline(
     base_pool = list(FEATURE_SETS.get("Proposed", []))
     plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
 
+    # Print feature pools used in experiments pipeline
+    try:
+        print("==== Feature Pools (Experiments) ====")
+        print(f"Base (Proposed) features ({len(base_pool)}): {base_pool}")
+        print(f"Plus (Proposed Plus) features ({len(plus_pool)}): {plus_pool}")
+    except Exception:
+        pass
+
+    # Print feature pools used in stabilized pipeline
+    try:
+        print("==== Feature Pools (Stabilized Pipeline) ====")
+        print(f"Base (Proposed) features ({len(base_pool)}): {base_pool}")
+        print(f"Plus (Proposed Plus) features ({len(plus_pool)}): {plus_pool}")
+    except Exception:
+        pass
+
     if enforce_fair_subset:
         df_use = drop_rows_with_missing_local_features(df)
     else:
@@ -655,6 +671,14 @@ def run_stabilized_two_model_pipeline(
     plus_major = _majority_features(plus_feat_runs, min_frac=0.5)
     if not plus_major:
         plus_major = [f for f in plus_pool if f in df_use.columns]
+
+    # Print final selected feature sets
+    try:
+        print("==== Final Selected Features (Stabilized Pipeline) ====")
+        print(f"Final Base features ({len(base_major)}): {base_major}")
+        print(f"Final Plus features ({len(plus_major)}): {plus_major}")
+    except Exception:
+        pass
 
     # Train final models on full dataset
     final_base = _train_group_model(
