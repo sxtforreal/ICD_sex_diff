@@ -132,7 +132,9 @@ class BenefitClassifier:
                 # Avoid RuntimeWarning when all values are NaN
                 finite_aucs = np.asarray(aucs, dtype=float)
                 finite_aucs = finite_aucs[np.isfinite(finite_aucs)]
-                mean_auc = float(np.mean(finite_aucs)) if finite_aucs.size > 0 else -np.inf
+                mean_auc = (
+                    float(np.mean(finite_aucs)) if finite_aucs.size > 0 else -np.inf
+                )
                 if mean_auc > best_auc:
                     best_auc = mean_auc
                     best_model = lr
@@ -177,8 +179,12 @@ class BenefitClassifier:
                 df_imp = pd.DataFrame({"feature": feats, "coef": coefs})
             df_imp["abs_coef"] = df_imp["coef"].abs()
             with np.errstate(over="ignore"):
-                df_imp["odds_ratio"] = np.exp(df_imp["coef"])  # may overflow -> inf acceptable
-            df_imp = df_imp.sort_values("abs_coef", ascending=False).reset_index(drop=True)
+                df_imp["odds_ratio"] = np.exp(
+                    df_imp["coef"]
+                )  # may overflow -> inf acceptable
+            df_imp = df_imp.sort_values("abs_coef", ascending=False).reset_index(
+                drop=True
+            )
             return df_imp
         except Exception:
             return None
@@ -192,7 +198,9 @@ def _standardize_by_train(risk_tr: np.ndarray, risk_va: np.ndarray) -> np.ndarra
     return (risk_va - mu) / sd
 
 
-def _make_joint_stratify_labels(df: pd.DataFrame, cols: List[str]) -> Optional[pd.Series]:
+def _make_joint_stratify_labels(
+    df: pd.DataFrame, cols: List[str]
+) -> Optional[pd.Series]:
     """Build a joint stratification label from multiple discrete columns.
 
     Returns a Series of string labels like "ICD|Female|Event" or None if any column missing.
@@ -273,9 +281,7 @@ def compute_oof_risks(
 
     # Optional inner progress over OOF folds
     iter_splits = (
-        tqdm(splits, desc="[Benefit] OOF folds", leave=False)
-        if _HAS_TQDM
-        else splits
+        tqdm(splits, desc="[Benefit] OOF folds", leave=False) if _HAS_TQDM else splits
     )
     for tr_idx_local, va_idx_local in iter_splits:
         tr_part = tr_local.iloc[tr_idx_local]
@@ -330,7 +336,11 @@ def _train_group_model(
         model_feats = list(getattr(cph, "params_", pd.Series()).index)
         risk_tr = predict_risk(cph, df_group, model_feats if model_feats else kept)
         thr = float(np.nanmedian(risk_tr))
-        return GroupModel(features=(model_feats if model_feats else list(kept)), threshold=thr, model=cph)
+        return GroupModel(
+            features=(model_feats if model_feats else list(kept)),
+            threshold=thr,
+            model=cph,
+        )
     except Exception:
         return None
 
@@ -416,7 +426,9 @@ def evaluate_benefit_specific_split(
 
     if group_ok:
         # Benefit group model: optionally restrict to Base features only
-        plus_candidate_pool = base_pool if use_base_features_only_for_group_models else plus_pool
+        plus_candidate_pool = (
+            base_pool if use_base_features_only_for_group_models else plus_pool
+        )
         plus_model = _train_group_model(
             df_group=df_benefit,
             candidate_features=plus_candidate_pool,
@@ -498,7 +510,9 @@ def evaluate_benefit_specific_split(
             cidx = np.nan
         # Even in fallback, expose benefit mask predicted by classifier for downstream subgroup analysis
         try:
-            benefit_mask = benefit_clf.predict_label(test_df, threshold=0.5).astype(bool)
+            benefit_mask = benefit_clf.predict_label(test_df, threshold=0.5).astype(
+                bool
+            )
         except Exception:
             benefit_mask = np.zeros(len(test_df), dtype=bool)
         return (
@@ -600,12 +614,16 @@ def _train_two_models_on_split(
 
     try:
         if base_model is not None:
-            risk_base_test = predict_risk(base_model.model, test_df, base_model.features)
+            risk_base_test = predict_risk(
+                base_model.model, test_df, base_model.features
+            )
     except Exception:
         risk_base_test = np.zeros(len(test_df), dtype=float)
     try:
         if plus_model is not None:
-            risk_plus_test = predict_risk(plus_model.model, test_df, plus_model.features)
+            risk_plus_test = predict_risk(
+                plus_model.model, test_df, plus_model.features
+            )
     except Exception:
         risk_plus_test = np.zeros(len(test_df), dtype=float)
 
@@ -617,14 +635,18 @@ def _train_two_models_on_split(
         choose_plus_mask = np.zeros(len(test_df), dtype=bool)
         finite_idx = np.isfinite(diff) & np.isfinite(events.astype(float))
         # For events==1, choose plus when diff>0; for events==0, choose plus when diff<0
-        choose_plus_mask[finite_idx] = np.where(events[finite_idx] == 1, diff[finite_idx] > 0.0, diff[finite_idx] < 0.0)
+        choose_plus_mask[finite_idx] = np.where(
+            events[finite_idx] == 1, diff[finite_idx] > 0.0, diff[finite_idx] < 0.0
+        )
     except Exception:
         choose_plus_mask = np.zeros(len(test_df), dtype=bool)
 
     return base_model, plus_model, risk_base_test, risk_plus_test, choose_plus_mask
 
 
-def _majority_features(feature_lists: List[List[str]], min_frac: float = 0.5) -> List[str]:
+def _majority_features(
+    feature_lists: List[List[str]], min_frac: float = 0.5
+) -> List[str]:
     if not feature_lists:
         return []
     total = len(feature_lists)
@@ -701,15 +723,21 @@ def run_stabilized_two_model_pipeline(
     base_feat_runs: List[List[str]] = []
     plus_feat_runs: List[List[str]] = []
 
-    iterator = tqdm(range(N), desc="[Stabilize] Splits", leave=True) if _HAS_TQDM else range(N)
+    iterator = (
+        tqdm(range(N), desc="[Stabilize] Splits", leave=True) if _HAS_TQDM else range(N)
+    )
     for seed in iterator:
         try:
             data_use = df_use.dropna(subset=[time_col, event_col]).copy()
-            strat_labels = _make_joint_stratify_labels(data_use, ["ICD", "Female", event_col])
+            strat_labels = _make_joint_stratify_labels(
+                data_use, ["ICD", "Female", event_col]
+            )
             if strat_labels is not None and strat_labels.nunique() > 1:
                 stratify_arg = strat_labels
             else:
-                stratify_arg = data_use[event_col] if data_use[event_col].nunique() > 1 else None
+                stratify_arg = (
+                    data_use[event_col] if data_use[event_col].nunique() > 1 else None
+                )
             tr, te = train_test_split(
                 data_use,
                 test_size=0.3,
@@ -788,7 +816,11 @@ def run_stabilized_two_model_pipeline(
     # Metrics
     def _cidx_safe(risk: np.ndarray) -> float:
         try:
-            return float(concordance_index(df_use[time_col], -np.asarray(risk), df_use[event_col]))
+            return float(
+                concordance_index(
+                    df_use[time_col], -np.asarray(risk), df_use[event_col]
+                )
+            )
         except Exception:
             return np.nan
 
@@ -801,11 +833,15 @@ def run_stabilized_two_model_pipeline(
     # TableOne for benefit vs non-benefit groups (test split only, event-conditioned choice)
     try:
         data_tab = df_use.dropna(subset=[time_col, event_col]).copy()
-        strat_labels = _make_joint_stratify_labels(data_tab, ["ICD", "Female", event_col])
+        strat_labels = _make_joint_stratify_labels(
+            data_tab, ["ICD", "Female", event_col]
+        )
         if strat_labels is not None and strat_labels.nunique() > 1:
             stratify_arg = strat_labels
         else:
-            stratify_arg = data_tab[event_col] if data_tab[event_col].nunique() > 1 else None
+            stratify_arg = (
+                data_tab[event_col] if data_tab[event_col].nunique() > 1 else None
+            )
         tr_tab, te_tab = train_test_split(
             data_tab,
             test_size=0.3,
@@ -836,12 +872,16 @@ def run_stabilized_two_model_pipeline(
         risk_plus_tab = np.zeros(len(te_tab), dtype=float)
         try:
             if tab_base_model is not None:
-                risk_base_tab = predict_risk(tab_base_model.model, te_tab, tab_base_model.features)
+                risk_base_tab = predict_risk(
+                    tab_base_model.model, te_tab, tab_base_model.features
+                )
         except Exception:
             pass
         try:
             if tab_plus_model is not None:
-                risk_plus_tab = predict_risk(tab_plus_model.model, te_tab, tab_plus_model.features)
+                risk_plus_tab = predict_risk(
+                    tab_plus_model.model, te_tab, tab_plus_model.features
+                )
         except Exception:
             pass
 
@@ -850,7 +890,11 @@ def run_stabilized_two_model_pipeline(
             events_tab = te_tab[event_col].values.astype(int)
         except Exception:
             events_tab = np.zeros(len(te_tab), dtype=int)
-        choose_plus_tab = np.where(events_tab == 1, risk_plus_tab > risk_base_tab, risk_plus_tab < risk_base_tab)
+        choose_plus_tab = np.where(
+            events_tab == 1,
+            risk_plus_tab > risk_base_tab,
+            risk_plus_tab < risk_base_tab,
+        )
         df_tab = te_tab.copy()
         df_tab["BenefitGroup"] = np.where(choose_plus_tab, "Benefit", "Non-Benefit")
         try:
@@ -876,7 +920,11 @@ def run_stabilized_two_model_pipeline(
                 best_lr: Optional[LogisticRegression] = None
                 Cs = [0.1, 0.5, 1.0]
                 skf = StratifiedKFold(
-                    n_splits=min(5, int(np.bincount(y).min())) if np.bincount(y).size > 1 else 3,
+                    n_splits=(
+                        min(5, int(np.bincount(y).min()))
+                        if np.bincount(y).size > 1
+                        else 3
+                    ),
                     shuffle=True,
                     random_state=0,
                 )
@@ -908,7 +956,11 @@ def run_stabilized_two_model_pipeline(
                             aucs.append(auc)
                         finite_aucs = np.asarray(aucs, dtype=float)
                         finite_aucs = finite_aucs[np.isfinite(finite_aucs)]
-                        mean_auc = float(np.mean(finite_aucs)) if finite_aucs.size > 0 else -np.inf
+                        mean_auc = (
+                            float(np.mean(finite_aucs))
+                            if finite_aucs.size > 0
+                            else -np.inf
+                        )
                         if mean_auc > best_auc:
                             best_auc = mean_auc
                             best_lr = lr
@@ -923,12 +975,21 @@ def run_stabilized_two_model_pipeline(
                         df_imp = pd.DataFrame({"feature": feats, "coef": coefs})
                         df_imp["abs_coef"] = df_imp["coef"].abs()
                         with np.errstate(over="ignore"):
-                            df_imp["odds_ratio"] = np.exp(df_imp["coef"])  # may overflow
-                        clf_importance = df_imp.sort_values("abs_coef", ascending=False).reset_index(drop=True)
+                            df_imp["odds_ratio"] = np.exp(
+                                df_imp["coef"]
+                            )  # may overflow
+                        clf_importance = df_imp.sort_values(
+                            "abs_coef", ascending=False
+                        ).reset_index(drop=True)
                         if clf_importance_excel_path is not None:
                             try:
-                                os.makedirs(os.path.dirname(clf_importance_excel_path), exist_ok=True)
-                                clf_importance.to_excel(clf_importance_excel_path, index=False)
+                                os.makedirs(
+                                    os.path.dirname(clf_importance_excel_path),
+                                    exist_ok=True,
+                                )
+                                clf_importance.to_excel(
+                                    clf_importance_excel_path, index=False
+                                )
                             except Exception:
                                 pass
                     except Exception:
@@ -970,22 +1031,35 @@ def run_benefit_specific_experiments(
     model_configs = [
         {"name": "Proposed Plus (benefit-specific)", "mode": "benefit_specific"},
         {"name": "Proposed (sex-specific)", "mode": "sex_specific_baseline"},
-        {"name": "Proposed Plus (benefit-specific, base-only)", "mode": "benefit_specific_base_only"},
-        {"name": "Stabilized Proposed (base)", "mode": "stabilized_proposed_base"},
-        {"name": "Stabilized Proposed Plus", "mode": "stabilized_proposed_plus"},
+        {
+            "name": "Proposed Plus (benefit-specific, base-only)",
+            "mode": "benefit_specific_base_only",
+        },
     ]
     metrics = [
         "c_index_all",
+        "c_index_male",
+        "c_index_female",
+        "c_index_benefit",
+        "c_index_non_benefit",
     ]
     results: Dict[str, Dict[str, List[float]]] = {
         cfg["name"]: {m: [] for m in metrics} for cfg in model_configs
     }
 
-    iterator = tqdm(range(N), desc="[Benefit] Splits", leave=True) if _HAS_TQDM else range(N)
+    iterator = (
+        tqdm(range(N), desc="[Benefit] Splits", leave=True) if _HAS_TQDM else range(N)
+    )
     for seed in iterator:
         data_use = df.dropna(subset=[time_col, event_col]).copy()
-        strat_labels = _make_joint_stratify_labels(data_use, ["ICD", "Female", event_col])
-        stratify_arg = strat_labels if (strat_labels is not None and strat_labels.nunique() > 1) else (data_use[event_col] if data_use[event_col].nunique() > 1 else None)
+        strat_labels = _make_joint_stratify_labels(
+            data_use, ["ICD", "Female", event_col]
+        )
+        stratify_arg = (
+            strat_labels
+            if (strat_labels is not None and strat_labels.nunique() > 1)
+            else (data_use[event_col] if data_use[event_col].nunique() > 1 else None)
+        )
         tr, te = train_test_split(
             data_use,
             test_size=0.3,
@@ -1033,131 +1107,108 @@ def run_benefit_specific_experiments(
             use_base_features_only_for_group_models=True,
         )
 
-        # Append overall C-index only for required models
+        # Collect metrics consistently (per-sex c-index computed from risk arrays)
+        def _safe_cidx(
+            mask: np.ndarray, risk: np.ndarray, te_local: pd.DataFrame
+        ) -> float:
+            try:
+                if mask.dtype != bool:
+                    mask_bool = mask.astype(bool)
+                else:
+                    mask_bool = mask
+                t = te_local.loc[mask_bool, time_col].values
+                e = te_local.loc[mask_bool, event_col].values
+                r = np.asarray(risk)[mask]
+                if len(t) < 2 or np.all(~np.isfinite(r)) or np.allclose(r, r[0]):
+                    return np.nan
+                return float(concordance_index(t, -r, e))
+            except Exception:
+                return np.nan
+
+        # Build aligned evaluation frames for subgroup metrics
+        te_eval_b = (
+            ACC.drop_rows_with_missing_local_features(te)
+            if enforce_fair_subset
+            else te.copy()
+        )
+        te_eval_s = ACC.drop_rows_with_missing_local_features(te)
+        mask_m = (
+            te_eval_s["Female"].values == 0
+            if "Female" in te_eval_s.columns
+            else np.zeros(len(te_eval_s), dtype=bool)
+        )
+        mask_f = (
+            te_eval_s["Female"].values == 1
+            if "Female" in te_eval_s.columns
+            else np.zeros(len(te_eval_s), dtype=bool)
+        )
+
+        # Benefit-specific (full)
         results["Proposed Plus (benefit-specific)"]["c_index_all"].append(
             met_b.get("c_index", np.nan)
         )
+        # Benefit vs Non-benefit subgroup C-index
+        benefit_mask = met_b.get("benefit_mask", np.zeros(len(te_eval_b), dtype=bool))
+        if benefit_mask.shape[0] != len(te_eval_b):
+            # Best-effort alignment fallback: truncate or pad
+            min_len = min(benefit_mask.shape[0], len(te_eval_b))
+            benefit_mask = np.asarray(benefit_mask).astype(bool)[:min_len]
+            risk_b = np.asarray(risk_b)[:min_len]
+            te_eval_b = te_eval_b.iloc[:min_len]
+        non_benefit_mask = ~benefit_mask
+        results["Proposed Plus (benefit-specific)"]["c_index_benefit"].append(
+            _safe_cidx(benefit_mask, risk_b, te_eval_b)
+        )
+        results["Proposed Plus (benefit-specific)"]["c_index_non_benefit"].append(
+            _safe_cidx(non_benefit_mask, risk_b, te_eval_b)
+        )
+
+        # Benefit-specific (base-only)
         results["Proposed Plus (benefit-specific, base-only)"]["c_index_all"].append(
             met_bb.get("c_index", np.nan)
         )
+        benefit_mask_bb = met_bb.get(
+            "benefit_mask", np.zeros(len(te_eval_b), dtype=bool)
+        )
+        if benefit_mask_bb.shape[0] != len(te_eval_b):
+            min_len = min(benefit_mask_bb.shape[0], len(te_eval_b))
+            benefit_mask_bb = np.asarray(benefit_mask_bb).astype(bool)[:min_len]
+            risk_bb = np.asarray(risk_bb)[:min_len]
+        non_benefit_mask_bb = ~benefit_mask_bb
+        results["Proposed Plus (benefit-specific, base-only)"][
+            "c_index_benefit"
+        ].append(_safe_cidx(benefit_mask_bb, risk_bb, te_eval_b))
+        results["Proposed Plus (benefit-specific, base-only)"][
+            "c_index_non_benefit"
+        ].append(_safe_cidx(non_benefit_mask_bb, risk_bb, te_eval_b))
+
+        # Sex-specific baseline
         results["Proposed (sex-specific)"]["c_index_all"].append(
             met_s.get("c_index", np.nan)
         )
-
-        # Stabilized Proposed (base) and Stabilized Proposed Plus on the test split
-        try:
-            tr_fair = ACC.drop_rows_with_missing_local_features(tr)
-            tr_m = tr_fair[tr_fair["Female"] == 0].dropna(subset=[time_col, event_col]).copy()
-            tr_f = tr_fair[tr_fair["Female"] == 1].dropna(subset=[time_col, event_col]).copy()
-            seeds_stab = list(range(10))
-
-            # Base (Proposed)
-            base_no_female = [f for f in base_pool if f != "Female"]
-            sel_m_base = stability_select_features(
-                df=tr_m,
-                candidate_features=list(base_no_female),
-                time_col=time_col,
-                event_col=event_col,
-                seeds=seeds_stab,
-                max_features=None,
-                threshold=0.4,
-                min_features=None,
-                verbose=False,
-            ) if not tr_m.empty else []
-            sel_f_base = stability_select_features(
-                df=tr_f,
-                candidate_features=list(base_no_female),
-                time_col=time_col,
-                event_col=event_col,
-                seeds=seeds_stab,
-                max_features=None,
-                threshold=0.4,
-                min_features=None,
-                verbose=False,
-            ) if not tr_f.empty else []
-            overrides_base = {
-                "male": sel_m_base if sel_m_base else base_no_female,
-                "female": sel_f_base if sel_f_base else base_no_female,
-            }
-            _, _, met_stab_base = ACC.evaluate_split(
-                tr,
-                te,
-                feature_cols=base_pool,
-                time_col=time_col,
-                event_col=event_col,
-                mode="sex_specific",
-                seed=seed,
-                use_undersampling=False,
-                disable_within_split_feature_selection=True,
-                sex_specific_feature_override=overrides_base,
-            )
-            results["Stabilized Proposed (base)"]["c_index_all"].append(
-                met_stab_base.get("c_index", np.nan)
-            )
-
-            # Plus (Proposed Plus)
-            plus_no_female = [f for f in plus_pool if f != "Female"]
-            sel_m_plus = stability_select_features(
-                df=tr_m,
-                candidate_features=list(plus_no_female),
-                time_col=time_col,
-                event_col=event_col,
-                seeds=seeds_stab,
-                max_features=None,
-                threshold=0.4,
-                min_features=None,
-                verbose=False,
-            ) if not tr_m.empty else []
-            sel_f_plus = stability_select_features(
-                df=tr_f,
-                candidate_features=list(plus_no_female),
-                time_col=time_col,
-                event_col=event_col,
-                seeds=seeds_stab,
-                max_features=None,
-                threshold=0.4,
-                min_features=None,
-                verbose=False,
-            ) if not tr_f.empty else []
-            overrides_plus = {
-                "male": sel_m_plus if sel_m_plus else plus_no_female,
-                "female": sel_f_plus if sel_f_plus else plus_no_female,
-            }
-            _, _, met_stab_plus = ACC.evaluate_split(
-                tr,
-                te,
-                feature_cols=plus_pool,
-                time_col=time_col,
-                event_col=event_col,
-                mode="sex_specific",
-                seed=seed,
-                use_undersampling=False,
-                disable_within_split_feature_selection=True,
-                sex_specific_feature_override=overrides_plus,
-            )
-            results["Stabilized Proposed Plus"]["c_index_all"].append(
-                met_stab_plus.get("c_index", np.nan)
-            )
-        except Exception:
-            results["Stabilized Proposed (base)"]["c_index_all"].append(np.nan)
-            results["Stabilized Proposed Plus"]["c_index_all"].append(np.nan)
-
-        # Optional TableOne preview based on benefit grouping for the first split
+        results["Proposed (sex-specific)"]["c_index_male"].append(
+            _safe_cidx(mask_m, risk_s, te_eval_s)
+        )
+        results["Proposed (sex-specific)"]["c_index_female"].append(
+            _safe_cidx(mask_f, risk_s, te_eval_s)
+        )
+        # On the first split, optionally generate TableOne only (classifier importance disabled)
         if print_first_split_preview and seed == 0:
             try:
-                te_eval_b = (
-                    ACC.drop_rows_with_missing_local_features(te)
-                    if enforce_fair_subset
-                    else te.copy()
-                )
-                benefit_mask = met_b.get("benefit_mask", np.zeros(len(te_eval_b), dtype=bool))
                 te_b_tab = te_eval_b.copy()
-                te_b_tab["BenefitGroup"] = np.where(benefit_mask, "Benefit", "Non-Benefit")
-                ACC.generate_tableone_by_group(
-                    te_b_tab,
-                    group_col="BenefitGroup",
-                    output_excel_path=None,
+                te_b_tab["BenefitGroup"] = np.where(
+                    benefit_mask, "Benefit", "Non-Benefit"
                 )
+                # Generate TableOne for BenefitGroup
+                try:
+                    ACC.generate_tableone_by_group(
+                        te_b_tab,
+                        group_col="BenefitGroup",
+                        output_excel_path=None,
+                    )
+                except Exception:
+                    # Silent fail if grouping utility missing
+                    pass
             except Exception:
                 pass
 
@@ -1200,7 +1251,15 @@ def run_benefit_specific_experiments(
         axis=1,
     )
     summary_table = formatted.unstack(level=1)
-    summary_table = summary_table.rename(columns={"c_index_all": "all"})
+    summary_table = summary_table.rename(
+        columns={
+            "c_index_all": "all",
+            "c_index_male": "male",
+            "c_index_female": "female",
+            "c_index_benefit": "benefit",
+            "c_index_non_benefit": "non_benefit",
+        }
+    )
 
     if export_excel_path is not None:
         os.makedirs(os.path.dirname(export_excel_path), exist_ok=True)
@@ -1234,8 +1293,10 @@ if __name__ == "__main__":
 
     # New stabilized two-model pipeline
     try:
-        tableone_path = None  # e.g., "/workspace/outputs/benefit_tableone.xlsx"
-        clf_imp_path = None  # e.g., "/workspace/outputs/benefit_classifier_importance.xlsx"
+        tableone_path = (
+            "/home/sunx/data/aiiih/projects/sunx/projects/ICD/benefit_tableone.xlsx"
+        )
+        clf_imp_path = "/home/sunx/data/aiiih/projects/sunx/projects/ICD/benefit_classifier_importance.xlsx"
         stabilized = run_stabilized_two_model_pipeline(
             df=df,
             N=10,
