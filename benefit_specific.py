@@ -659,7 +659,7 @@ def run_stabilized_two_model_pipeline(
     base_pool = list(FEATURE_SETS.get("Proposed", []))
     plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
 
-    # Exclude specified features from both pools
+    # Exclude specified features from both pools for all experiments
     exclude_features = {"Age by decade", "CrCl>45", "NYHA>2", "Significant LGE"}
     base_pool = [f for f in base_pool if f not in exclude_features]
     plus_pool = [f for f in plus_pool if f not in exclude_features]
@@ -668,6 +668,14 @@ def run_stabilized_two_model_pipeline(
     exclude_features = {"Age by decade", "CrCl>45", "NYHA>2", "Significant LGE"}
     base_pool = [f for f in base_pool if f not in exclude_features]
     plus_pool = [f for f in plus_pool if f not in exclude_features]
+
+    # Print feature pools used in experiments pipeline
+    try:
+        print("==== Feature Pools (Experiments) ====")
+        print(f"Base (Proposed) features ({len(base_pool)}): {base_pool}")
+        print(f"Plus (Proposed Plus) features ({len(plus_pool)}): {plus_pool}")
+    except Exception:
+        pass
 
     # Print feature pools used in experiments pipeline
     try:
@@ -790,10 +798,61 @@ def run_stabilized_two_model_pipeline(
         "c_index_per_sample_best": _cidx_safe(risk_best_all),
     }
 
-    # TableOne for benefit vs non-benefit groups
+    # TableOne for benefit vs non-benefit groups (test split only, event-conditioned choice)
     try:
-        df_tab = df_use.copy()
-        df_tab["BenefitGroup"] = np.where(benefit_mask, "Benefit", "Non-Benefit")
+        data_tab = df_use.dropna(subset=[time_col, event_col]).copy()
+        strat_labels = _make_joint_stratify_labels(data_tab, ["ICD", "Female", event_col])
+        if strat_labels is not None and strat_labels.nunique() > 1:
+            stratify_arg = strat_labels
+        else:
+            stratify_arg = data_tab[event_col] if data_tab[event_col].nunique() > 1 else None
+        tr_tab, te_tab = train_test_split(
+            data_tab,
+            test_size=0.3,
+            random_state=0,
+            stratify=stratify_arg,
+        )
+
+        # Train models on train split using finalized feature sets
+        tab_base_model = _train_group_model(
+            df_group=tr_tab,
+            candidate_features=base_major,
+            time_col=time_col,
+            event_col=event_col,
+            stability_seeds=list(range(10)),
+            verbose=False,
+        )
+        tab_plus_model = _train_group_model(
+            df_group=tr_tab,
+            candidate_features=plus_major,
+            time_col=time_col,
+            event_col=event_col,
+            stability_seeds=list(range(10)),
+            verbose=False,
+        )
+
+        # Predict risks on test split
+        risk_base_tab = np.zeros(len(te_tab), dtype=float)
+        risk_plus_tab = np.zeros(len(te_tab), dtype=float)
+        try:
+            if tab_base_model is not None:
+                risk_base_tab = predict_risk(tab_base_model.model, te_tab, tab_base_model.features)
+        except Exception:
+            pass
+        try:
+            if tab_plus_model is not None:
+                risk_plus_tab = predict_risk(tab_plus_model.model, te_tab, tab_plus_model.features)
+        except Exception:
+            pass
+
+        # Event-conditioned model choice: if event==1 choose higher risk; if event==0 choose lower risk
+        try:
+            events_tab = te_tab[event_col].values.astype(int)
+        except Exception:
+            events_tab = np.zeros(len(te_tab), dtype=int)
+        choose_plus_tab = np.where(events_tab == 1, risk_plus_tab > risk_base_tab, risk_plus_tab < risk_base_tab)
+        df_tab = te_tab.copy()
+        df_tab["BenefitGroup"] = np.where(choose_plus_tab, "Benefit", "Non-Benefit")
         try:
             ACC.generate_tableone_by_group(
                 df_tab,
