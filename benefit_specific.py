@@ -192,6 +192,37 @@ def _standardize_by_train(risk_tr: np.ndarray, risk_va: np.ndarray) -> np.ndarra
     return (risk_va - mu) / sd
 
 
+def _make_joint_stratify_labels(df: pd.DataFrame, cols: List[str]) -> Optional[pd.Series]:
+    """Build a joint stratification label from multiple discrete columns.
+
+    Returns a Series of string labels like "ICD|Female|Event" or None if any column missing.
+    Robust to numeric/boolean/categorical types; missing values are labeled as "NA".
+    """
+    try:
+        for c in cols:
+            if c not in df.columns:
+                return None
+        parts: List[pd.Series] = []
+        for c in cols:
+            s = df[c]
+            try:
+                s_num = pd.to_numeric(s, errors="coerce")
+                s_int = s_num.round().astype("Int64")
+                parts.append(s_int.astype(str).fillna("NA"))
+            except Exception:
+                try:
+                    s_cat = s.astype("category").cat.codes.astype("Int64")
+                    parts.append(s_cat.astype(str).fillna("NA"))
+                except Exception:
+                    parts.append(s.astype("string").fillna("NA"))
+        label = parts[0]
+        for p in parts[1:]:
+            label = label.str.cat(p, sep="|")
+        return label
+    except Exception:
+        return None
+
+
 def compute_oof_risks(
     train_df: pd.DataFrame,
     base_features: List[str],
@@ -665,11 +696,17 @@ def run_stabilized_two_model_pipeline(
     iterator = tqdm(range(N), desc="[Stabilize] Splits", leave=True) if _HAS_TQDM else range(N)
     for seed in iterator:
         try:
+            data_use = df_use.dropna(subset=[time_col, event_col]).copy()
+            strat_labels = _make_joint_stratify_labels(data_use, ["ICD", "Female", event_col])
+            if strat_labels is not None and strat_labels.nunique() > 1:
+                stratify_arg = strat_labels
+            else:
+                stratify_arg = data_use[event_col] if data_use[event_col].nunique() > 1 else None
             tr, te = train_test_split(
-                df_use.dropna(subset=[time_col, event_col]).copy(),
+                data_use,
                 test_size=0.3,
                 random_state=seed,
-                stratify=df_use[event_col] if df_use[event_col].nunique() > 1 else None,
+                stratify=stratify_arg,
             )
         except Exception:
             continue
@@ -889,11 +926,14 @@ def run_benefit_specific_experiments(
 
     iterator = tqdm(range(N), desc="[Benefit] Splits", leave=True) if _HAS_TQDM else range(N)
     for seed in iterator:
+        data_use = df.dropna(subset=[time_col, event_col]).copy()
+        strat_labels = _make_joint_stratify_labels(data_use, ["ICD", "Female", event_col])
+        stratify_arg = strat_labels if (strat_labels is not None and strat_labels.nunique() > 1) else (data_use[event_col] if data_use[event_col].nunique() > 1 else None)
         tr, te = train_test_split(
-            df.dropna(subset=[time_col, event_col]).copy(),
+            data_use,
             test_size=0.3,
             random_state=seed,
-            stratify=df[event_col] if df[event_col].nunique() > 1 else None,
+            stratify=stratify_arg,
         )
 
         # Benefit-specific (full Plus features)
