@@ -578,9 +578,15 @@ def _train_two_models_on_split(
     except Exception:
         risk_plus_test = np.zeros(len(test_df), dtype=float)
 
-    # Choose model with lower predicted risk per sample
+    # Choose better model per sample based on true label:
+    # If event==1 -> higher risk is better; if event==0 -> lower risk is better.
     try:
-        choose_plus_mask = np.asarray(risk_plus_test) < np.asarray(risk_base_test)
+        diff = np.asarray(risk_plus_test) - np.asarray(risk_base_test)
+        events = np.asarray(test_df[event_col]).astype(int)
+        choose_plus_mask = np.zeros(len(test_df), dtype=bool)
+        finite_idx = np.isfinite(diff) & np.isfinite(events.astype(float))
+        # For events==1, choose plus when diff>0; for events==0, choose plus when diff<0
+        choose_plus_mask[finite_idx] = np.where(events[finite_idx] == 1, diff[finite_idx] > 0.0, diff[finite_idx] < 0.0)
     except Exception:
         choose_plus_mask = np.zeros(len(test_df), dtype=bool)
 
@@ -607,6 +613,7 @@ def run_stabilized_two_model_pipeline(
     enforce_fair_subset: bool = True,
     tableone_excel_path: Optional[str] = None,
     clf_importance_excel_path: Optional[str] = None,
+    train_benefit_classifier: bool = False,
 ) -> Dict[str, object]:
     """Run N random splits to stabilize Base and Plus models, then finalize and evaluate.
 
@@ -761,77 +768,78 @@ def run_stabilized_two_model_pipeline(
     except Exception:
         pass
 
-    # Train a classifier (Base features only) to predict benefit group
+    # Train a classifier (Base features only) to predict benefit group (optional)
     clf_model: Optional[LogisticRegression] = None
     clf_importance: Optional[pd.DataFrame] = None
-    try:
-        X = df_use[[f for f in base_pool if f in df_use.columns]].copy()
-        y = benefit_mask.astype(int)
-        if X.shape[1] > 0 and len(np.unique(y)) == 2:
-            best_auc = -np.inf
-            best_lr: Optional[LogisticRegression] = None
-            Cs = [0.1, 0.5, 1.0]
-            skf = StratifiedKFold(
-                n_splits=min(5, int(np.bincount(y).min())) if np.bincount(y).size > 1 else 3,
-                shuffle=True,
-                random_state=0,
-            )
-            for C in Cs:
-                try:
-                    lr = LogisticRegression(
-                        penalty="l1",
-                        C=C,
-                        solver="liblinear",
-                        class_weight="balanced",
-                        random_state=0,
-                        max_iter=200,
-                    )
-                    aucs: List[float] = []
-                    for tr_idx, va_idx in skf.split(X, y):
-                        X_tr = X.iloc[tr_idx]
-                        y_tr = y[tr_idx]
-                        X_va = X.iloc[va_idx]
-                        y_va = y[va_idx]
-                        lr.fit(X_tr, y_tr)
-                        p = lr.predict_proba(X_va)[:, 1]
-                        try:
-                            if np.unique(y_va).size < 2:
+    if train_benefit_classifier:
+        try:
+            X = df_use[[f for f in base_pool if f in df_use.columns]].copy()
+            y = benefit_mask.astype(int)
+            if X.shape[1] > 0 and len(np.unique(y)) == 2:
+                best_auc = -np.inf
+                best_lr: Optional[LogisticRegression] = None
+                Cs = [0.1, 0.5, 1.0]
+                skf = StratifiedKFold(
+                    n_splits=min(5, int(np.bincount(y).min())) if np.bincount(y).size > 1 else 3,
+                    shuffle=True,
+                    random_state=0,
+                )
+                for C in Cs:
+                    try:
+                        lr = LogisticRegression(
+                            penalty="l1",
+                            C=C,
+                            solver="liblinear",
+                            class_weight="balanced",
+                            random_state=0,
+                            max_iter=200,
+                        )
+                        aucs: List[float] = []
+                        for tr_idx, va_idx in skf.split(X, y):
+                            X_tr = X.iloc[tr_idx]
+                            y_tr = y[tr_idx]
+                            X_va = X.iloc[va_idx]
+                            y_va = y[va_idx]
+                            lr.fit(X_tr, y_tr)
+                            p = lr.predict_proba(X_va)[:, 1]
+                            try:
+                                if np.unique(y_va).size < 2:
+                                    auc = np.nan
+                                else:
+                                    auc = roc_auc_score(y_va, p)
+                            except Exception:
                                 auc = np.nan
-                            else:
-                                auc = roc_auc_score(y_va, p)
-                        except Exception:
-                            auc = np.nan
-                        aucs.append(auc)
-                    finite_aucs = np.asarray(aucs, dtype=float)
-                    finite_aucs = finite_aucs[np.isfinite(finite_aucs)]
-                    mean_auc = float(np.mean(finite_aucs)) if finite_aucs.size > 0 else -np.inf
-                    if mean_auc > best_auc:
-                        best_auc = mean_auc
-                        best_lr = lr
-                except Exception:
-                    continue
-            clf_model = best_lr
-            if clf_model is not None:
-                clf_model.fit(X, y)
-                try:
-                    coefs = clf_model.coef_.reshape(-1)
-                    feats = list(X.columns)
-                    df_imp = pd.DataFrame({"feature": feats, "coef": coefs})
-                    df_imp["abs_coef"] = df_imp["coef"].abs()
-                    with np.errstate(over="ignore"):
-                        df_imp["odds_ratio"] = np.exp(df_imp["coef"])  # may overflow
-                    clf_importance = df_imp.sort_values("abs_coef", ascending=False).reset_index(drop=True)
-                    if clf_importance_excel_path is not None:
-                        try:
-                            os.makedirs(os.path.dirname(clf_importance_excel_path), exist_ok=True)
-                            clf_importance.to_excel(clf_importance_excel_path, index=False)
-                        except Exception:
-                            pass
-                except Exception:
-                    clf_importance = None
-    except Exception:
-        clf_model = None
-        clf_importance = None
+                            aucs.append(auc)
+                        finite_aucs = np.asarray(aucs, dtype=float)
+                        finite_aucs = finite_aucs[np.isfinite(finite_aucs)]
+                        mean_auc = float(np.mean(finite_aucs)) if finite_aucs.size > 0 else -np.inf
+                        if mean_auc > best_auc:
+                            best_auc = mean_auc
+                            best_lr = lr
+                    except Exception:
+                        continue
+                clf_model = best_lr
+                if clf_model is not None:
+                    clf_model.fit(X, y)
+                    try:
+                        coefs = clf_model.coef_.reshape(-1)
+                        feats = list(X.columns)
+                        df_imp = pd.DataFrame({"feature": feats, "coef": coefs})
+                        df_imp["abs_coef"] = df_imp["coef"].abs()
+                        with np.errstate(over="ignore"):
+                            df_imp["odds_ratio"] = np.exp(df_imp["coef"])  # may overflow
+                        clf_importance = df_imp.sort_values("abs_coef", ascending=False).reset_index(drop=True)
+                        if clf_importance_excel_path is not None:
+                            try:
+                                os.makedirs(os.path.dirname(clf_importance_excel_path), exist_ok=True)
+                                clf_importance.to_excel(clf_importance_excel_path, index=False)
+                            except Exception:
+                                pass
+                    except Exception:
+                        clf_importance = None
+        except Exception:
+            clf_model = None
+            clf_importance = None
 
     return {
         "final_base_features": base_major,
@@ -1009,15 +1017,8 @@ def run_benefit_specific_experiments(
         results["Proposed (sex-specific)"]["c_index_female"].append(
             _safe_cidx(mask_f, risk_s, te_eval_s)
         )
-        # On the first split, optionally generate TableOne and print classifier importance
+        # On the first split, optionally generate TableOne only (classifier importance disabled)
         if print_first_split_preview and seed == 0:
-            try:
-                benefit_importance = met_b.get("benefit_importance", None)
-                if benefit_importance is not None:
-                    print("==== Benefit Classifier Feature Importance (top 20 by |coef|) ====")
-                    print(benefit_importance.head(20))
-            except Exception:
-                pass
             try:
                 te_b_tab = te_eval_b.copy()
                 te_b_tab["BenefitGroup"] = np.where(benefit_mask, "Benefit", "Non-Benefit")
