@@ -9,8 +9,8 @@ import pandas as pd
 from lifelines.utils import concordance_index
 
 # Reuse modeling and preprocessing utilities from cox.py
-import cox
-from cox import (
+import ACC
+from ACC import (
     fit_cox_model,
     predict_risk,
     drop_rows_with_missing_local_features,
@@ -87,7 +87,11 @@ class BenefitClassifier:
         best_auc = -np.inf
         best_model: Optional[LogisticRegression] = None
         Cs = [0.1, 0.5, 1.0]
-        skf = StratifiedKFold(n_splits=min(3, int(np.bincount(y).min())), shuffle=True, random_state=self.random_state)
+        skf = StratifiedKFold(
+            n_splits=min(3, int(np.bincount(y).min())),
+            shuffle=True,
+            random_state=self.random_state,
+        )
         for C in Cs:
             try:
                 lr = LogisticRegression(
@@ -175,17 +179,22 @@ def compute_oof_risks(
     # Stratify by events if possible
     y = tr_local[event_col].values
     try:
-        skf = StratifiedKFold(n_splits=k_splits, shuffle=True, random_state=random_state)
+        skf = StratifiedKFold(
+            n_splits=k_splits, shuffle=True, random_state=random_state
+        )
         splits = list(skf.split(np.zeros(len(tr_local)), y))
     except Exception:
         # Fallback to simple KFold-like partition
         rng = np.random.RandomState(random_state)
         order = rng.permutation(len(tr_local))
         folds = np.array_split(order, k_splits)
-        splits = [(
-            np.setdiff1d(np.arange(len(tr_local)), f, assume_unique=False),
-            f,
-        ) for f in folds]
+        splits = [
+            (
+                np.setdiff1d(np.arange(len(tr_local)), f, assume_unique=False),
+                f,
+            )
+            for f in folds
+        ]
 
     for tr_idx_local, va_idx_local in splits:
         tr_part = tr_local.iloc[tr_idx_local]
@@ -309,7 +318,9 @@ def evaluate_benefit_specific_split(
     z = (risk_plus_oof - risk_base_oof) * y_signed
 
     # 2) Train benefit classifier using ONLY Base features
-    benefit_clf = BenefitClassifier(base_features=base_pool, margin_std=0.1, random_state=random_state)
+    benefit_clf = BenefitClassifier(
+        base_features=base_pool, margin_std=0.1, random_state=random_state
+    )
     benefit_clf.fit(train_df, z)
 
     # 3) Split train by predicted benefit, enforce minimum sizes
@@ -331,7 +342,8 @@ def evaluate_benefit_specific_split(
     if (
         len(df_benefit) < max(int(np.ceil(min_group_frac * n_total)), int(min_group_n))
         or _num_events(df_benefit) < int(min_events)
-        or len(df_non_benefit) < max(int(np.ceil(min_group_frac * n_total)), int(min_group_n))
+        or len(df_non_benefit)
+        < max(int(np.ceil(min_group_frac * n_total)), int(min_group_n))
         or _num_events(df_non_benefit) < int(min_events)
     ):
         group_ok = False
@@ -369,14 +381,21 @@ def evaluate_benefit_specific_split(
     if not group_ok:
         # Evaluate OOF c-index
         try:
-            cidx_base = concordance_index(train_df[time_col], -risk_base_oof, train_df[event_col])
+            cidx_base = concordance_index(
+                train_df[time_col], -risk_base_oof, train_df[event_col]
+            )
         except Exception:
             cidx_base = np.nan
         try:
-            cidx_plus = concordance_index(train_df[time_col], -risk_plus_oof, train_df[event_col])
+            cidx_plus = concordance_index(
+                train_df[time_col], -risk_plus_oof, train_df[event_col]
+            )
         except Exception:
             cidx_plus = np.nan
-        use_plus = bool(np.nan_to_num(cidx_plus, nan=-np.inf) > np.nan_to_num(cidx_base, nan=-np.inf))
+        use_plus = bool(
+            np.nan_to_num(cidx_plus, nan=-np.inf)
+            > np.nan_to_num(cidx_base, nan=-np.inf)
+        )
         pool = plus_pool if use_plus else base_pool
         try:
             single_model = _train_group_model(
@@ -405,10 +424,20 @@ def evaluate_benefit_specific_split(
             risk_scores = np.zeros(len(test_df))
             pred_labels = np.zeros(len(test_df), dtype=int)
         try:
-            cidx = concordance_index(test_df[time_col], -risk_scores, test_df[event_col])
+            cidx = concordance_index(
+                test_df[time_col], -risk_scores, test_df[event_col]
+            )
         except Exception:
             cidx = np.nan
-        return pred_labels, risk_scores, {"c_index": cidx, "grouping": 0, "single_is_plus": float(single_model_is_plus)}
+        return (
+            pred_labels,
+            risk_scores,
+            {
+                "c_index": cidx,
+                "grouping": 0,
+                "single_is_plus": float(single_model_is_plus),
+            },
+        )
 
     # Grouped inference
     test_pred = benefit_clf.predict_label(test_df, threshold=0.5)
@@ -437,7 +466,9 @@ def evaluate_benefit_specific_split(
             pass
 
     try:
-        cidx_all = concordance_index(test_df[time_col], -risk_scores, test_df[event_col])
+        cidx_all = concordance_index(
+            test_df[time_col], -risk_scores, test_df[event_col]
+        )
     except Exception:
         cidx_all = np.nan
     return pred_labels, risk_scores, {"c_index": cidx_all, "grouping": 1}
@@ -473,9 +504,7 @@ def run_benefit_specific_experiments(
             df.dropna(subset=[time_col, event_col]).copy(),
             test_size=0.3,
             random_state=seed,
-            stratify=df[event_col]
-            if df[event_col].nunique() > 1
-            else None,
+            stratify=df[event_col] if df[event_col].nunique() > 1 else None,
         )
 
         # Benefit-specific
@@ -492,7 +521,7 @@ def run_benefit_specific_experiments(
         )
 
         # Sex-specific baseline on Proposed features (reuse cox.evaluate_split)
-        pred_s, risk_s, met_s = cox.evaluate_split(
+        pred_s, risk_s, met_s = ACC.evaluate_split(
             tr,
             te,
             feature_cols=base_pool,
@@ -516,18 +545,38 @@ def run_benefit_specific_experiments(
             except Exception:
                 return np.nan
 
-        mask_m = te["Female"].values == 0 if "Female" in te.columns else np.zeros(len(te), dtype=bool)
-        mask_f = te["Female"].values == 1 if "Female" in te.columns else np.zeros(len(te), dtype=bool)
+        mask_m = (
+            te["Female"].values == 0
+            if "Female" in te.columns
+            else np.zeros(len(te), dtype=bool)
+        )
+        mask_f = (
+            te["Female"].values == 1
+            if "Female" in te.columns
+            else np.zeros(len(te), dtype=bool)
+        )
 
         # Benefit-specific
-        results["Proposed Plus (benefit-specific)"]["c_index_all"].append(met_b.get("c_index", np.nan))
-        results["Proposed Plus (benefit-specific)"]["c_index_male"].append(_safe_cidx(mask_m, risk_b))
-        results["Proposed Plus (benefit-specific)"]["c_index_female"].append(_safe_cidx(mask_f, risk_b))
+        results["Proposed Plus (benefit-specific)"]["c_index_all"].append(
+            met_b.get("c_index", np.nan)
+        )
+        results["Proposed Plus (benefit-specific)"]["c_index_male"].append(
+            _safe_cidx(mask_m, risk_b)
+        )
+        results["Proposed Plus (benefit-specific)"]["c_index_female"].append(
+            _safe_cidx(mask_f, risk_b)
+        )
 
         # Sex-specific baseline
-        results["Proposed (sex-specific)"]["c_index_all"].append(met_s.get("c_index", np.nan))
-        results["Proposed (sex-specific)"]["c_index_male"].append(_safe_cidx(mask_m, risk_s))
-        results["Proposed (sex-specific)"]["c_index_female"].append(_safe_cidx(mask_f, risk_s))
+        results["Proposed (sex-specific)"]["c_index_all"].append(
+            met_s.get("c_index", np.nan)
+        )
+        results["Proposed (sex-specific)"]["c_index_male"].append(
+            _safe_cidx(mask_m, risk_s)
+        )
+        results["Proposed (sex-specific)"]["c_index_female"].append(
+            _safe_cidx(mask_f, risk_s)
+        )
 
     # Summaries
     summary = {}
@@ -573,7 +622,7 @@ def run_benefit_specific_experiments(
 if __name__ == "__main__":
     # Load and prepare data using cox utilities
     try:
-        df = cox.load_dataframes()
+        df = ACC.load_dataframes()
     except Exception as e:
         raise SystemExit(f"Failed to load dataframes: {e}")
 
@@ -590,4 +639,3 @@ if __name__ == "__main__":
         export_excel_path=export_path,
     )
     print(summary)
-
