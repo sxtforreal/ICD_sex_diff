@@ -822,6 +822,71 @@ def predict_risk(
     return risk
 
 
+def baseline_cumulative_hazard_at_time(model: CoxPHFitter, t: float) -> float:
+    """Return the baseline cumulative hazard H0(t) from a fitted Cox model.
+
+    Uses a right-continuous step-function lookup on model.baseline_cumulative_hazard_.
+    If t exceeds the last available time, returns the last value; if t precedes the
+    first time, returns 0.0.
+    """
+    try:
+        bh = model.baseline_cumulative_hazard_
+        if isinstance(bh, pd.DataFrame):
+            # Single column DataFrame indexed by durations
+            times = bh.index.to_numpy(dtype=float)
+            values = bh.iloc[:, 0].to_numpy(dtype=float)
+        else:
+            # Unexpected type; fall back safely
+            return float("nan")
+        if values.size == 0:
+            return float("nan")
+        # Right-continuous step function: pick last value with time <= t
+        idx = np.searchsorted(times, float(t), side="right") - 1
+        if idx < 0:
+            return 0.0
+        if idx >= values.size:
+            return float(values[-1])
+        return float(values[idx])
+    except Exception:
+        return float("nan")
+
+
+def predict_absolute_risk_at_time(
+    model: CoxPHFitter,
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    horizon_days: float = 1825.0,
+) -> np.ndarray:
+    """Predict absolute risk P(T <= t | x) at a fixed horizon using Cox baseline H0.
+
+    Formula: S(t|x) = exp(-H0(t) * exp(eta(x))) => P(T<=t|x) = 1 - S(t|x).
+    """
+    # Prepare design matrix consistent with the trained model
+    model_features = list(model.params_.index)
+    X = df.copy()
+    for c in model_features:
+        if c not in X.columns:
+            X[c] = 0.0
+    X = X[model_features]
+
+    try:
+        rel_risk = model.predict_partial_hazard(X).values.reshape(-1)  # exp(eta)
+    except Exception:
+        return np.zeros(len(df), dtype=float)
+
+    H0_t = baseline_cumulative_hazard_at_time(model, float(horizon_days))
+    if not np.isfinite(H0_t) or H0_t < 0:
+        # Fallback: if baseline is unavailable, return zeros to avoid crashes
+        return np.zeros(len(df), dtype=float)
+
+    with np.errstate(over="ignore"):  # large exponents possible -> inf handled by clip
+        surv = np.exp(-H0_t * rel_risk)
+        abs_risk = 1.0 - surv
+    # Numerical safety
+    abs_risk = np.clip(abs_risk, 0.0, 1.0)
+    return abs_risk.astype(float)
+
+
 def threshold_by_top_quantile(risk_scores: np.ndarray, quantile: float = 0.5) -> float:
     q = np.nanquantile(risk_scores, quantile)
     return float(q)
