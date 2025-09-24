@@ -811,10 +811,13 @@ def run_benefit_specific_experiments(
     k_splits: int = 5,
     enforce_fair_subset: bool = True,
     export_excel_path: Optional[str] = None,
+    print_first_split_preview: bool = False,
 ) -> Tuple[Dict[str, Dict[str, List[float]]], pd.DataFrame]:
     """Run outer-loop evaluation for benefit-specific vs Proposed sex-specific baselines.
 
     Returns (results_dict, summary_table)
+
+    If print_first_split_preview=True, print classifier importance and TableOne for the first split.
     """
     base_pool = list(FEATURE_SETS.get("Proposed", []))
     plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
@@ -933,8 +936,8 @@ def run_benefit_specific_experiments(
         results["Proposed (sex-specific)"]["c_index_female"].append(
             _safe_cidx(mask_f, risk_s, te_eval_s)
         )
-        # On the first split, generate TableOne for Benefit vs Non-benefit and print classifier importance
-        if seed == 0:
+        # On the first split, optionally generate TableOne and print classifier importance
+        if print_first_split_preview and seed == 0:
             try:
                 benefit_importance = met_b.get("benefit_importance", None)
                 if benefit_importance is not None:
