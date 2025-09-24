@@ -29,9 +29,26 @@ SELECTED_FEATURES_STORE: Dict[str, Any] = {
 # They will be treated as categorical variables and included as candidates in
 # the "Proposed Plus" model's feature selection.
 LOCAL_CATEGORICAL_FEATURES: List[str] = [
-    # Example placeholders (replace with your real column names):
-    # "Local Feature 1",
-    # "Local Feature 2",
+    "LGE_Circumural",
+    "LGE_Ring-Like",
+    "LGE_Basal anterior",
+    "LGE_Basal anterior septum",
+    "LGE_Basal inferoseptum",
+    "LGE_Basal inferio",
+    "LGE_Basal inferolateral",
+    "LGE_Basal anterolateral",
+    "LGE_mid anterior",
+    "LGE_mid anterior septum",
+    "LGE_mid inferoseptum",
+    "LGE_mid inferior",
+    "LGE_mid inferolateral",
+    "LGE_mid anterolateral",
+    "LGE_apical anterior",
+    "LGE_apical septum",
+    "LGE_apical inferior",
+    "LGE_apical lateral",
+    "LGE_Apical cap",
+    "LGE_RV insertion site (1 superior, 2 inferior. 3 both)",
 ]
 
 print(f"[Config] Local categorical features: {LOCAL_CATEGORICAL_FEATURES}")
@@ -183,11 +200,18 @@ def plot_cox_coefficients(
         proposed_set = set(FEATURE_SETS.get("Proposed", []))
         proposed_plus_set = set(FEATURE_SETS.get("Proposed Plus", []))
     except Exception:
-        guideline_set, benchmark_set, proposed_set, proposed_plus_set = set(), set(), set(), set()
+        guideline_set, benchmark_set, proposed_set, proposed_plus_set = (
+            set(),
+            set(),
+            set(),
+            set(),
+        )
 
     benchmark_only = benchmark_set - guideline_set
     proposed_only = proposed_set - (benchmark_set | guideline_set)
-    proposed_plus_only = proposed_plus_set - (proposed_set | benchmark_set | guideline_set)
+    proposed_plus_only = proposed_plus_set - (
+        proposed_set | benchmark_set | guideline_set
+    )
 
     # Map features to colors by category
     colors = []
@@ -1248,7 +1272,7 @@ def evaluate_split(
             if use_undersampling
             else train_df
         )
-    # Feature selection only for Proposed/Proposed Plus set
+        # Feature selection only for Proposed/Proposed Plus set
         if not disable_within_split_feature_selection:
             try:
                 if set(feature_cols) in (
@@ -1525,9 +1549,11 @@ def conversion_and_imputation(
 
 
 def load_dataframes() -> pd.DataFrame:
-    base = "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff"
-    icd = pd.read_excel(os.path.join(base, "NICM.xlsx"), sheet_name="ICD")
-    noicd = pd.read_excel(os.path.join(base, "NICM.xlsx"), sheet_name="No_ICD")
+    base = "/home/sunx/data/aiiih/projects/sunx/projects/ICD"
+    icd = pd.read_excel(os.path.join(base, "LGE_granularity.xlsx"), sheet_name="ICD")
+    noicd = pd.read_excel(
+        os.path.join(base, "LGE_granularity.xlsx"), sheet_name="No_ICD"
+    )
 
     # Cockcroft-Gault
     noicd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = noicd.apply(
@@ -1671,7 +1697,9 @@ def run_cox_experiments(
                 set(FEATURE_SETS.get("Proposed", [])),
                 set(FEATURE_SETS.get("Proposed Plus", [])),
             ):
-                is_plus = set(feature_cols) == set(FEATURE_SETS.get("Proposed Plus", []))
+                is_plus = set(feature_cols) == set(
+                    FEATURE_SETS.get("Proposed Plus", [])
+                )
                 # Sex-agnostic stabilization
                 sel_agn = stability_select_features(
                     df.dropna(subset=[time_col, event_col]).copy(),
@@ -1989,7 +2017,8 @@ FEATURE_SETS = {
         "QTc",
         "CrCl>45",
         # local categorical placeholders (kept as names; may be missing depending on dataset)
-    ] + list(LOCAL_CATEGORICAL_FEATURES),
+    ]
+    + list(LOCAL_CATEGORICAL_FEATURES),
 }
 
 
@@ -2001,14 +2030,14 @@ if __name__ == "__main__":
     try:
         generate_tableone_by_sex_icd(
             df,
-            output_excel_path="/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/results_tableone_sex_icd.xlsx",
+            output_excel_path="/home/sunx/data/aiiih/projects/sunx/projects/ICD/results_tableone_sex_icd.xlsx",
         )
     except Exception as e:
         warnings.warn(f"[Main] TableOne generation skipped due to error: {e}")
 
     # Run experiments (50 random splits; PE as event; PE_Time as duration)
     export_path = (
-        "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/results_cox.xlsx"
+        "/home/sunx/data/aiiih/projects/sunx/projects/ICD/results_cox.xlsx"
     )
     _, summary = run_cox_experiments(
         df=df,
@@ -2046,8 +2075,12 @@ if __name__ == "__main__":
 
     # Full-data inference and analysis - Proposed Plus
     features = FEATURE_SETS["Proposed Plus"]
-    print("Running sex-agnostic full-data inference (includes Female) - Proposed Plus...")
+    print(
+        "Running sex-agnostic full-data inference (includes Female) - Proposed Plus..."
+    )
     _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
 
-    print("Running sex-specific full-data inference (excludes Female in submodels) - Proposed Plus...")
+    print(
+        "Running sex-specific full-data inference (excludes Female in submodels) - Proposed Plus..."
+    )
     _ = sex_specific_full_inference(df, features)
