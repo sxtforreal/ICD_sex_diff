@@ -318,6 +318,7 @@ def evaluate_benefit_specific_split(
     min_group_n: int = 100,
     min_events: int = 30,
     verbose: bool = False,
+    use_base_features_only_for_group_models: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
     """Train benefit-specific models on train_df and evaluate on test_df.
 
@@ -383,10 +384,11 @@ def evaluate_benefit_specific_split(
     plus_model: Optional[GroupModel] = None
 
     if group_ok:
-        # Benefit group uses Plus pool
+        # Benefit group model: optionally restrict to Base features only
+        plus_candidate_pool = base_pool if use_base_features_only_for_group_models else plus_pool
         plus_model = _train_group_model(
             df_group=df_benefit,
-            candidate_features=plus_pool,
+            candidate_features=plus_candidate_pool,
             time_col=time_col,
             event_col=event_col,
             stability_seeds=stability_seeds,
@@ -425,7 +427,12 @@ def evaluate_benefit_specific_split(
             np.nan_to_num(cidx_plus, nan=-np.inf)
             > np.nan_to_num(cidx_base, nan=-np.inf)
         )
-        pool = plus_pool if use_plus else base_pool
+        # If using base-only variant, force Base pool
+        if use_base_features_only_for_group_models:
+            pool = base_pool
+            use_plus = False
+        else:
+            pool = plus_pool if use_plus else base_pool
         try:
             single_model = _train_group_model(
                 df_group=train_df,
@@ -859,6 +866,7 @@ def run_benefit_specific_experiments(
     model_configs = [
         {"name": "Proposed Plus (benefit-specific)", "mode": "benefit_specific"},
         {"name": "Proposed (sex-specific)", "mode": "sex_specific_baseline"},
+        {"name": "Proposed Plus (benefit-specific, base-only)", "mode": "benefit_specific_base_only"},
     ]
     metrics = [
         "c_index_all",
@@ -880,7 +888,7 @@ def run_benefit_specific_experiments(
             stratify=df[event_col] if df[event_col].nunique() > 1 else None,
         )
 
-        # Benefit-specific
+        # Benefit-specific (full Plus features)
         pred_b, risk_b, met_b = evaluate_benefit_specific_split(
             tr,
             te,
@@ -904,6 +912,20 @@ def run_benefit_specific_experiments(
             seed=seed,
             use_undersampling=False,
             disable_within_split_feature_selection=False,
+        )
+
+        # Benefit-specific (base-only variant)
+        pred_bb, risk_bb, met_bb = evaluate_benefit_specific_split(
+            tr,
+            te,
+            time_col,
+            event_col,
+            base_pool,
+            plus_pool,
+            random_state=seed,
+            k_splits=k_splits,
+            enforce_fair_subset=enforce_fair_subset,
+            use_base_features_only_for_group_models=True,
         )
 
         # Collect metrics consistently (per-sex c-index computed from risk arrays)
@@ -940,7 +962,7 @@ def run_benefit_specific_experiments(
             else np.zeros(len(te_eval_s), dtype=bool)
         )
 
-        # Benefit-specific
+        # Benefit-specific (full)
         results["Proposed Plus (benefit-specific)"]["c_index_all"].append(
             met_b.get("c_index", np.nan)
         )
@@ -958,6 +980,23 @@ def run_benefit_specific_experiments(
         )
         results["Proposed Plus (benefit-specific)"]["c_index_non_benefit"].append(
             _safe_cidx(non_benefit_mask, risk_b, te_eval_b)
+        )
+
+        # Benefit-specific (base-only)
+        results["Proposed Plus (benefit-specific, base-only)"]["c_index_all"].append(
+            met_bb.get("c_index", np.nan)
+        )
+        benefit_mask_bb = met_bb.get("benefit_mask", np.zeros(len(te_eval_b), dtype=bool))
+        if benefit_mask_bb.shape[0] != len(te_eval_b):
+            min_len = min(benefit_mask_bb.shape[0], len(te_eval_b))
+            benefit_mask_bb = np.asarray(benefit_mask_bb).astype(bool)[:min_len]
+            risk_bb = np.asarray(risk_bb)[:min_len]
+        non_benefit_mask_bb = ~benefit_mask_bb
+        results["Proposed Plus (benefit-specific, base-only)"]["c_index_benefit"].append(
+            _safe_cidx(benefit_mask_bb, risk_bb, te_eval_b)
+        )
+        results["Proposed Plus (benefit-specific, base-only)"]["c_index_non_benefit"].append(
+            _safe_cidx(non_benefit_mask_bb, risk_bb, te_eval_b)
         )
 
         # Sex-specific baseline
