@@ -798,7 +798,7 @@ def run_stabilized_two_model_pipeline(
         "c_index_per_sample_best": _cidx_safe(risk_best_all),
     }
 
-    # TableOne for benefit vs non-benefit groups (test split only)
+    # TableOne for benefit vs non-benefit groups (test split only, event-conditioned choice)
     try:
         data_tab = df_use.dropna(subset=[time_col, event_col]).copy()
         strat_labels = _make_joint_stratify_labels(data_tab, ["ICD", "Female", event_col])
@@ -845,9 +845,14 @@ def run_stabilized_two_model_pipeline(
         except Exception:
             pass
 
-        benefit_mask_tab = risk_plus_tab < risk_base_tab
+        # Event-conditioned model choice: if event==1 choose higher risk; if event==0 choose lower risk
+        try:
+            events_tab = te_tab[event_col].values.astype(int)
+        except Exception:
+            events_tab = np.zeros(len(te_tab), dtype=int)
+        choose_plus_tab = np.where(events_tab == 1, risk_plus_tab > risk_base_tab, risk_plus_tab < risk_base_tab)
         df_tab = te_tab.copy()
-        df_tab["BenefitGroup"] = np.where(benefit_mask_tab, "Benefit", "Non-Benefit")
+        df_tab["BenefitGroup"] = np.where(choose_plus_tab, "Benefit", "Non-Benefit")
         try:
             ACC.generate_tableone_by_group(
                 df_tab,
