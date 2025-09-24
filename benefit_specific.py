@@ -971,13 +971,11 @@ def run_benefit_specific_experiments(
         {"name": "Proposed Plus (benefit-specific)", "mode": "benefit_specific"},
         {"name": "Proposed (sex-specific)", "mode": "sex_specific_baseline"},
         {"name": "Proposed Plus (benefit-specific, base-only)", "mode": "benefit_specific_base_only"},
+        {"name": "Stabilized Proposed (base)", "mode": "stabilized_proposed_base"},
+        {"name": "Stabilized Proposed Plus", "mode": "stabilized_proposed_plus"},
     ]
     metrics = [
         "c_index_all",
-        "c_index_male",
-        "c_index_female",
-        "c_index_benefit",
-        "c_index_non_benefit",
     ]
     results: Dict[str, Dict[str, List[float]]] = {
         cfg["name"]: {m: [] for m in metrics} for cfg in model_configs
@@ -1035,102 +1033,131 @@ def run_benefit_specific_experiments(
             use_base_features_only_for_group_models=True,
         )
 
-        # Collect metrics consistently (per-sex c-index computed from risk arrays)
-        def _safe_cidx(mask: np.ndarray, risk: np.ndarray, te_local: pd.DataFrame) -> float:
-            try:
-                if mask.dtype != bool:
-                    mask_bool = mask.astype(bool)
-                else:
-                    mask_bool = mask
-                t = te_local.loc[mask_bool, time_col].values
-                e = te_local.loc[mask_bool, event_col].values
-                r = np.asarray(risk)[mask]
-                if len(t) < 2 or np.all(~np.isfinite(r)) or np.allclose(r, r[0]):
-                    return np.nan
-                return float(concordance_index(t, -r, e))
-            except Exception:
-                return np.nan
-
-        # Build aligned evaluation frames for subgroup metrics
-        te_eval_b = (
-            ACC.drop_rows_with_missing_local_features(te)
-            if enforce_fair_subset
-            else te.copy()
-        )
-        te_eval_s = ACC.drop_rows_with_missing_local_features(te)
-        mask_m = (
-            te_eval_s["Female"].values == 0
-            if "Female" in te_eval_s.columns
-            else np.zeros(len(te_eval_s), dtype=bool)
-        )
-        mask_f = (
-            te_eval_s["Female"].values == 1
-            if "Female" in te_eval_s.columns
-            else np.zeros(len(te_eval_s), dtype=bool)
-        )
-
-        # Benefit-specific (full)
+        # Append overall C-index only for required models
         results["Proposed Plus (benefit-specific)"]["c_index_all"].append(
             met_b.get("c_index", np.nan)
         )
-        # Benefit vs Non-benefit subgroup C-index
-        benefit_mask = met_b.get("benefit_mask", np.zeros(len(te_eval_b), dtype=bool))
-        if benefit_mask.shape[0] != len(te_eval_b):
-            # Best-effort alignment fallback: truncate or pad
-            min_len = min(benefit_mask.shape[0], len(te_eval_b))
-            benefit_mask = np.asarray(benefit_mask).astype(bool)[:min_len]
-            risk_b = np.asarray(risk_b)[:min_len]
-            te_eval_b = te_eval_b.iloc[:min_len]
-        non_benefit_mask = ~benefit_mask
-        results["Proposed Plus (benefit-specific)"]["c_index_benefit"].append(
-            _safe_cidx(benefit_mask, risk_b, te_eval_b)
-        )
-        results["Proposed Plus (benefit-specific)"]["c_index_non_benefit"].append(
-            _safe_cidx(non_benefit_mask, risk_b, te_eval_b)
-        )
-
-        # Benefit-specific (base-only)
         results["Proposed Plus (benefit-specific, base-only)"]["c_index_all"].append(
             met_bb.get("c_index", np.nan)
         )
-        benefit_mask_bb = met_bb.get("benefit_mask", np.zeros(len(te_eval_b), dtype=bool))
-        if benefit_mask_bb.shape[0] != len(te_eval_b):
-            min_len = min(benefit_mask_bb.shape[0], len(te_eval_b))
-            benefit_mask_bb = np.asarray(benefit_mask_bb).astype(bool)[:min_len]
-            risk_bb = np.asarray(risk_bb)[:min_len]
-        non_benefit_mask_bb = ~benefit_mask_bb
-        results["Proposed Plus (benefit-specific, base-only)"]["c_index_benefit"].append(
-            _safe_cidx(benefit_mask_bb, risk_bb, te_eval_b)
-        )
-        results["Proposed Plus (benefit-specific, base-only)"]["c_index_non_benefit"].append(
-            _safe_cidx(non_benefit_mask_bb, risk_bb, te_eval_b)
-        )
-
-        # Sex-specific baseline
         results["Proposed (sex-specific)"]["c_index_all"].append(
             met_s.get("c_index", np.nan)
         )
-        results["Proposed (sex-specific)"]["c_index_male"].append(
-            _safe_cidx(mask_m, risk_s, te_eval_s)
-        )
-        results["Proposed (sex-specific)"]["c_index_female"].append(
-            _safe_cidx(mask_f, risk_s, te_eval_s)
-        )
-        # On the first split, optionally generate TableOne only (classifier importance disabled)
+
+        # Stabilized Proposed (base) and Stabilized Proposed Plus on the test split
+        try:
+            tr_fair = ACC.drop_rows_with_missing_local_features(tr)
+            tr_m = tr_fair[tr_fair["Female"] == 0].dropna(subset=[time_col, event_col]).copy()
+            tr_f = tr_fair[tr_fair["Female"] == 1].dropna(subset=[time_col, event_col]).copy()
+            seeds_stab = list(range(10))
+
+            # Base (Proposed)
+            base_no_female = [f for f in base_pool if f != "Female"]
+            sel_m_base = stability_select_features(
+                df=tr_m,
+                candidate_features=list(base_no_female),
+                time_col=time_col,
+                event_col=event_col,
+                seeds=seeds_stab,
+                max_features=None,
+                threshold=0.4,
+                min_features=None,
+                verbose=False,
+            ) if not tr_m.empty else []
+            sel_f_base = stability_select_features(
+                df=tr_f,
+                candidate_features=list(base_no_female),
+                time_col=time_col,
+                event_col=event_col,
+                seeds=seeds_stab,
+                max_features=None,
+                threshold=0.4,
+                min_features=None,
+                verbose=False,
+            ) if not tr_f.empty else []
+            overrides_base = {
+                "male": sel_m_base if sel_m_base else base_no_female,
+                "female": sel_f_base if sel_f_base else base_no_female,
+            }
+            _, _, met_stab_base = ACC.evaluate_split(
+                tr,
+                te,
+                feature_cols=base_pool,
+                time_col=time_col,
+                event_col=event_col,
+                mode="sex_specific",
+                seed=seed,
+                use_undersampling=False,
+                disable_within_split_feature_selection=True,
+                sex_specific_feature_override=overrides_base,
+            )
+            results["Stabilized Proposed (base)"]["c_index_all"].append(
+                met_stab_base.get("c_index", np.nan)
+            )
+
+            # Plus (Proposed Plus)
+            plus_no_female = [f for f in plus_pool if f != "Female"]
+            sel_m_plus = stability_select_features(
+                df=tr_m,
+                candidate_features=list(plus_no_female),
+                time_col=time_col,
+                event_col=event_col,
+                seeds=seeds_stab,
+                max_features=None,
+                threshold=0.4,
+                min_features=None,
+                verbose=False,
+            ) if not tr_m.empty else []
+            sel_f_plus = stability_select_features(
+                df=tr_f,
+                candidate_features=list(plus_no_female),
+                time_col=time_col,
+                event_col=event_col,
+                seeds=seeds_stab,
+                max_features=None,
+                threshold=0.4,
+                min_features=None,
+                verbose=False,
+            ) if not tr_f.empty else []
+            overrides_plus = {
+                "male": sel_m_plus if sel_m_plus else plus_no_female,
+                "female": sel_f_plus if sel_f_plus else plus_no_female,
+            }
+            _, _, met_stab_plus = ACC.evaluate_split(
+                tr,
+                te,
+                feature_cols=plus_pool,
+                time_col=time_col,
+                event_col=event_col,
+                mode="sex_specific",
+                seed=seed,
+                use_undersampling=False,
+                disable_within_split_feature_selection=True,
+                sex_specific_feature_override=overrides_plus,
+            )
+            results["Stabilized Proposed Plus"]["c_index_all"].append(
+                met_stab_plus.get("c_index", np.nan)
+            )
+        except Exception:
+            results["Stabilized Proposed (base)"]["c_index_all"].append(np.nan)
+            results["Stabilized Proposed Plus"]["c_index_all"].append(np.nan)
+
+        # Optional TableOne preview based on benefit grouping for the first split
         if print_first_split_preview and seed == 0:
             try:
+                te_eval_b = (
+                    ACC.drop_rows_with_missing_local_features(te)
+                    if enforce_fair_subset
+                    else te.copy()
+                )
+                benefit_mask = met_b.get("benefit_mask", np.zeros(len(te_eval_b), dtype=bool))
                 te_b_tab = te_eval_b.copy()
                 te_b_tab["BenefitGroup"] = np.where(benefit_mask, "Benefit", "Non-Benefit")
-                # Generate TableOne for BenefitGroup
-                try:
-                    ACC.generate_tableone_by_group(
-                        te_b_tab,
-                        group_col="BenefitGroup",
-                        output_excel_path=None,
-                    )
-                except Exception:
-                    # Silent fail if grouping utility missing
-                    pass
+                ACC.generate_tableone_by_group(
+                    te_b_tab,
+                    group_col="BenefitGroup",
+                    output_excel_path=None,
+                )
             except Exception:
                 pass
 
