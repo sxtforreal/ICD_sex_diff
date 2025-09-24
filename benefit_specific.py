@@ -154,6 +154,34 @@ class BenefitClassifier:
         p = self.predict_proba(df)
         return (p >= float(threshold)).astype(int)
 
+    def get_feature_importance(self) -> Optional[pd.DataFrame]:
+        """Return feature importance for the logistic classifier as a DataFrame.
+
+        Columns: feature, coef, abs_coef, odds_ratio
+        """
+        if self.model is None:
+            return None
+        try:
+            coefs = self.model.coef_.reshape(-1)
+            feats = list(self.base_features)
+            # Align in case model dropped features internally
+            if len(coefs) != len(feats):
+                # Try to get from model classes if available; otherwise fallback with NaNs
+                data = {
+                    "feature": feats,
+                    "coef": [np.nan] * len(feats),
+                }
+                df_imp = pd.DataFrame(data)
+            else:
+                df_imp = pd.DataFrame({"feature": feats, "coef": coefs})
+            df_imp["abs_coef"] = df_imp["coef"].abs()
+            with np.errstate(over="ignore"):
+                df_imp["odds_ratio"] = np.exp(df_imp["coef"])  # may overflow -> inf acceptable
+            df_imp = df_imp.sort_values("abs_coef", ascending=False).reset_index(drop=True)
+            return df_imp
+        except Exception:
+            return None
+
 
 def _standardize_by_train(risk_tr: np.ndarray, risk_va: np.ndarray) -> np.ndarray:
     mu = float(np.nanmean(risk_tr))
@@ -320,6 +348,8 @@ def evaluate_benefit_specific_split(
         base_features=base_pool, margin_std=0.1, random_state=random_state
     )
     benefit_clf.fit(train_df, z)
+    # Capture classifier importance if available
+    clf_importance = benefit_clf.get_feature_importance()
 
     # 3) Split train by predicted benefit, enforce minimum sizes
     train_pred = benefit_clf.predict_label(train_df, threshold=0.5)
@@ -427,6 +457,11 @@ def evaluate_benefit_specific_split(
             )
         except Exception:
             cidx = np.nan
+        # Even in fallback, expose benefit mask predicted by classifier for downstream subgroup analysis
+        try:
+            benefit_mask = benefit_clf.predict_label(test_df, threshold=0.5).astype(bool)
+        except Exception:
+            benefit_mask = np.zeros(len(test_df), dtype=bool)
         return (
             pred_labels,
             risk_scores,
@@ -434,6 +469,8 @@ def evaluate_benefit_specific_split(
                 "c_index": cidx,
                 "grouping": 0,
                 "single_is_plus": float(single_model_is_plus),
+                "benefit_mask": benefit_mask,
+                "benefit_importance": clf_importance,
             },
         )
 
@@ -469,7 +506,16 @@ def evaluate_benefit_specific_split(
         )
     except Exception:
         cidx_all = np.nan
-    return pred_labels, risk_scores, {"c_index": cidx_all, "grouping": 1}
+    return (
+        pred_labels,
+        risk_scores,
+        {
+            "c_index": cidx_all,
+            "grouping": 1,
+            "benefit_mask": mask_benefit.astype(bool),
+            "benefit_importance": clf_importance,
+        },
+    )
 
 
 def run_benefit_specific_experiments(
@@ -492,7 +538,13 @@ def run_benefit_specific_experiments(
         {"name": "Proposed Plus (benefit-specific)", "mode": "benefit_specific"},
         {"name": "Proposed (sex-specific)", "mode": "sex_specific_baseline"},
     ]
-    metrics = ["c_index_all", "c_index_male", "c_index_female"]
+    metrics = [
+        "c_index_all",
+        "c_index_male",
+        "c_index_female",
+        "c_index_benefit",
+        "c_index_non_benefit",
+    ]
     results: Dict[str, Dict[str, List[float]]] = {
         cfg["name"]: {m: [] for m in metrics} for cfg in model_configs
     }
@@ -533,10 +585,14 @@ def run_benefit_specific_experiments(
         )
 
         # Collect metrics consistently (per-sex c-index computed from risk arrays)
-        def _safe_cidx(mask: np.ndarray, risk: np.ndarray) -> float:
+        def _safe_cidx(mask: np.ndarray, risk: np.ndarray, te_local: pd.DataFrame) -> float:
             try:
-                t = te.loc[mask, time_col].values
-                e = te.loc[mask, event_col].values
+                if mask.dtype != bool:
+                    mask_bool = mask.astype(bool)
+                else:
+                    mask_bool = mask
+                t = te_local.loc[mask_bool, time_col].values
+                e = te_local.loc[mask_bool, event_col].values
                 r = np.asarray(risk)[mask]
                 if len(t) < 2 or np.all(~np.isfinite(r)) or np.allclose(r, r[0]):
                     return np.nan
@@ -544,26 +600,42 @@ def run_benefit_specific_experiments(
             except Exception:
                 return np.nan
 
+        # Build aligned evaluation frames for subgroup metrics
+        te_eval_b = (
+            ACC.drop_rows_with_missing_local_features(te)
+            if enforce_fair_subset
+            else te.copy()
+        )
+        te_eval_s = ACC.drop_rows_with_missing_local_features(te)
         mask_m = (
-            te["Female"].values == 0
-            if "Female" in te.columns
-            else np.zeros(len(te), dtype=bool)
+            te_eval_s["Female"].values == 0
+            if "Female" in te_eval_s.columns
+            else np.zeros(len(te_eval_s), dtype=bool)
         )
         mask_f = (
-            te["Female"].values == 1
-            if "Female" in te.columns
-            else np.zeros(len(te), dtype=bool)
+            te_eval_s["Female"].values == 1
+            if "Female" in te_eval_s.columns
+            else np.zeros(len(te_eval_s), dtype=bool)
         )
 
         # Benefit-specific
         results["Proposed Plus (benefit-specific)"]["c_index_all"].append(
             met_b.get("c_index", np.nan)
         )
-        results["Proposed Plus (benefit-specific)"]["c_index_male"].append(
-            _safe_cidx(mask_m, risk_b)
+        # Benefit vs Non-benefit subgroup C-index
+        benefit_mask = met_b.get("benefit_mask", np.zeros(len(te_eval_b), dtype=bool))
+        if benefit_mask.shape[0] != len(te_eval_b):
+            # Best-effort alignment fallback: truncate or pad
+            min_len = min(benefit_mask.shape[0], len(te_eval_b))
+            benefit_mask = np.asarray(benefit_mask).astype(bool)[:min_len]
+            risk_b = np.asarray(risk_b)[:min_len]
+            te_eval_b = te_eval_b.iloc[:min_len]
+        non_benefit_mask = ~benefit_mask
+        results["Proposed Plus (benefit-specific)"]["c_index_benefit"].append(
+            _safe_cidx(benefit_mask, risk_b, te_eval_b)
         )
-        results["Proposed Plus (benefit-specific)"]["c_index_female"].append(
-            _safe_cidx(mask_f, risk_b)
+        results["Proposed Plus (benefit-specific)"]["c_index_non_benefit"].append(
+            _safe_cidx(non_benefit_mask, risk_b, te_eval_b)
         )
 
         # Sex-specific baseline
@@ -571,11 +643,35 @@ def run_benefit_specific_experiments(
             met_s.get("c_index", np.nan)
         )
         results["Proposed (sex-specific)"]["c_index_male"].append(
-            _safe_cidx(mask_m, risk_s)
+            _safe_cidx(mask_m, risk_s, te_eval_s)
         )
         results["Proposed (sex-specific)"]["c_index_female"].append(
-            _safe_cidx(mask_f, risk_s)
+            _safe_cidx(mask_f, risk_s, te_eval_s)
         )
+        # On the first split, generate TableOne for Benefit vs Non-benefit and print classifier importance
+        if seed == 0:
+            try:
+                benefit_importance = met_b.get("benefit_importance", None)
+                if benefit_importance is not None:
+                    print("==== Benefit Classifier Feature Importance (top 20 by |coef|) ====")
+                    print(benefit_importance.head(20))
+            except Exception:
+                pass
+            try:
+                te_b_tab = te_eval_b.copy()
+                te_b_tab["BenefitGroup"] = np.where(benefit_mask, "Benefit", "Non-Benefit")
+                # Generate TableOne for BenefitGroup
+                try:
+                    ACC.generate_tableone_by_group(
+                        te_b_tab,
+                        group_col="BenefitGroup",
+                        output_excel_path=None,
+                    )
+                except Exception:
+                    # Silent fail if grouping utility missing
+                    pass
+            except Exception:
+                pass
 
     # Summaries
     summary = {}
@@ -621,6 +717,8 @@ def run_benefit_specific_experiments(
             "c_index_all": "all",
             "c_index_male": "male",
             "c_index_female": "female",
+            "c_index_benefit": "benefit",
+            "c_index_non_benefit": "non_benefit",
         }
     )
 

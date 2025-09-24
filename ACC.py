@@ -577,6 +577,133 @@ def generate_tableone_by_sex_icd(
         warnings.warn(f"[TableOne Fallback] Failed to generate summary: {e}")
 
 
+def generate_tableone_by_group(
+    df: pd.DataFrame, group_col: str, output_excel_path: str = None
+) -> None:
+    """Generic TableOne-like summary for an arbitrary grouping column.
+
+    - If `tableone` is available, use it; otherwise provide a readable fallback summary.
+    - Does not modify the input dataframe.
+    """
+    if df is None or df.empty or group_col not in df.columns:
+        return
+    df_local = df.copy()
+    groups = [g for g in df_local[group_col].dropna().unique().tolist()]
+    if not groups:
+        return
+    variables = [c for c in df_local.columns if c not in {group_col, "MRN"}]
+    # Heuristic categorical columns: non-numeric or binary numeric
+    cat_cols = []
+    for c in variables:
+        try:
+            if not pd.api.types.is_numeric_dtype(df_local[c]):
+                cat_cols.append(c)
+            else:
+                vals = pd.to_numeric(df_local[c], errors="coerce").dropna().unique()
+                if len(vals) <= 2:
+                    cat_cols.append(c)
+        except Exception:
+            continue
+    if _HAS_TABLEONE:
+        try:
+            tab1 = TableOne(
+                df_local,
+                columns=variables,
+                categorical=cat_cols,
+                groupby=group_col,
+                pval=True,
+                overall=True,
+                missing=True,
+                label_suffix=True,
+            )
+            print(f"==== TableOne by {group_col} ====")
+            print(tab1)
+            table_df = getattr(tab1, "tableone", None)
+            if table_df is None:
+                try:
+                    table_df = tab1.to_dataframe()  # type: ignore[attr-defined]
+                except Exception:
+                    table_df = None
+            if output_excel_path and table_df is not None:
+                os.makedirs(os.path.dirname(output_excel_path), exist_ok=True)
+                try:
+                    table_df.to_excel(output_excel_path)
+                except Exception:
+                    if isinstance(table_df.columns, pd.MultiIndex):
+                        flat_cols = [
+                            (str(a) if a is not None else "")
+                            + (f" | {b}" if b not in (None, "") else "")
+                            for a, b in table_df.columns
+                        ]
+                        tmp_df = table_df.copy()
+                        tmp_df.columns = flat_cols
+                        tmp_df.to_excel(output_excel_path)
+                    else:
+                        table_df.to_excel(output_excel_path)
+            return
+        except Exception as e:
+            warnings.warn(f"[TableOne] Failed to generate generic TableOne: {e}")
+    # Fallback: simple per-group summaries
+    try:
+        group_order = groups
+        col_order = ["Missing", "Overall"] + group_order
+        summary_rows: Dict[Tuple[str, str], Dict[str, object]] = {}
+        for var in variables:
+            series = df_local[var]
+            is_num = pd.api.types.is_numeric_dtype(series)
+            if is_num:
+                row: Dict[str, object] = {}
+                row["Missing"] = int(pd.to_numeric(series, errors="coerce").isna().sum())
+                overall = pd.to_numeric(series, errors="coerce")
+                row["Overall"] = (
+                    "" if overall.dropna().empty else f"{overall.mean():.1f} ({overall.std():.1f})"
+                )
+                for g in group_order:
+                    grp_series = pd.to_numeric(
+                        df_local.loc[df_local[group_col] == g, var], errors="coerce"
+                    ).dropna()
+                    row[g] = "" if grp_series.empty else f"{grp_series.mean():.1f} ({grp_series.std():.1f})"
+                summary_rows[(var, "mean (SD)")] = row
+            else:
+                levels = [lvl for lvl in series.dropna().unique().tolist()]
+                try:
+                    levels = sorted(levels)
+                except Exception:
+                    pass
+                overall_non_missing = series.notna().sum()
+                overall_missing = int(series.isna().sum())
+                for idx, lvl in enumerate(levels):
+                    row: Dict[str, object] = {}
+                    row["Missing"] = overall_missing if idx == 0 else ""
+                    if overall_non_missing > 0:
+                        count = int((series == lvl).sum())
+                        pct = count / max(1, overall_non_missing) * 100.0
+                        row["Overall"] = f"{count} ({pct:.1f}%)"
+                    else:
+                        row["Overall"] = ""
+                    for g in group_order:
+                        grp_series = df_local.loc[df_local[group_col] == g, var]
+                        non_missing = grp_series.notna().sum()
+                        if non_missing == 0:
+                            row[g] = ""
+                        else:
+                            cnt = int((grp_series == lvl).sum())
+                            pct = cnt / non_missing * 100.0
+                            row[g] = f"{cnt} ({pct:.1f}%)"
+                    summary_rows[(f"{var}, n (%)", str(lvl))] = row
+        if not summary_rows:
+            return
+        fallback_df = pd.DataFrame.from_dict(summary_rows, orient="index")
+        fallback_df = fallback_df.reindex(columns=col_order)
+        print(f"==== Summary by {group_col} (fallback) ====")
+        print(fallback_df.head())
+        if output_excel_path:
+            os.makedirs(os.path.dirname(output_excel_path), exist_ok=True)
+            fallback_df.to_excel(output_excel_path)
+    except Exception as e:
+        warnings.warn(f"[TableOne Generic Fallback] Failed: {e}")
+
+
 # Drop constant/duplicate/highly correlated columns to mitigate singular matrices
 def _sanitize_cox_features_matrix(
     df: pd.DataFrame,
