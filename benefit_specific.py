@@ -660,7 +660,7 @@ if __name__ == "__main__":
     export_path = None  # set to an absolute path to export Excel
     results, summary = run_benefit_specific_experiments(
         df=df,
-        N=50,
+        N=10,
         time_col="PE_Time",
         event_col="VT/VF/SCD",
         k_splits=5,

@@ -2061,7 +2061,7 @@ if __name__ == "__main__":
     _, summary = run_cox_experiments(
         df=df,
         feature_sets=FEATURE_SETS,
-        N=100,
+        N=10,
         time_col="PE_Time",
         event_col="VT/VF/SCD",
         export_excel_path=export_path,
