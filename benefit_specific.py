@@ -650,6 +650,7 @@ def run_stabilized_two_model_pipeline(
     triage_tableone_excel_path: Optional[str] = None,
     triage_km_plot_path: Optional[str] = None,
     triage_featimp_plot_path: Optional[str] = None,
+    best_per_sample_tableone_excel_path: Optional[str] = None,
 ) -> Dict[str, object]:
     base_pool = list(FEATURE_SETS.get("Proposed", []))
     plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
@@ -762,6 +763,19 @@ def run_stabilized_two_model_pipeline(
     )
     benefit_mask = dLL_all > tau
     p5y_best_all = np.where(benefit_mask, p5y_plus_all, p5y_base_all)
+
+    # Generate TableOne for the real best-per-sample grouping (Plus better vs Base better)
+    try:
+        best_route_plus_all = np.asarray(p5y_plus_all) < np.asarray(p5y_base_all)
+        df_best = df_use.copy()
+        df_best["BenefitGroup"] = np.where(best_route_plus_all, "Benefit", "Non-Benefit")
+        ACC.generate_tableone_by_group(
+            df_best,
+            group_col="BenefitGroup",
+            output_excel_path=best_per_sample_tableone_excel_path,
+        )
+    except Exception:
+        pass
 
     def _cidx_safe_from_prob(p: np.ndarray) -> float:
         try:
@@ -918,6 +932,13 @@ def run_stabilized_two_model_pipeline(
                             os.path.dirname(clf_importance_excel_path), exist_ok=True
                         )
                         clf_importance.to_excel(clf_importance_excel_path, index=False)
+                    # Print top-k importance here so it shows up even when imported
+                    try:
+                        top_show = int(min(20, len(clf_importance)))
+                        print("==== Triage Classifier Feature Importance (|coef|) - Top 20 ====")
+                        print(clf_importance.head(top_show))
+                    except Exception:
+                        pass
                     # Plot and save feature importance if requested
                     try:
                         if (
@@ -1132,6 +1153,7 @@ if __name__ == "__main__":
         outdir = "/home/sunx/data/aiiih/projects/sunx/projects/ICD"
         os.makedirs(outdir, exist_ok=True)
         triage_tableone_path = os.path.join(outdir, "tableone_by_triage.xlsx")
+        best_tableone_path = os.path.join(outdir, "tableone_best_per_sample.xlsx")
         triage_km_plot_path = os.path.join(outdir, "km_by_triage.png")
         clf_imp_path = os.path.join(outdir, "triage_feature_importance.xlsx")
         triage_featimp_plot_path = os.path.join(outdir, "triage_feature_importance.png")
@@ -1147,6 +1169,7 @@ if __name__ == "__main__":
             triage_tableone_excel_path=triage_tableone_path,
             triage_km_plot_path=triage_km_plot_path,
             triage_featimp_plot_path=triage_featimp_plot_path,
+            best_per_sample_tableone_excel_path=best_tableone_path,
         )
         print("==== Stabilized Two-Model Metrics ====")
         print(stabilized.get("metrics", {}))
@@ -1158,6 +1181,7 @@ if __name__ == "__main__":
                 pass
         try:
             print("Saved triage TableOne:", triage_tableone_path)
+            print("Saved best-per-sample TableOne:", best_tableone_path)
             print("Saved triage KM plot:", triage_km_plot_path)
             print("Saved triage feature importance:", clf_imp_path)
             print("Saved triage feature importance plot:", triage_featimp_plot_path)
