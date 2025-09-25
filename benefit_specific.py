@@ -645,6 +645,8 @@ def run_stabilized_two_model_pipeline(
     tableone_excel_path: Optional[str] = None,
     clf_importance_excel_path: Optional[str] = None,
     train_benefit_classifier: bool = True,
+    triage_tableone_excel_path: Optional[str] = None,
+    triage_km_plot_path: Optional[str] = None,
 ) -> Dict[str, object]:
     base_pool = list(FEATURE_SETS.get("Proposed", []))
     plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
@@ -790,6 +792,27 @@ def run_stabilized_two_model_pipeline(
         coverage_triage = float(np.mean(route_plus))
         p5y_triage_all = np.where(route_plus, p5y_plus_all, p5y_base_all)
         c_index_triage = _cidx_safe_from_prob(p5y_triage_all)
+        # Triage-based TableOne and KM for the full dataset
+        try:
+            df_tri = df_use.copy()
+            df_tri["BenefitGroup"] = np.where(route_plus, "Benefit", "Non-Benefit")
+            ACC.generate_tableone_by_group(
+                df_tri, group_col="BenefitGroup", output_excel_path=triage_tableone_excel_path
+            )
+        except Exception:
+            pass
+        try:
+            ACC.plot_km_by_group(
+                df_use.assign(
+                    BenefitGroup=np.where(route_plus, "Benefit", "Non-Benefit")
+                ),
+                group_col="BenefitGroup",
+                time_col=time_col,
+                event_col=event_col,
+                output_path=triage_km_plot_path,
+            )
+        except Exception:
+            pass
     else:
         theta_used = np.nan
         coverage_triage = np.nan
@@ -866,23 +889,33 @@ def run_stabilized_two_model_pipeline(
     clf_importance: Optional[pd.DataFrame] = None
     if train_benefit_classifier and triage_clf is not None:
         try:
-            base_est = getattr(triage_clf, "base_estimator", None)
-            lr_cv = base_est if hasattr(base_est, "coef_") else None
-            if lr_cv is not None and hasattr(lr_cv, "coef_"):
-                coefs = lr_cv.coef_.reshape(-1)
+            fitted_base = None
+            if hasattr(triage_clf, "calibrated_classifiers_") and getattr(
+                triage_clf, "calibrated_classifiers_", None
+            ):
+                fitted_base = triage_clf.calibrated_classifiers_[0].base_estimator
+            else:
+                fitted_base = getattr(triage_clf, "base_estimator", None)
+            if fitted_base is not None and hasattr(fitted_base, "named_steps"):
+                inner = fitted_base.named_steps.get("clf", fitted_base)
+            else:
+                inner = fitted_base
+            if inner is not None and hasattr(inner, "coef_"):
+                coefs = np.asarray(inner.coef_).reshape(-1)
                 feats = list(df_use[base_pool].columns)
-                df_imp = pd.DataFrame({"feature": feats, "coef": coefs})
-                df_imp["abs_coef"] = df_imp["coef"].abs()
-                with np.errstate(over="ignore"):
-                    df_imp["odds_ratio"] = np.exp(df_imp["coef"])
-                clf_importance = df_imp.sort_values(
-                    "abs_coef", ascending=False
-                ).reset_index(drop=True)
-                if clf_importance_excel_path is not None:
-                    os.makedirs(
-                        os.path.dirname(clf_importance_excel_path), exist_ok=True
-                    )
-                    clf_importance.to_excel(clf_importance_excel_path, index=False)
+                if len(coefs) == len(feats):
+                    df_imp = pd.DataFrame({"feature": feats, "coef": coefs})
+                    df_imp["abs_coef"] = df_imp["coef"].abs()
+                    with np.errstate(over="ignore"):
+                        df_imp["odds_ratio"] = np.exp(df_imp["coef"])
+                    clf_importance = df_imp.sort_values(
+                        "abs_coef", ascending=False
+                    ).reset_index(drop=True)
+                    if clf_importance_excel_path is not None:
+                        os.makedirs(
+                            os.path.dirname(clf_importance_excel_path), exist_ok=True
+                        )
+                        clf_importance.to_excel(clf_importance_excel_path, index=False)
         except Exception:
             clf_importance = None
     return {

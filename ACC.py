@@ -325,6 +325,50 @@ def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame) -> None:
     plt.show()
 
 
+# Generic KM by arbitrary grouping column (e.g., Benefit vs Non-Benefit)
+def plot_km_by_group(
+    df: pd.DataFrame,
+    group_col: str,
+    time_col: str = "PE_Time",
+    event_col: str = "VT/VF/SCD",
+    output_path: str = None,
+) -> None:
+    if df is None or df.empty or group_col not in df.columns:
+        return
+    if not {time_col, event_col}.issubset(df.columns):
+        return
+    data = df.dropna(subset=[time_col, event_col]).copy()
+    groups = [g for g in data[group_col].dropna().unique().tolist()]
+    if len(groups) == 0:
+        return
+    kmf = KaplanMeierFitter()
+    plt.figure(figsize=(7, 5))
+    palette = ["tab:blue", "tab:red", "tab:green", "tab:orange", "tab:purple"]
+    for idx, g in enumerate(groups):
+        sub = data[data[group_col] == g]
+        if sub.empty:
+            continue
+        n = int(len(sub))
+        events = int(pd.to_numeric(sub[event_col], errors="coerce").fillna(0).sum())
+        label = f"{str(g)} (n={n}, events={events})"
+        kmf.fit(durations=sub[time_col], event_observed=sub[event_col], label=label)
+        kmf.plot(ci_show=True, color=palette[idx % len(palette)])
+    plt.xlabel("Time (days)")
+    plt.ylabel("Survival Probability")
+    plt.title(f"KM by {group_col}")
+    plt.grid(alpha=0.3)
+    plt.legend(loc="best")
+    plt.tight_layout()
+    if output_path:
+        try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            plt.savefig(output_path, dpi=200)
+        except Exception:
+            pass
+    else:
+        plt.show()
+
+
 # ==========================================
 # TableOne generation (Sex x ICD -> 4 groups)
 # ==========================================
