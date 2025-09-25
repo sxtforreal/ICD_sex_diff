@@ -645,6 +645,8 @@ def run_stabilized_two_model_pipeline(
     tableone_excel_path: Optional[str] = None,
     clf_importance_excel_path: Optional[str] = None,
     train_benefit_classifier: bool = True,
+    triage_tableone_excel_path: Optional[str] = None,
+    triage_km_plot_path: Optional[str] = None,
 ) -> Dict[str, object]:
     base_pool = list(FEATURE_SETS.get("Proposed", []))
     plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
@@ -790,6 +792,27 @@ def run_stabilized_two_model_pipeline(
         coverage_triage = float(np.mean(route_plus))
         p5y_triage_all = np.where(route_plus, p5y_plus_all, p5y_base_all)
         c_index_triage = _cidx_safe_from_prob(p5y_triage_all)
+        # Triage-based TableOne and KM for the full dataset
+        try:
+            df_tri = df_use.copy()
+            df_tri["BenefitGroup"] = np.where(route_plus, "Benefit", "Non-Benefit")
+            ACC.generate_tableone_by_group(
+                df_tri, group_col="BenefitGroup", output_excel_path=triage_tableone_excel_path
+            )
+        except Exception:
+            pass
+        try:
+            ACC.plot_km_by_group(
+                df_use.assign(
+                    BenefitGroup=np.where(route_plus, "Benefit", "Non-Benefit")
+                ),
+                group_col="BenefitGroup",
+                time_col=time_col,
+                event_col=event_col,
+                output_path=triage_km_plot_path,
+            )
+        except Exception:
+            pass
     else:
         theta_used = np.nan
         coverage_triage = np.nan
@@ -832,19 +855,29 @@ def run_stabilized_two_model_pipeline(
             stability_seeds=list(range(10)),
             verbose=False,
         )
-        p_base_tab = np.zeros(len(te_tab), dtype=float)
-        p_plus_tab = np.zeros(len(te_tab), dtype=float)
-        if tab_base_model is not None:
-            p_base_tab = _predict_surv_prob_at_t_cox(
-                tab_base_model.model, te_tab, tab_base_model.features, T_STAR_DAYS
-            )
-        if tab_plus_model is not None:
-            p_plus_tab = _predict_surv_prob_at_t_cox(
-                tab_plus_model.model, te_tab, tab_plus_model.features, T_STAR_DAYS
-            )
-        choose_plus_tab = p_plus_tab < p_base_tab
         df_tab = te_tab.copy()
-        df_tab["BenefitGroup"] = np.where(choose_plus_tab, "Benefit", "Non-Benefit")
+        route_plus_tab = None
+        # Prefer grouping by triage classifier prediction when available
+        if triage_clf is not None and np.isfinite(theta_used):
+            try:
+                triage_probs_te_tab = triage_clf.predict_proba(te_tab[base_pool])[:, 1]
+                route_plus_tab = triage_probs_te_tab >= theta_used
+            except Exception:
+                route_plus_tab = None
+        # Fallback: group by which model yields lower predicted 5-year probability
+        if route_plus_tab is None:
+            p_base_tab = np.zeros(len(te_tab), dtype=float)
+            p_plus_tab = np.zeros(len(te_tab), dtype=float)
+            if tab_base_model is not None:
+                p_base_tab = _predict_surv_prob_at_t_cox(
+                    tab_base_model.model, te_tab, tab_base_model.features, T_STAR_DAYS
+                )
+            if tab_plus_model is not None:
+                p_plus_tab = _predict_surv_prob_at_t_cox(
+                    tab_plus_model.model, te_tab, tab_plus_model.features, T_STAR_DAYS
+                )
+            route_plus_tab = p_plus_tab < p_base_tab
+        df_tab["BenefitGroup"] = np.where(route_plus_tab, "Benefit", "Non-Benefit")
         try:
             ACC.generate_tableone_by_group(
                 df_tab, group_col="BenefitGroup", output_excel_path=tableone_excel_path
@@ -856,23 +889,33 @@ def run_stabilized_two_model_pipeline(
     clf_importance: Optional[pd.DataFrame] = None
     if train_benefit_classifier and triage_clf is not None:
         try:
-            base_est = getattr(triage_clf, "base_estimator", None)
-            lr_cv = base_est if hasattr(base_est, "coef_") else None
-            if lr_cv is not None and hasattr(lr_cv, "coef_"):
-                coefs = lr_cv.coef_.reshape(-1)
+            fitted_base = None
+            if hasattr(triage_clf, "calibrated_classifiers_") and getattr(
+                triage_clf, "calibrated_classifiers_", None
+            ):
+                fitted_base = triage_clf.calibrated_classifiers_[0].base_estimator
+            else:
+                fitted_base = getattr(triage_clf, "base_estimator", None)
+            if fitted_base is not None and hasattr(fitted_base, "named_steps"):
+                inner = fitted_base.named_steps.get("clf", fitted_base)
+            else:
+                inner = fitted_base
+            if inner is not None and hasattr(inner, "coef_"):
+                coefs = np.asarray(inner.coef_).reshape(-1)
                 feats = list(df_use[base_pool].columns)
-                df_imp = pd.DataFrame({"feature": feats, "coef": coefs})
-                df_imp["abs_coef"] = df_imp["coef"].abs()
-                with np.errstate(over="ignore"):
-                    df_imp["odds_ratio"] = np.exp(df_imp["coef"])
-                clf_importance = df_imp.sort_values(
-                    "abs_coef", ascending=False
-                ).reset_index(drop=True)
-                if clf_importance_excel_path is not None:
-                    os.makedirs(
-                        os.path.dirname(clf_importance_excel_path), exist_ok=True
-                    )
-                    clf_importance.to_excel(clf_importance_excel_path, index=False)
+                if len(coefs) == len(feats):
+                    df_imp = pd.DataFrame({"feature": feats, "coef": coefs})
+                    df_imp["abs_coef"] = df_imp["coef"].abs()
+                    with np.errstate(over="ignore"):
+                        df_imp["odds_ratio"] = np.exp(df_imp["coef"])
+                    clf_importance = df_imp.sort_values(
+                        "abs_coef", ascending=False
+                    ).reset_index(drop=True)
+                    if clf_importance_excel_path is not None:
+                        os.makedirs(
+                            os.path.dirname(clf_importance_excel_path), exist_ok=True
+                        )
+                        clf_importance.to_excel(clf_importance_excel_path, index=False)
         except Exception:
             clf_importance = None
     return {
@@ -1050,10 +1093,11 @@ if __name__ == "__main__":
     except Exception:
         pass
     try:
-        tableone_path = (
-            "/home/sunx/data/aiiih/projects/sunx/projects/ICD/benefit_tableone.xlsx"
-        )
-        clf_imp_path = "/home/sunx/data/aiiih/projects/sunx/projects/ICD/benefit_classifier_importance.xlsx"
+        outdir = "/workspace/outputs"
+        os.makedirs(outdir, exist_ok=True)
+        triage_tableone_path = os.path.join(outdir, "tableone_by_triage.xlsx")
+        triage_km_plot_path = os.path.join(outdir, "km_by_triage.png")
+        clf_imp_path = os.path.join(outdir, "triage_feature_importance.xlsx")
         stabilized = run_stabilized_two_model_pipeline(
             df=df,
             N=20,
@@ -1061,9 +1105,10 @@ if __name__ == "__main__":
             event_col="VT/VF/SCD",
             k_splits=5,
             enforce_fair_subset=True,
-            tableone_excel_path=tableone_path,
             clf_importance_excel_path=clf_imp_path,
             train_benefit_classifier=True,
+            triage_tableone_excel_path=triage_tableone_path,
+            triage_km_plot_path=triage_km_plot_path,
         )
         print("==== Stabilized Two-Model Metrics ====")
         print(stabilized.get("metrics", {}))
@@ -1073,5 +1118,11 @@ if __name__ == "__main__":
                 print(stabilized["classifier_importance"].head(20))
             except Exception:
                 pass
+        try:
+            print("Saved triage TableOne:", triage_tableone_path)
+            print("Saved triage KM plot:", triage_km_plot_path)
+            print("Saved triage feature importance:", clf_imp_path)
+        except Exception:
+            pass
     except Exception:
         pass
