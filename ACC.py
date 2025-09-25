@@ -391,6 +391,8 @@ def generate_tableone_by_sex_icd(
         "Significant LGE",
     ]
     categorical_cols = [c for c in known_cats if c in variables]
+    # Include user-defined local categorical features as categorical
+    categorical_cols += [c for c in LOCAL_CATEGORICAL_FEATURES if c in variables]
 
     # Prefer TableOne if available
     if _HAS_TABLEONE:
@@ -604,6 +606,28 @@ def generate_tableone_by_group(
                     cat_cols.append(c)
         except Exception:
             continue
+    # Ensure known categorical variables are always treated as categorical
+    known_cats = [
+        "Female",
+        "DM",
+        "HTN",
+        "HLP",
+        "AF",
+        "NYHA Class",
+        "NYHA>2",
+        "Beta Blocker",
+        "ACEi/ARB/ARNi",
+        "Aldosterone Antagonist",
+        "VT/VF/SCD",
+        "AAD",
+        "CRT",
+        "ICD",
+        "CrCl>45",
+        "Significant LGE",
+    ]
+    extra_cats = [c for c in known_cats if c in variables]
+    local_cats = [c for c in LOCAL_CATEGORICAL_FEATURES if c in variables]
+    cat_cols = sorted(set(cat_cols) | set(extra_cats) | set(local_cats))
     if _HAS_TABLEONE:
         try:
             tab1 = TableOne(
