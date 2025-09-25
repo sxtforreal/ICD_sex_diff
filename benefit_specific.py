@@ -832,19 +832,29 @@ def run_stabilized_two_model_pipeline(
             stability_seeds=list(range(10)),
             verbose=False,
         )
-        p_base_tab = np.zeros(len(te_tab), dtype=float)
-        p_plus_tab = np.zeros(len(te_tab), dtype=float)
-        if tab_base_model is not None:
-            p_base_tab = _predict_surv_prob_at_t_cox(
-                tab_base_model.model, te_tab, tab_base_model.features, T_STAR_DAYS
-            )
-        if tab_plus_model is not None:
-            p_plus_tab = _predict_surv_prob_at_t_cox(
-                tab_plus_model.model, te_tab, tab_plus_model.features, T_STAR_DAYS
-            )
-        choose_plus_tab = p_plus_tab < p_base_tab
         df_tab = te_tab.copy()
-        df_tab["BenefitGroup"] = np.where(choose_plus_tab, "Benefit", "Non-Benefit")
+        route_plus_tab = None
+        # Prefer grouping by triage classifier prediction when available
+        if triage_clf is not None and np.isfinite(theta_used):
+            try:
+                triage_probs_te_tab = triage_clf.predict_proba(te_tab[base_pool])[:, 1]
+                route_plus_tab = triage_probs_te_tab >= theta_used
+            except Exception:
+                route_plus_tab = None
+        # Fallback: group by which model yields lower predicted 5-year probability
+        if route_plus_tab is None:
+            p_base_tab = np.zeros(len(te_tab), dtype=float)
+            p_plus_tab = np.zeros(len(te_tab), dtype=float)
+            if tab_base_model is not None:
+                p_base_tab = _predict_surv_prob_at_t_cox(
+                    tab_base_model.model, te_tab, tab_base_model.features, T_STAR_DAYS
+                )
+            if tab_plus_model is not None:
+                p_plus_tab = _predict_surv_prob_at_t_cox(
+                    tab_plus_model.model, te_tab, tab_plus_model.features, T_STAR_DAYS
+                )
+            route_plus_tab = p_plus_tab < p_base_tab
+        df_tab["BenefitGroup"] = np.where(route_plus_tab, "Benefit", "Non-Benefit")
         try:
             ACC.generate_tableone_by_group(
                 df_tab, group_col="BenefitGroup", output_excel_path=tableone_excel_path
