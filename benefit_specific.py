@@ -877,6 +877,7 @@ def run_stabilized_two_model_pipeline(
                 time_col=time_col,
                 event_col=event_col,
                 output_path=triage_km_plot_path,
+                t_star_days=T_STAR_DAYS,
             )
         except Exception:
             pass
