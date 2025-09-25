@@ -1768,6 +1768,12 @@ def conversion_and_imputation(
         imputed_X["NYHA Class"] = imputed_X["NYHA Class"].round().astype("Int64")
         imputed_X["NYHA Class"] = imputed_X["NYHA Class"].replace({0: 1, 5: 4})
 
+    # After cleaning: drop rows with missing values in additional (local categorical) features
+    try:
+        imputed_X = drop_rows_with_missing_local_features(imputed_X)
+    except Exception:
+        pass
+
     return imputed_X
 
 
