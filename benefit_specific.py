@@ -1093,10 +1093,11 @@ if __name__ == "__main__":
     except Exception:
         pass
     try:
-        tableone_path = (
-            "/home/sunx/data/aiiih/projects/sunx/projects/ICD/benefit_tableone.xlsx"
-        )
-        clf_imp_path = "/home/sunx/data/aiiih/projects/sunx/projects/ICD/benefit_classifier_importance.xlsx"
+        outdir = "/workspace/outputs"
+        os.makedirs(outdir, exist_ok=True)
+        triage_tableone_path = os.path.join(outdir, "tableone_by_triage.xlsx")
+        triage_km_plot_path = os.path.join(outdir, "km_by_triage.png")
+        clf_imp_path = os.path.join(outdir, "triage_feature_importance.xlsx")
         stabilized = run_stabilized_two_model_pipeline(
             df=df,
             N=20,
@@ -1104,9 +1105,10 @@ if __name__ == "__main__":
             event_col="VT/VF/SCD",
             k_splits=5,
             enforce_fair_subset=True,
-            tableone_excel_path=tableone_path,
             clf_importance_excel_path=clf_imp_path,
             train_benefit_classifier=True,
+            triage_tableone_excel_path=triage_tableone_path,
+            triage_km_plot_path=triage_km_plot_path,
         )
         print("==== Stabilized Two-Model Metrics ====")
         print(stabilized.get("metrics", {}))
@@ -1116,5 +1118,11 @@ if __name__ == "__main__":
                 print(stabilized["classifier_importance"].head(20))
             except Exception:
                 pass
+        try:
+            print("Saved triage TableOne:", triage_tableone_path)
+            print("Saved triage KM plot:", triage_km_plot_path)
+            print("Saved triage feature importance:", clf_imp_path)
+        except Exception:
+            pass
     except Exception:
         pass
