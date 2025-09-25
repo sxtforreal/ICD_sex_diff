@@ -1763,9 +1763,10 @@ def conversion_and_imputation(
         if c in imputed_X.columns:
             imputed_X[c] = (imputed_X[c] >= 0.5).astype(float)
 
-    # Round NYHA Class
+    # Round NYHA Class and coerce 0->1, 5->4 after imputation
     if "NYHA Class" in imputed_X.columns:
         imputed_X["NYHA Class"] = imputed_X["NYHA Class"].round().astype("Int64")
+        imputed_X["NYHA Class"] = imputed_X["NYHA Class"].replace({0: 1, 5: 4})
 
     return imputed_X
 
