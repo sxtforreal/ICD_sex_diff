@@ -184,6 +184,55 @@ def _choose_theta(
     return 0.5
 
 
+def _choose_theta_by_cindex(
+    p: np.ndarray,
+    p5y_base: np.ndarray,
+    p5y_plus: np.ndarray,
+    time: np.ndarray,
+    event: np.ndarray,
+    q_grid: Optional[np.ndarray] = None,
+    min_coverage: float = 0.0,
+    max_coverage: float = 1.0,
+) -> Tuple[float, float, float]:
+    """Select triage threshold by maximizing C-index of the mixture.
+
+    Returns (theta, coverage, c_index).
+    """
+    try:
+        p = np.asarray(p, float)
+        p5y_base = np.asarray(p5y_base, float)
+        p5y_plus = np.asarray(p5y_plus, float)
+        time = np.asarray(time, float)
+        event = np.asarray(event, int)
+        if q_grid is None:
+            q_grid = np.linspace(float(min_coverage), float(max_coverage), 101)
+        best_c = -np.inf
+        best_theta = float("nan")
+        best_cov = float("nan")
+        # Ensure quantiles are computed on finite probs
+        p_finite = p[np.isfinite(p)]
+        if p_finite.size == 0:
+            return 0.5, 0.0, float("nan")
+        for cov in q_grid:
+            cov = float(np.clip(cov, 0.0, 1.0))
+            # route cov fraction to plus -> threshold at (1 - cov) quantile
+            q = 1.0 - cov
+            theta = float(np.quantile(p_finite, q))
+            route_plus = p >= theta
+            mix = np.where(route_plus, p5y_plus, p5y_base)
+            try:
+                cidx = float(concordance_index(time, -np.asarray(mix), event))
+            except Exception:
+                cidx = np.nan
+            if np.isfinite(cidx) and (cidx > best_c):
+                best_c = cidx
+                best_theta = theta
+                best_cov = float(np.mean(route_plus))
+        return best_theta, best_cov, best_c
+    except Exception:
+        return 0.5, float("nan"), float("nan")
+
+
 def _make_joint_stratify_labels(
     df: pd.DataFrame, cols: List[str]
 ) -> Optional[pd.Series]:
@@ -841,20 +890,69 @@ def run_stabilized_two_model_pipeline(
             ).fit(X_tri, y_tri)
 
             triage_probs = lr_tri.predict_proba(X_tri)[:, 1]
-            theta_used = _choose_theta(triage_probs, method="budget", coverage=0.4)
-            route_plus = triage_probs >= theta_used
-            coverage_triage = float(np.mean(route_plus))
-
-            p5y_triage_all = np.where(route_plus, p5y_plus_all, p5y_base_all)
-
+            # Optimize threshold by maximizing mixture C-index over coverage grid
+            theta_opt, cov_opt, cidx_opt = _choose_theta_by_cindex(
+                p=triage_probs,
+                p5y_base=p5y_base_all,
+                p5y_plus=p5y_plus_all,
+                time=df_use[time_col].values,
+                event=df_use[event_col].values,
+                q_grid=np.linspace(0.0, 1.0, 101),
+            )
+            # Fallback to budget rule if optimization failed
+            if not np.isfinite(theta_opt):
+                theta_opt = _choose_theta(triage_probs, method="budget", coverage=0.4)
+                route_plus = triage_probs >= theta_opt
+                p5y_triage_all = np.where(route_plus, p5y_plus_all, p5y_base_all)
+                try:
+                    cidx_opt = float(
+                        concordance_index(
+                            df_use[time_col], -np.asarray(p5y_triage_all), df_use[event_col]
+                        )
+                    )
+                except Exception:
+                    cidx_opt = np.nan
+                cov_opt = float(np.mean(route_plus))
+            else:
+                route_plus = triage_probs >= theta_opt
+                p5y_triage_all = np.where(route_plus, p5y_plus_all, p5y_base_all)
+            # Ensure triage is not worse than the better single model at extremes
             try:
-                c_index_triage = float(
+                cidx_base_only = float(
                     concordance_index(
-                        df_use[time_col], -np.asarray(p5y_triage_all), df_use[event_col]
+                        df_use[time_col].values, -np.asarray(p5y_base_all), df_use[event_col].values
                     )
                 )
             except Exception:
-                c_index_triage = np.nan
+                cidx_base_only = np.nan
+            try:
+                cidx_plus_only = float(
+                    concordance_index(
+                        df_use[time_col].values, -np.asarray(p5y_plus_all), df_use[event_col].values
+                    )
+                )
+            except Exception:
+                cidx_plus_only = np.nan
+
+            theta_used = float(theta_opt)
+            coverage_triage = float(cov_opt)
+            c_index_triage = float(cidx_opt)
+
+            best_single = np.nanmax([cidx_base_only, cidx_plus_only])
+            if not np.isfinite(c_index_triage) or (np.isfinite(best_single) and c_index_triage < best_single - 1e-12):
+                # Override with the better single model routing
+                if np.nan_to_num(cidx_plus_only, nan=-np.inf) >= np.nan_to_num(cidx_base_only, nan=-np.inf):
+                    route_plus = np.ones(len(df_use), dtype=bool)
+                    p5y_triage_all = p5y_plus_all
+                    coverage_triage = 1.0
+                    c_index_triage = float(cidx_plus_only)
+                    theta_used = float(np.nanmin(triage_probs) - 1e-9)
+                else:
+                    route_plus = np.zeros(len(df_use), dtype=bool)
+                    p5y_triage_all = p5y_base_all
+                    coverage_triage = 0.0
+                    c_index_triage = float(cidx_base_only)
+                    theta_used = float(np.nanmax(triage_probs) + 1e-9)
     except Exception:
         pass
 
