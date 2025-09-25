@@ -792,27 +792,6 @@ def run_stabilized_two_model_pipeline(
         coverage_triage = float(np.mean(route_plus))
         p5y_triage_all = np.where(route_plus, p5y_plus_all, p5y_base_all)
         c_index_triage = _cidx_safe_from_prob(p5y_triage_all)
-        # Triage-based TableOne and KM for the full dataset
-        try:
-            df_tri = df_use.copy()
-            df_tri["BenefitGroup"] = np.where(route_plus, "Benefit", "Non-Benefit")
-            ACC.generate_tableone_by_group(
-                df_tri, group_col="BenefitGroup", output_excel_path=triage_tableone_excel_path
-            )
-        except Exception:
-            pass
-        try:
-            ACC.plot_km_by_group(
-                df_use.assign(
-                    BenefitGroup=np.where(route_plus, "Benefit", "Non-Benefit")
-                ),
-                group_col="BenefitGroup",
-                time_col=time_col,
-                event_col=event_col,
-                output_path=triage_km_plot_path,
-            )
-        except Exception:
-            pass
     else:
         theta_used = np.nan
         coverage_triage = np.nan
@@ -881,6 +860,23 @@ def run_stabilized_two_model_pipeline(
         try:
             ACC.generate_tableone_by_group(
                 df_tab, group_col="BenefitGroup", output_excel_path=tableone_excel_path
+            )
+        except Exception:
+            pass
+        # Additionally, save triage TableOne and KM for TEST split only
+        try:
+            ACC.generate_tableone_by_group(
+                df_tab, group_col="BenefitGroup", output_excel_path=triage_tableone_excel_path
+            )
+        except Exception:
+            pass
+        try:
+            ACC.plot_km_by_group(
+                df_tab,
+                group_col="BenefitGroup",
+                time_col=time_col,
+                event_col=event_col,
+                output_path=triage_km_plot_path,
             )
         except Exception:
             pass
