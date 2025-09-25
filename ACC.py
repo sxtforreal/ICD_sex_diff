@@ -332,6 +332,7 @@ def plot_km_by_group(
     time_col: str = "PE_Time",
     event_col: str = "VT/VF/SCD",
     output_path: str = None,
+    t_star_days: int = None,
 ) -> None:
     if df is None or df.empty or group_col not in df.columns:
         return
@@ -349,10 +350,21 @@ def plot_km_by_group(
         if sub.empty:
             continue
         n = int(len(sub))
-        events = int(pd.to_numeric(sub[event_col], errors="coerce").fillna(0).sum())
+        if t_star_days is not None:
+            t_raw = pd.to_numeric(sub[time_col], errors="coerce").astype(float).values
+            e_raw = (
+                pd.to_numeric(sub[event_col], errors="coerce").fillna(0).astype(int).values
+            )
+            t_used = np.minimum(t_raw, float(t_star_days))
+            e_used = ((e_raw == 1) & (t_raw <= float(t_star_days))).astype(int)
+            events = int(e_used.sum())
+            kmf.fit(durations=t_used, event_observed=e_used, label=None)
+        else:
+            events = int(pd.to_numeric(sub[event_col], errors="coerce").fillna(0).sum())
+            kmf.fit(durations=sub[time_col], event_observed=sub[event_col], label=None)
         label = f"{str(g)} (n={n}, events={events})"
-        kmf.fit(durations=sub[time_col], event_observed=sub[event_col], label=label)
-        kmf.plot(ci_show=True, color=palette[idx % len(palette)])
+        # Re-plot with label (workaround to keep computed curve and attach label)
+        kmf.plot(ci_show=True, color=palette[idx % len(palette)], label=label)
     plt.xlabel("Time (days)")
     plt.ylabel("Survival Probability")
     plt.title(f"KM by {group_col}")
