@@ -5,10 +5,12 @@ from collections import Counter
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 from lifelines.utils import concordance_index
 from lifelines import KaplanMeierFitter
 
+import matplotlib.pyplot as plt
 import ACC
 from ACC import (
     fit_cox_model,
@@ -647,6 +649,7 @@ def run_stabilized_two_model_pipeline(
     train_benefit_classifier: bool = True,
     triage_tableone_excel_path: Optional[str] = None,
     triage_km_plot_path: Optional[str] = None,
+    triage_featimp_plot_path: Optional[str] = None,
 ) -> Dict[str, object]:
     base_pool = list(FEATURE_SETS.get("Proposed", []))
     plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
@@ -913,6 +916,24 @@ def run_stabilized_two_model_pipeline(
                             os.path.dirname(clf_importance_excel_path), exist_ok=True
                         )
                         clf_importance.to_excel(clf_importance_excel_path, index=False)
+                    # Plot and save feature importance if requested
+                    try:
+                        if triage_featimp_plot_path is not None and clf_importance is not None and len(clf_importance) > 0:
+                            os.makedirs(os.path.dirname(triage_featimp_plot_path), exist_ok=True)
+                            top_k = int(min(30, len(clf_importance)))
+                            df_plot = clf_importance.head(top_k).iloc[::-1]
+                            height = max(4.0, 0.4 * top_k)
+                            plt.figure(figsize=(10, height))
+                            colors = ["#d62728" if v > 0 else "#1f77b4" for v in df_plot["coef"].tolist()]
+                            plt.barh(df_plot["feature"], df_plot["abs_coef"], color=colors, alpha=0.85)
+                            plt.xlabel("Absolute Coefficient |beta|")
+                            plt.ylabel("Feature")
+                            plt.title("Triage Classifier Feature Importance (|coef|)")
+                            plt.tight_layout()
+                            plt.savefig(triage_featimp_plot_path, dpi=200, bbox_inches="tight")
+                            plt.close()
+                    except Exception:
+                        pass
         except Exception:
             clf_importance = None
     return {
@@ -1095,6 +1116,7 @@ if __name__ == "__main__":
         triage_tableone_path = os.path.join(outdir, "tableone_by_triage.xlsx")
         triage_km_plot_path = os.path.join(outdir, "km_by_triage.png")
         clf_imp_path = os.path.join(outdir, "triage_feature_importance.xlsx")
+        triage_featimp_plot_path = os.path.join(outdir, "triage_feature_importance.png")
         stabilized = run_stabilized_two_model_pipeline(
             df=df,
             N=20,
@@ -1106,6 +1128,7 @@ if __name__ == "__main__":
             train_benefit_classifier=True,
             triage_tableone_excel_path=triage_tableone_path,
             triage_km_plot_path=triage_km_plot_path,
+            triage_featimp_plot_path=triage_featimp_plot_path,
         )
         print("==== Stabilized Two-Model Metrics ====")
         print(stabilized.get("metrics", {}))
@@ -1119,6 +1142,7 @@ if __name__ == "__main__":
             print("Saved triage TableOne:", triage_tableone_path)
             print("Saved triage KM plot:", triage_km_plot_path)
             print("Saved triage feature importance:", clf_imp_path)
+            print("Saved triage feature importance plot:", triage_featimp_plot_path)
         except Exception:
             pass
     except Exception:
