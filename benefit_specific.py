@@ -869,7 +869,9 @@ def run_stabilized_two_model_pipeline(
         # Additionally, save triage TableOne and KM for TEST split only
         try:
             ACC.generate_tableone_by_group(
-                df_tab, group_col="BenefitGroup", output_excel_path=triage_tableone_excel_path
+                df_tab,
+                group_col="BenefitGroup",
+                output_excel_path=triage_tableone_excel_path,
             )
         except Exception:
             pass
@@ -918,19 +920,35 @@ def run_stabilized_two_model_pipeline(
                         clf_importance.to_excel(clf_importance_excel_path, index=False)
                     # Plot and save feature importance if requested
                     try:
-                        if triage_featimp_plot_path is not None and clf_importance is not None and len(clf_importance) > 0:
-                            os.makedirs(os.path.dirname(triage_featimp_plot_path), exist_ok=True)
+                        if (
+                            triage_featimp_plot_path is not None
+                            and clf_importance is not None
+                            and len(clf_importance) > 0
+                        ):
+                            os.makedirs(
+                                os.path.dirname(triage_featimp_plot_path), exist_ok=True
+                            )
                             top_k = int(min(30, len(clf_importance)))
                             df_plot = clf_importance.head(top_k).iloc[::-1]
                             height = max(4.0, 0.4 * top_k)
                             plt.figure(figsize=(10, height))
-                            colors = ["#d62728" if v > 0 else "#1f77b4" for v in df_plot["coef"].tolist()]
-                            plt.barh(df_plot["feature"], df_plot["abs_coef"], color=colors, alpha=0.85)
+                            colors = [
+                                "#d62728" if v > 0 else "#1f77b4"
+                                for v in df_plot["coef"].tolist()
+                            ]
+                            plt.barh(
+                                df_plot["feature"],
+                                df_plot["abs_coef"],
+                                color=colors,
+                                alpha=0.85,
+                            )
                             plt.xlabel("Absolute Coefficient |beta|")
                             plt.ylabel("Feature")
                             plt.title("Triage Classifier Feature Importance (|coef|)")
                             plt.tight_layout()
-                            plt.savefig(triage_featimp_plot_path, dpi=200, bbox_inches="tight")
+                            plt.savefig(
+                                triage_featimp_plot_path, dpi=200, bbox_inches="tight"
+                            )
                             plt.close()
                     except Exception:
                         pass
@@ -1099,7 +1117,7 @@ if __name__ == "__main__":
         export_path = None
         results, summary = run_benefit_specific_experiments(
             df=df,
-            N=20,
+            N=10,
             time_col="PE_Time",
             event_col="VT/VF/SCD",
             k_splits=5,
@@ -1111,7 +1129,7 @@ if __name__ == "__main__":
     except Exception:
         pass
     try:
-        outdir = "/workspace/outputs"
+        outdir = "/home/sunx/data/aiiih/projects/sunx/projects/ICD"
         os.makedirs(outdir, exist_ok=True)
         triage_tableone_path = os.path.join(outdir, "tableone_by_triage.xlsx")
         triage_km_plot_path = os.path.join(outdir, "km_by_triage.png")
@@ -1119,7 +1137,7 @@ if __name__ == "__main__":
         triage_featimp_plot_path = os.path.join(outdir, "triage_feature_importance.png")
         stabilized = run_stabilized_two_model_pipeline(
             df=df,
-            N=20,
+            N=10,
             time_col="PE_Time",
             event_col="VT/VF/SCD",
             k_splits=5,
