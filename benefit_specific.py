@@ -26,7 +26,7 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import SGDClassifier
+from sklearn.linear_model import SGDClassifier, LogisticRegression
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -297,16 +297,13 @@ def fit_calibrated_triage(
             ("scaler", StandardScaler()),
             (
                 "clf",
-                SGDClassifier(
-                    loss="log_loss",
-                    penalty="elasticnet",
-                    alpha=3e-4,
-                    l1_ratio=0.15,
-                    max_iter=2000,
-                    tol=1e-3,
+                LogisticRegression(
+                    solver="liblinear",
+                    penalty="l2",
+                    C=1.0,
                     class_weight="balanced",
+                    max_iter=2000,
                     random_state=random_state,
-                    n_jobs=-1,
                 ),
             ),
         ]
@@ -1147,6 +1144,8 @@ def run_single_split_two_model_pipeline(
     triage_clf = None
     theta_used = np.nan
     coverage_triage = np.nan
+    p5y_triage_te = np.zeros(len(te), dtype=float)
+    clf_importance: Optional[pd.DataFrame] = None
     try:
         # Crossfit benefit labels on training set
         _, B, tau = make_benefit_labels_crossfit(
@@ -1178,6 +1177,50 @@ def run_single_split_two_model_pipeline(
             )
             p_va = triage_clf.predict_proba(X_va_theta)[:, 1]
             theta_used = _choose_theta(p_va, method="max_net_benefit", y_benefit=y_va_theta, harm_ratio=1.0)
+        # Extract and display triage classifier feature importance (logistic coefficients)
+        try:
+            fitted_base = None
+            if hasattr(triage_clf, "calibrated_classifiers_") and getattr(
+                triage_clf, "calibrated_classifiers_", None
+            ):
+                fitted_base = triage_clf.calibrated_classifiers_[0].base_estimator
+            else:
+                fitted_base = getattr(triage_clf, "base_estimator", None)
+            if fitted_base is not None and hasattr(fitted_base, "named_steps"):
+                inner = fitted_base.named_steps.get("clf", fitted_base)
+            else:
+                inner = fitted_base
+            if inner is not None and hasattr(inner, "coef_"):
+                coefs = np.asarray(inner.coef_).reshape(-1)
+                feats = [f for f in base_pool if f in tr.columns]
+                if len(coefs) == len(feats):
+                    df_imp = pd.DataFrame({"feature": feats, "coef": coefs})
+                    df_imp["abs_coef"] = df_imp["coef"].abs()
+                    with np.errstate(over="ignore"):
+                        df_imp["odds_ratio"] = np.exp(df_imp["coef"])
+                    clf_importance = df_imp.sort_values("abs_coef", ascending=False).reset_index(drop=True)
+                    try:
+                        print("==== Triage Classifier Feature Importance (|coef|) - Top 20 ====")
+                        print(clf_importance.head(int(min(20, len(clf_importance)))))
+                    except Exception:
+                        pass
+                    if plot_model_featimp and len(clf_importance) > 0:
+                        try:
+                            top_k = int(min(30, len(clf_importance)))
+                            df_plot = clf_importance.head(top_k).iloc[::-1]
+                            height = max(4.0, 0.4 * top_k)
+                            plt.figure(figsize=(10, height))
+                            colors = ["#d62728" if v > 0 else "#1f77b4" for v in df_plot["coef"].tolist()]
+                            plt.barh(df_plot["feature"], df_plot["abs_coef"], color=colors, alpha=0.85)
+                            plt.xlabel("Absolute Coefficient |beta|")
+                            plt.ylabel("Feature")
+                            plt.title("Triage Classifier Feature Importance (|coef|)")
+                            plt.tight_layout()
+                            plt.show()
+                        except Exception:
+                            pass
+        except Exception:
+            clf_importance = None
     except Exception:
         triage_clf = None
 
@@ -1208,6 +1251,9 @@ def run_single_split_two_model_pipeline(
         "final_plus_features": (final_plus.features if final_plus is not None else []),
         "p5y_base_test": p5y_base_te,
         "p5y_plus_test": p5y_plus_te,
+        "p5y_triage_test": p5y_triage_te,
+        "p5y_best_test": p5y_best_te,
+        "triage_route_plus": (triage_clf is not None and np.isfinite(theta_used) and (triage_probs_te >= float(theta_used))) if 'triage_probs_te' in locals() else np.zeros(len(te), dtype=bool),
         "metrics": {
             "c_index_base": cidx_base,
             "c_index_plus": cidx_plus,
@@ -1215,6 +1261,7 @@ def run_single_split_two_model_pipeline(
             "c_index_triage": cidx_triage,
             "coverage_triage": coverage_triage,
         },
+        "triage_classifier_importance": clf_importance,
     }
 
 def run_benefit_specific_experiments(
