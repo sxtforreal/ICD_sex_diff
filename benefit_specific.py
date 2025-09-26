@@ -352,6 +352,82 @@ def _brier_ipcw_at_t(
         return float("nan")
 
 
+def make_best_per_sample_labels(event: np.ndarray, p_base: np.ndarray, p_plus: np.ndarray) -> np.ndarray:
+    """
+    根据 true label 与 base/plus 风险，生成是否从 plus 受益的二分类标签：
+      - 若 event=1（发生事件），选择预测风险更高的模型
+      - 若 event=0（未发生事件），选择预测风险更低的模型
+    返回 1 表示应选择 plus，0 表示应选择 base。
+    """
+    try:
+        e = np.asarray(event).astype(int)
+        pB = np.asarray(p_base, float)
+        pP = np.asarray(p_plus, float)
+        return np.where(e == 1, pP > pB, pP < pB).astype(int)
+    except Exception:
+        return np.zeros(len(event), dtype=int)
+
+
+def fit_triage_best_per_sample(
+    train_df: pd.DataFrame,
+    base_features: List[str],
+    event_col: str,
+    p_base_tr: np.ndarray,
+    p_plus_tr: np.ndarray,
+    random_state: int = 0,
+    backend: str = "sgd",
+    calibration: str = "sigmoid",
+):
+    """
+    用 best-per-sample 标签训练分诊分类器。
+    """
+    try:
+        labels = make_best_per_sample_labels(
+            event=train_df[event_col].values.astype(int),
+            p_base=p_base_tr,
+            p_plus=p_plus_tr,
+        )
+        kept = [f for f in base_features if f in train_df.columns]
+        if len(kept) == 0:
+            return None
+        return fit_calibrated_triage(
+            train_df=train_df,
+            base_features=kept,
+            B=labels,
+            random_state=int(random_state),
+            backend=backend,
+            calibration=calibration,
+        )
+    except Exception:
+        return None
+
+
+def route_with_triage(
+    triage_clf,
+    df_part: pd.DataFrame,
+    base_features: List[str],
+    p_base: np.ndarray,
+    p_plus: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    使用分诊分类器的类别预测进行路由，返回：
+      - 路由后的风险数组
+      - 布尔掩码（True 表示走 plus，False 表示走 base）
+    """
+    try:
+        if triage_clf is None:
+            return np.asarray(p_base, float), np.zeros(len(p_base), dtype=bool)
+        kept = [f for f in base_features if f in df_part.columns]
+        if len(kept) == 0:
+            return np.asarray(p_base, float), np.zeros(len(p_base), dtype=bool)
+        pred = triage_clf.predict(df_part[kept])
+        route_plus = (np.asarray(pred).astype(int) == 1)
+        routed = np.where(route_plus, np.asarray(p_plus, float), np.asarray(p_base, float))
+        return routed, route_plus
+    except Exception:
+        return np.asarray(p_base, float), np.zeros(len(p_base), dtype=bool)
+
+
 def fit_soft_r_triage(
     train_df: pd.DataFrame,
     base_features: List[str],
@@ -645,73 +721,42 @@ def evaluate_benefit_specific_split(
     if enforce_fair_subset:
         train_df = drop_rows_with_missing_local_features(train_df)
         test_df = drop_rows_with_missing_local_features(test_df)
-    z, B, tau = make_benefit_labels_crossfit(
-        train_df=train_df,
-        base_features=base_pool,
-        plus_features=plus_pool,
-        time_col=time_col,
-        event_col=event_col,
-        k_splits=k_splits,
-        random_state=random_state,
-        tau_rule="q65",
-        margin_std=0.10,
-    )
-    triage_clf = fit_calibrated_triage(
-        train_df=train_df,
-        base_features=base_pool,
-        B=B,
-        random_state=random_state,
-        backend="xgb",
-        calibration="sigmoid",
-    )
-    if triage_clf is None:
-        triage_probs_tr = np.zeros(len(train_df))
-    else:
-        triage_probs_tr = triage_clf.predict_proba(train_df[base_pool])[:, 1]
-    mask_lbl = (B == 0) | (B == 1)
-    X_theta = train_df.loc[mask_lbl, base_pool]
-    y_theta = B[mask_lbl].astype(int)
-    X_tr_theta, X_va_theta, y_tr_theta, y_va_theta = train_test_split(
-        X_theta, y_theta, test_size=0.2, random_state=random_state, stratify=y_theta
-    )
-    p_va = (
-        triage_clf.predict_proba(X_va_theta)[:, 1]
-        if triage_clf is not None
-        else np.zeros(len(X_va_theta))
-    )
-    # Prefer c-index-based theta using OOF base/plus risks on training
+    # Best-per-sample triage training on train set
     try:
-        pB_oof_tr, pP_oof_tr = compute_oof_probs_5y(
-            train_df=train_df,
-            base_features=base_pool,
-            plus_features=plus_pool,
-            time_col=time_col,
-            event_col=event_col,
-            k_splits=k_splits,
-            random_state=random_state,
-            enforce_fair_subset=False,
+        p5y_base_tr_all = _predict_surv_prob_at_t_cox(
+            fit_cox_model(train_df, base_pool, time_col, event_col),
+            train_df,
+            base_pool,
+            T_STAR_DAYS,
         )
-        idx_va = X_va_theta.index
-        pB_va = pB_oof_tr[idx_va]
-        pP_va = pP_oof_tr[idx_va]
-        t_va = train_df.loc[idx_va, time_col].values.astype(float)
-        e_va = train_df.loc[idx_va, event_col].values.astype(int)
-        theta = _choose_theta_by_cindex_mix(p_va, pB_va, pP_va, t_va, e_va)
-        if not np.isfinite(theta):
-            theta = _choose_theta(
-                p_va, method="max_net_benefit", y_benefit=y_va_theta, harm_ratio=1.0
-            )
     except Exception:
-        theta = _choose_theta(
-            p_va, method="max_net_benefit", y_benefit=y_va_theta, harm_ratio=1.0
+        p5y_base_tr_all = np.zeros(len(train_df), dtype=float)
+    try:
+        p5y_plus_tr_all = _predict_surv_prob_at_t_cox(
+            fit_cox_model(train_df, plus_pool, time_col, event_col),
+            train_df,
+            plus_pool,
+            T_STAR_DAYS,
         )
-    triage_probs_te = (
-        triage_clf.predict_proba(test_df[base_pool])[:, 1]
-        if triage_clf is not None
-        else np.zeros(len(test_df))
+    except Exception:
+        p5y_plus_tr_all = np.zeros(len(train_df), dtype=float)
+    triage_clf = fit_triage_best_per_sample(
+        train_df=train_df,
+        base_features=base_pool,
+        event_col=event_col,
+        p_base_tr=p5y_base_tr_all,
+        p_plus_tr=p5y_plus_tr_all,
+        random_state=int(random_state),
     )
-    test_pred_benefit = (triage_probs_te >= theta).astype(int)
-    benefit_mask_tr = triage_probs_tr >= theta
+    # Predict benefit on test directly with triage classifier
+    try:
+        triage_pred_te = (
+            triage_clf.predict(test_df[base_pool]) if triage_clf is not None else np.zeros(len(test_df), int)
+        )
+        test_pred_benefit = (np.asarray(triage_pred_te).astype(int) == 1)
+    except Exception:
+        test_pred_benefit = np.zeros(len(test_df), dtype=bool)
+    benefit_mask_tr = np.zeros(len(train_df), dtype=bool)
     non_benefit_mask_tr = ~benefit_mask_tr
     n_total = len(train_df)
 
@@ -827,9 +872,9 @@ def evaluate_benefit_specific_split(
                 "c_index": float(cidx),
                 "grouping": 0,
                 "single_is_plus": float(single_model_is_plus),
-                "benefit_mask": (triage_probs_te >= theta),
-                "benefit_theta": float(theta),
-                "benefit_tau": float(tau),
+                "benefit_mask": test_pred_benefit,
+                "benefit_theta": np.nan,
+                "benefit_tau": np.nan,
             },
         )
     mask_benefit_te = test_pred_benefit == 1
@@ -1117,46 +1162,34 @@ def run_stabilized_two_model_pipeline(
         except Exception:
             return np.nan
 
-    triage_clf = fit_calibrated_triage(
-        train_df=df_use,
+    # New triage: use best-per-sample labels via shared helpers
+    try:
+        triage_clf = fit_triage_best_per_sample(
+            train_df=df_use,
+            base_features=base_pool,
+            event_col=event_col,
+            p_base_tr=p5y_base_all,
+            p_plus_tr=p5y_plus_all,
+            random_state=0,
+        )
+    except Exception:
+        triage_clf = None
+    routed_all, route_plus_all = route_with_triage(
+        triage_clf=triage_clf,
+        df_part=df_use,
         base_features=base_pool,
-        B=(dLL_all > tau).astype(int),
-        random_state=0,
-        backend="sgd",
-        calibration="sigmoid",
+        p_base=p5y_base_all,
+        p_plus=p5y_plus_all,
     )
-    if triage_clf is not None:
-        triage_probs_all = triage_clf.predict_proba(df_use[base_pool])[:, 1]
-        labels_all = (dLL_all > tau).astype(int)
-        mask_lbl = np.isfinite(triage_probs_all) & np.isfinite(labels_all)
-        df_lbl = df_use.loc[mask_lbl]
-        p_all = triage_probs_all[mask_lbl]
-        y_all = labels_all[mask_lbl]
-        pB_lbl = p5y_base_all[mask_lbl]
-        pP_lbl = p5y_plus_all[mask_lbl]
-        t_lbl = df_lbl[time_col].values.astype(float)
-        e_lbl = df_lbl[event_col].values.astype(int)
-        p_tr, p_va, pB_tr, pB_va, pP_tr, pP_va, t_tr, t_va, e_tr, e_va, y_tr, y_va = train_test_split(
-            p_all, pB_lbl, pP_lbl, t_lbl, e_lbl, y_all,
-            test_size=0.2, random_state=0, stratify=y_all
-        )
-        # Choose theta by maximizing validation mixed c-index
-        theta_by_c = _choose_theta_by_cindex_mix(
-            p=p_va, p_base=pB_va, p_plus=pP_va, time=t_va, event=e_va
-        )
-        # Fallback to net benefit if needed (e.g., nan)
-        if not np.isfinite(theta_by_c):
-            theta_by_c = _choose_theta(
-                p_va, method="max_net_benefit", y_benefit=y_va, harm_ratio=1.0
-            )
-        theta_used = float(theta_by_c)
-        route_plus = triage_probs_all >= theta_used
-        coverage_triage = float(np.mean(route_plus))
-        p5y_triage_all = np.where(route_plus, p5y_plus_all, p5y_base_all)
-        c_index_triage = _cidx_safe_from_prob(p5y_triage_all)
-    else:
-        theta_used = np.nan
+    try:
+        coverage_triage = float(np.mean(route_plus_all))
+    except Exception:
         coverage_triage = np.nan
+    try:
+        c_index_triage = float(
+            concordance_index(df_use[time_col], -np.asarray(routed_all), df_use[event_col])
+        )
+    except Exception:
         c_index_triage = np.nan
 
     # Soft-routing triage on full data: fit r(x) with OOF risks and evaluate mixture
@@ -1216,7 +1249,7 @@ def run_stabilized_two_model_pipeline(
         "brier_soft": brier_soft,
         "coverage_triage": coverage_triage,
         "coverage_soft": coverage_soft,
-        "theta_triage": float(theta_used) if np.isfinite(theta_used) else np.nan,
+        "theta_triage": np.nan,
         "tau": float(tau),
     }
     try:
@@ -1251,10 +1284,10 @@ def run_stabilized_two_model_pipeline(
         df_tab = te_tab.copy()
         route_plus_tab = None
         # Prefer grouping by triage classifier prediction when available
-        if triage_clf is not None and np.isfinite(theta_used):
+        if triage_clf is not None:
             try:
-                triage_probs_te_tab = triage_clf.predict_proba(te_tab[base_pool])[:, 1]
-                route_plus_tab = triage_probs_te_tab >= theta_used
+                triage_pred_tab = triage_clf.predict(te_tab[base_pool])
+                route_plus_tab = (np.asarray(triage_pred_tab).astype(int) == 1)
             except Exception:
                 route_plus_tab = None
         # Fallback: group by which model yields lower predicted 5-year probability
@@ -1479,64 +1512,34 @@ def run_single_split_two_model_pipeline(
     except Exception:
         cidx_best = np.nan
 
-    # Train triage classifier on training set using the same method as before (crossfit OOF labels)
+    # Train triage classifier on TRAIN using best-per-sample labels from base/plus predictions and true labels
     triage_clf = None
-    theta_used = np.nan
     coverage_triage = np.nan
     p5y_triage_te = np.zeros(len(te), dtype=float)
     clf_importance: Optional[pd.DataFrame] = None
     try:
-        # Crossfit benefit labels on training set
-        _, B, tau = make_benefit_labels_crossfit(
-            train_df=tr,
-            base_features=[f for f in base_pool if f in tr.columns],
-            plus_features=[f for f in plus_pool if f in tr.columns],
-            time_col=time_col,
-            event_col=event_col,
-            k_splits=5,
-            random_state=int(random_state),
-            tau_rule="q65",
-            margin_std=0.10,
-        )
+        p5y_base_tr = np.zeros(len(tr), dtype=float)
+        p5y_plus_tr = np.zeros(len(tr), dtype=float)
+        try:
+            if final_base is not None:
+                p5y_base_tr = _predict_surv_prob_at_t_cox(final_base.model, tr, final_base.features, T_STAR_DAYS)
+        except Exception:
+            p5y_base_tr = np.zeros(len(tr), dtype=float)
+        try:
+            if final_plus is not None:
+                p5y_plus_tr = _predict_surv_prob_at_t_cox(final_plus.model, tr, final_plus.features, T_STAR_DAYS)
+        except Exception:
+            p5y_plus_tr = np.zeros(len(tr), dtype=float)
+        event_tr = tr[event_col].astype(int).to_numpy()
+        label_tr = np.where(event_tr == 1, p5y_plus_tr > p5y_base_tr, p5y_plus_tr < p5y_base_tr).astype(int)
         triage_clf = fit_calibrated_triage(
             train_df=tr,
             base_features=[f for f in base_pool if f in tr.columns],
-            B=B,
+            B=label_tr,
             random_state=int(random_state),
             backend="sgd",
             calibration="sigmoid",
         )
-        # Pick threshold theta on a small validation split from train where labels exist
-        mask_lbl = (B == 0) | (B == 1)
-        X_theta = tr.loc[mask_lbl, [f for f in base_pool if f in tr.columns]]
-        y_theta = B[mask_lbl].astype(int)
-        if len(X_theta) > 1 and triage_clf is not None:
-            X_tr_theta, X_va_theta, y_tr_theta, y_va_theta = train_test_split(
-                X_theta, y_theta, test_size=0.2, random_state=int(random_state), stratify=y_theta
-            )
-            p_va = triage_clf.predict_proba(X_va_theta)[:, 1]
-            # Build validation base/plus risks using globally trained models for c-index selection
-            try:
-                pB_va = _predict_surv_prob_at_t_cox(final_base.model, X_va_theta.join(te[[]]), final_base.features, T_STAR_DAYS) if final_base is not None else np.zeros(len(p_va))
-            except Exception:
-                pB_va = np.zeros(len(p_va))
-            try:
-                pP_va = _predict_surv_prob_at_t_cox(final_plus.model, X_va_theta.join(te[[]]), final_plus.features, T_STAR_DAYS) if final_plus is not None else np.zeros(len(p_va))
-            except Exception:
-                pP_va = np.zeros(len(p_va))
-            t_va = X_va_theta[time_col] if time_col in X_va_theta.columns else te[time_col].sample(n=len(p_va), random_state=int(random_state)).to_numpy()
-            e_va = X_va_theta[event_col] if event_col in X_va_theta.columns else te[event_col].sample(n=len(p_va), random_state=int(random_state)).to_numpy()
-            # Prefer c-index based theta
-            th_c = _choose_theta_by_cindex_mix(
-                p=p_va,
-                p_base=np.asarray(pB_va, float),
-                p_plus=np.asarray(pP_va, float),
-                time=np.asarray(t_va, float),
-                event=np.asarray(e_va, int),
-            )
-            if not np.isfinite(th_c):
-                th_c = _choose_theta(p_va, method="max_net_benefit", y_benefit=y_va_theta, harm_ratio=1.0)
-            theta_used = float(th_c)
         # Extract and display triage classifier feature importance (logistic coefficients)
         try:
             fitted_base = None
@@ -1584,11 +1587,11 @@ def run_single_split_two_model_pipeline(
     except Exception:
         triage_clf = None
 
-    # Triage routing on test using the globally trained base/plus models
+    # Triage routing on test using predicted class directly
     try:
-        if triage_clf is not None and np.isfinite(theta_used):
-            triage_probs_te = triage_clf.predict_proba(te[[f for f in base_pool if f in te.columns]])[:, 1]
-            route_plus = triage_probs_te >= float(theta_used)
+        if triage_clf is not None:
+            triage_pred_te = triage_clf.predict(te[[f for f in base_pool if f in te.columns]])
+            route_plus = (np.asarray(triage_pred_te).astype(int) == 1)
             coverage_triage = float(np.mean(route_plus))
             p5y_triage_te = np.where(route_plus, p5y_plus_te, p5y_base_te)
             cidx_triage = float(concordance_index(te[time_col], -p5y_triage_te, te[event_col]))
@@ -1671,7 +1674,7 @@ def run_single_split_two_model_pipeline(
         "p5y_soft_test": p5y_soft_te,
         "r_soft_test": r_soft_te,
         "best_route_plus": route_oracle_plus,
-        "triage_route_plus": (triage_clf is not None and np.isfinite(theta_used) and (triage_probs_te >= float(theta_used))) if 'triage_probs_te' in locals() else np.zeros(len(te), dtype=bool),
+        "triage_route_plus": (np.asarray(triage_pred_te).astype(int) == 1) if 'triage_pred_te' in locals() else np.zeros(len(te), dtype=bool),
         "metrics": {
             "c_index_base": cidx_base,
             "c_index_plus": cidx_plus,
