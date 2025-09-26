@@ -17,6 +17,8 @@ from ACC import (
     predict_risk,
     drop_rows_with_missing_local_features,
     FEATURE_SETS,
+    stability_select_features,
+    plot_cox_coefficients,
 )
 
 from sklearn.model_selection import StratifiedKFold, train_test_split
@@ -322,6 +324,10 @@ def _train_group_model(
     event_col: str,
     stability_seeds: List[int],
     verbose: bool = False,
+    do_feature_selection: bool = True,
+    fs_max_features: Optional[int] = None,
+    stability_threshold: float = 0.4,
+    plot_importance: bool = False,
 ) -> Optional[GroupModel]:
     if df_group is None or df_group.empty:
         return None
@@ -329,12 +335,46 @@ def _train_group_model(
     if not kept:
         return None
     try:
-        cph = fit_cox_model(df_group, kept, time_col, event_col)
-        p5y_tr = _predict_surv_prob_at_t_cox(cph, df_group, kept, T_STAR_DAYS)
+        feats_for_fit = list(kept)
+        if do_feature_selection:
+            try:
+                selected = stability_select_features(
+                    df=df_group.dropna(subset=[time_col, event_col]).copy(),
+                    candidate_features=feats_for_fit,
+                    time_col=time_col,
+                    event_col=event_col,
+                    seeds=list(stability_seeds),
+                    max_features=fs_max_features,
+                    threshold=float(stability_threshold),
+                    min_features=None,
+                    verbose=verbose,
+                )
+                if selected:
+                    feats_for_fit = list(selected)
+                    if verbose:
+                        try:
+                            print(f"[FS] Selected {len(feats_for_fit)} features: {feats_for_fit}")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        cph = fit_cox_model(df_group, feats_for_fit, time_col, event_col)
+        p5y_tr = _predict_surv_prob_at_t_cox(cph, df_group, feats_for_fit, T_STAR_DAYS)
         thr = float(np.nanmedian(p5y_tr))
-        model_feats = list(getattr(getattr(cph, "params_", pd.Series()), "index", kept))
+        model_feats = list(getattr(getattr(cph, "params_", pd.Series()), "index", feats_for_fit))
+        if plot_importance:
+            try:
+                plot_cox_coefficients(
+                    cph,
+                    title="Cox Coefficients (Selected Features)",
+                    reference_df=df_group,
+                    effect_scale="per_sd",
+                )
+            except Exception:
+                pass
         return GroupModel(
-            features=(model_feats if model_feats else list(kept)),
+            features=(model_feats if model_feats else list(feats_for_fit)),
             threshold=thr,
             model=cph,
         )
@@ -651,6 +691,7 @@ def run_stabilized_two_model_pipeline(
     triage_km_plot_path: Optional[str] = None,
     triage_featimp_plot_path: Optional[str] = None,
     best_per_sample_tableone_excel_path: Optional[str] = None,
+    plot_model_featimp: bool = True,
 ) -> Dict[str, object]:
     base_pool = list(FEATURE_SETS.get("Proposed", []))
     plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
@@ -727,6 +768,7 @@ def run_stabilized_two_model_pipeline(
         event_col=event_col,
         stability_seeds=list(range(10)),
         verbose=False,
+        plot_importance=False,
     )
     p5y_base_all = np.zeros(len(df_use), dtype=float)
     p5y_plus_all = np.zeros(len(df_use), dtype=float)
@@ -776,6 +818,29 @@ def run_stabilized_two_model_pipeline(
         )
     except Exception:
         pass
+
+    # Plot feature importance (Cox coefficients) for final base/plus models trained on the full training set
+    if plot_model_featimp:
+        try:
+            if final_base is not None:
+                plot_cox_coefficients(
+                    final_base.model,
+                    title="Final Base Model - Cox Coefficients (per SD)",
+                    reference_df=df_use,
+                    effect_scale="per_sd",
+                )
+        except Exception:
+            pass
+        try:
+            if final_plus is not None:
+                plot_cox_coefficients(
+                    final_plus.model,
+                    title="Final Plus Model - Cox Coefficients (per SD)",
+                    reference_df=df_use,
+                    effect_scale="per_sd",
+                )
+        except Exception:
+            pass
 
     def _cidx_safe_from_prob(p: np.ndarray) -> float:
         try:
