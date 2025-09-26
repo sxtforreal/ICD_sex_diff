@@ -1359,62 +1359,42 @@ def run_benefit_specific_experiments(
 
 
 if __name__ == "__main__":
+    # Single-run only: load data, split once, train with feature selection on train, evaluate on test
     try:
         df = ACC.load_dataframes()
     except Exception as e:
         raise SystemExit(f"Failed to load dataframes: {e}")
-    try:
-        export_path = None
-        results, summary = run_benefit_specific_experiments(
-            df=df,
-            N=10,
-            time_col="PE_Time",
-            event_col="VT/VF/SCD",
-            k_splits=5,
-            enforce_fair_subset=True,
-            export_excel_path=export_path,
-            print_first_split_preview=False,
-        )
-        print(summary)
-    except Exception:
-        pass
+
     try:
         outdir = "/home/sunx/data/aiiih/projects/sunx/projects/ICD"
         os.makedirs(outdir, exist_ok=True)
-        triage_tableone_path = os.path.join(outdir, "tableone_by_triage.xlsx")
-        best_tableone_path = os.path.join(outdir, "tableone_best_per_sample.xlsx")
-        triage_km_plot_path = os.path.join(outdir, "km_by_triage.png")
-        clf_imp_path = os.path.join(outdir, "triage_feature_importance.xlsx")
-        triage_featimp_plot_path = os.path.join(outdir, "triage_feature_importance.png")
-        stabilized = run_stabilized_two_model_pipeline(
+    except Exception:
+        outdir = None
+
+    try:
+        table_path = (
+            os.path.join(outdir, "tableone_best_per_sample.xlsx") if outdir else None
+        )
+    except Exception:
+        table_path = None
+
+    try:
+        result = run_single_split_two_model_pipeline(
             df=df,
-            N=10,
             time_col="PE_Time",
             event_col="VT/VF/SCD",
-            k_splits=5,
+            test_size=0.3,
+            random_state=0,
             enforce_fair_subset=True,
-            clf_importance_excel_path=clf_imp_path,
-            train_benefit_classifier=True,
-            triage_tableone_excel_path=triage_tableone_path,
-            triage_km_plot_path=triage_km_plot_path,
-            triage_featimp_plot_path=triage_featimp_plot_path,
-            best_per_sample_tableone_excel_path=best_tableone_path,
+            plot_model_featimp=True,
+            tableone_excel_path=table_path,
         )
-        print("==== Stabilized Two-Model Metrics ====")
-        print(stabilized.get("metrics", {}))
-        if stabilized.get("classifier_importance", None) is not None:
-            print("==== Benefit Classifier (Base features only) - Top 20 ====")
-            try:
-                print(stabilized["classifier_importance"].head(20))
-            except Exception:
-                pass
         try:
-            print("Saved triage TableOne:", triage_tableone_path)
-            print("Saved best-per-sample TableOne:", best_tableone_path)
-            print("Saved triage KM plot:", triage_km_plot_path)
-            print("Saved triage feature importance:", clf_imp_path)
-            print("Saved triage feature importance plot:", triage_featimp_plot_path)
+            print("==== Single-split Benefit-Specific Metrics ====")
+            print(result.get("metrics", {}))
+            if table_path is not None:
+                print("Saved best-per-sample TableOne:", table_path)
         except Exception:
             pass
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Single-split pipeline failed: {e}")
