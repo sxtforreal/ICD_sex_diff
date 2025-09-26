@@ -2193,6 +2193,158 @@ def run_cox_experiments(
     return results, summary_table
 
 
+def run_single_split_experiment(
+    df: pd.DataFrame,
+    feature_sets: Dict[str, List[str]],
+    time_col: str = "PE_Time",
+    event_col: str = "VT/VF/SCD",
+    test_size: float = 0.3,
+    random_state: int = 0,
+    use_undersampling: bool = False,
+) -> pd.DataFrame:
+    """Run a single 70/30 split with feature selection and return a compact summary table.
+
+    - Uses greedy forward selection on the training set to maximize validation c-index
+      for BOTH sex-agnostic and sex-specific modes.
+    - Applies the selected features to the test set exactly once (no stability/multi-run).
+    """
+    data_use = df.dropna(subset=[time_col, event_col]).copy()
+    try:
+        tr, te = train_test_split(
+            data_use,
+            test_size=float(test_size),
+            random_state=int(random_state),
+            stratify=(data_use[event_col] if data_use[event_col].nunique() > 1 else None),
+        )
+    except Exception:
+        # Fallback: unstratified
+        tr, te = train_test_split(
+            data_use, test_size=float(test_size), random_state=int(random_state)
+        )
+
+    # Fairness: drop rows with missing local categorical features in both sets
+    tr = drop_rows_with_missing_local_features(tr)
+    te = drop_rows_with_missing_local_features(te)
+
+    model_configs = [
+        {"name": "Sex-agnostic (Cox)", "mode": "sex_agnostic"},
+        {"name": "Sex-specific (Cox)", "mode": "sex_specific"},
+    ]
+
+    rows = []
+
+    for featset_name, feature_cols in feature_sets.items():
+        # Keep only columns that exist
+        feat_available = [f for f in feature_cols if f in tr.columns]
+        if not feat_available:
+            continue
+
+        # Helper: safe forward selection with fallback to at least one feature
+        def _safe_select(train_subset: pd.DataFrame, candidates: List[str]) -> List[str]:
+            cand = [c for c in candidates if c in train_subset.columns]
+            if not cand:
+                return []
+            try:
+                sel = select_features_max_cindex_forward(
+                    train_df=train_subset,
+                    candidate_features=cand,
+                    time_col=time_col,
+                    event_col=event_col,
+                    random_state=int(random_state),
+                    max_features=None,
+                    verbose=False,
+                )
+                if sel:
+                    return list(sel)
+            except Exception:
+                pass
+            # Fallback to first candidate to ensure at least one feature
+            return [cand[0]]
+
+        for cfg in model_configs:
+            if cfg["mode"] == "sex_agnostic":
+                # Select features on train (agnostic includes Female if present)
+                sel_feats = _safe_select(tr, feat_available)
+                if not sel_feats:
+                    sel_feats = feat_available[:1]
+                pred, risk, met = evaluate_split(
+                    tr,
+                    te,
+                    sel_feats,
+                    time_col,
+                    event_col,
+                    mode=cfg["mode"],
+                    seed=int(random_state),
+                    use_undersampling=bool(use_undersampling),
+                    disable_within_split_feature_selection=True,
+                )
+            else:
+                # Sex-specific: exclude Female in submodels; select per sex on train
+                base_pool = [f for f in feat_available if f != "Female"]
+                tr_m = tr[tr["Female"] == 0].dropna(subset=[time_col, event_col])
+                tr_f = tr[tr["Female"] == 1].dropna(subset=[time_col, event_col])
+                sel_m = _safe_select(tr_m, base_pool) if not tr_m.empty else []
+                sel_f = _safe_select(tr_f, base_pool) if not tr_f.empty else []
+                overrides = {
+                    "male": (sel_m if sel_m else (base_pool[:1] if base_pool else [])),
+                    "female": (sel_f if sel_f else (base_pool[:1] if base_pool else [])),
+                }
+                pred, risk, met = evaluate_split(
+                    tr,
+                    te,
+                    feat_available,
+                    time_col,
+                    event_col,
+                    mode=cfg["mode"],
+                    seed=int(random_state),
+                    use_undersampling=False,
+                    disable_within_split_feature_selection=True,
+                    sex_specific_feature_override=overrides,
+                )
+
+            # Compute c-index split by sex for consistency
+            try:
+                mask_m = te["Female"].values == 0
+                mask_f = te["Female"].values == 1
+
+                def _safe_cidx(t, e, r):
+                    try:
+                        if len(t) < 2:
+                            return np.nan
+                        if np.all(~np.isfinite(r)) or np.allclose(r, r[0]):
+                            return np.nan
+                        return float(concordance_index(t, -r, e))
+                    except Exception:
+                        return np.nan
+
+                c_all = float(met.get("c_index", np.nan))
+                c_m = _safe_cidx(
+                    te.loc[mask_m, time_col].values,
+                    te.loc[mask_m, event_col].values,
+                    np.asarray(risk)[mask_m],
+                )
+                c_f = _safe_cidx(
+                    te.loc[mask_f, time_col].values,
+                    te.loc[mask_f, event_col].values,
+                    np.asarray(risk)[mask_f],
+                )
+            except Exception:
+                c_all, c_m, c_f = np.nan, np.nan, np.nan
+
+            rows.append(
+                {
+                    "Model": f"{featset_name} - {cfg['name']}",
+                    "all": c_all,
+                    "male": c_m,
+                    "female": c_f,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame()
+    out_df = pd.DataFrame(rows).set_index("Model")
+    return out_df
+
 FEATURE_SETS = {
     "Guideline": ["NYHA Class", "LVEF"],
     "Benchmark": [
@@ -2270,7 +2422,7 @@ if __name__ == "__main__":
     # Load and prepare data
     df = load_dataframes()
 
-    # Generate TableOne grouped by Sex x ICD (four groups)
+    # Optional: TableOne by Sex x ICD for descriptive stats (kept, but can be skipped if desired)
     try:
         generate_tableone_by_sex_icd(
             df,
@@ -2279,52 +2431,18 @@ if __name__ == "__main__":
     except Exception as e:
         warnings.warn(f"[Main] TableOne generation skipped due to error: {e}")
 
-    # Run experiments (50 random splits; PE as event; PE_Time as duration)
-    export_path = (
-        "/home/sunx/data/aiiih/projects/sunx/projects/ICD/results_cox.xlsx"
-    )
-    _, summary = run_cox_experiments(
+    # Single-run experiment with feature selection (no stability, no multiple runs)
+    summary_once = run_single_split_experiment(
         df=df,
         feature_sets=FEATURE_SETS,
-        N=10,
         time_col="PE_Time",
         event_col="VT/VF/SCD",
-        export_excel_path=export_path,
+        test_size=0.3,
+        random_state=0,
+        use_undersampling=False,
     )
-    print("Saved Excel:", export_path)
-
-    # Full-data inference and analysis - Guideline
-    features = FEATURE_SETS["Guideline"]
-    print("Running sex-agnostic full-data inference (includes Female)...")
-    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-
-    print("Running sex-specific full-data inference (excludes Female in submodels)...")
-    _ = sex_specific_full_inference(df, features)
-
-    # Full-data inference and analysis - Benchmark
-    features = FEATURE_SETS["Benchmark"]
-    print("Running sex-agnostic full-data inference (includes Female)...")
-    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-
-    print("Running sex-specific full-data inference (excludes Female in submodels)...")
-    _ = sex_specific_full_inference(df, features)
-
-    # Full-data inference and analysis - Proposed
-    features = FEATURE_SETS["Proposed"]
-    print("Running sex-agnostic full-data inference (includes Female)...")
-    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-
-    print("Running sex-specific full-data inference (excludes Female in submodels)...")
-    _ = sex_specific_full_inference(df, features)
-
-    # Full-data inference and analysis - Proposed Plus
-    features = FEATURE_SETS["Proposed Plus"]
-    print(
-        "Running sex-agnostic full-data inference (includes Female) - Proposed Plus..."
-    )
-    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-
-    print(
-        "Running sex-specific full-data inference (excludes Female in submodels) - Proposed Plus..."
-    )
-    _ = sex_specific_full_inference(df, features)
+    try:
+        print("==== Single-split Cox results (c-index) ====")
+        print(summary_once)
+    except Exception:
+        pass
