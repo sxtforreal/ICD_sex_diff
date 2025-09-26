@@ -1117,45 +1117,35 @@ def run_stabilized_two_model_pipeline(
         except Exception:
             return np.nan
 
-    triage_clf = fit_calibrated_triage(
-        train_df=df_use,
-        base_features=base_pool,
-        B=(dLL_all > tau).astype(int),
-        random_state=0,
-        backend="sgd",
-        calibration="sigmoid",
-    )
+    # New triage: use best-per-sample labels from training predictions and true labels
+    try:
+        event_all = df_use[event_col].astype(int).to_numpy()
+        triage_labels_all = np.where(
+            event_all == 1,
+            p5y_plus_all > p5y_base_all,
+            p5y_plus_all < p5y_base_all,
+        ).astype(int)
+        triage_clf = fit_calibrated_triage(
+            train_df=df_use,
+            base_features=base_pool,
+            B=triage_labels_all,
+            random_state=0,
+            backend="sgd",
+            calibration="sigmoid",
+        )
+    except Exception:
+        triage_clf = None
     if triage_clf is not None:
-        triage_probs_all = triage_clf.predict_proba(df_use[base_pool])[:, 1]
-        labels_all = (dLL_all > tau).astype(int)
-        mask_lbl = np.isfinite(triage_probs_all) & np.isfinite(labels_all)
-        df_lbl = df_use.loc[mask_lbl]
-        p_all = triage_probs_all[mask_lbl]
-        y_all = labels_all[mask_lbl]
-        pB_lbl = p5y_base_all[mask_lbl]
-        pP_lbl = p5y_plus_all[mask_lbl]
-        t_lbl = df_lbl[time_col].values.astype(float)
-        e_lbl = df_lbl[event_col].values.astype(int)
-        p_tr, p_va, pB_tr, pB_va, pP_tr, pP_va, t_tr, t_va, e_tr, e_va, y_tr, y_va = train_test_split(
-            p_all, pB_lbl, pP_lbl, t_lbl, e_lbl, y_all,
-            test_size=0.2, random_state=0, stratify=y_all
-        )
-        # Choose theta by maximizing validation mixed c-index
-        theta_by_c = _choose_theta_by_cindex_mix(
-            p=p_va, p_base=pB_va, p_plus=pP_va, time=t_va, event=e_va
-        )
-        # Fallback to net benefit if needed (e.g., nan)
-        if not np.isfinite(theta_by_c):
-            theta_by_c = _choose_theta(
-                p_va, method="max_net_benefit", y_benefit=y_va, harm_ratio=1.0
-            )
-        theta_used = float(theta_by_c)
-        route_plus = triage_probs_all >= theta_used
-        coverage_triage = float(np.mean(route_plus))
-        p5y_triage_all = np.where(route_plus, p5y_plus_all, p5y_base_all)
-        c_index_triage = _cidx_safe_from_prob(p5y_triage_all)
+        try:
+            triage_pred_all = triage_clf.predict(df_use[base_pool])
+            triage_pred_all = np.asarray(triage_pred_all).astype(int)
+            coverage_triage = float(np.mean(triage_pred_all == 1))
+            p5y_triage_all = np.where(triage_pred_all == 1, p5y_plus_all, p5y_base_all)
+            c_index_triage = _cidx_safe_from_prob(p5y_triage_all)
+        except Exception:
+            coverage_triage = np.nan
+            c_index_triage = np.nan
     else:
-        theta_used = np.nan
         coverage_triage = np.nan
         c_index_triage = np.nan
 
@@ -1216,7 +1206,7 @@ def run_stabilized_two_model_pipeline(
         "brier_soft": brier_soft,
         "coverage_triage": coverage_triage,
         "coverage_soft": coverage_soft,
-        "theta_triage": float(theta_used) if np.isfinite(theta_used) else np.nan,
+        "theta_triage": np.nan,
         "tau": float(tau),
     }
     try:
@@ -1251,10 +1241,10 @@ def run_stabilized_two_model_pipeline(
         df_tab = te_tab.copy()
         route_plus_tab = None
         # Prefer grouping by triage classifier prediction when available
-        if triage_clf is not None and np.isfinite(theta_used):
+        if triage_clf is not None:
             try:
-                triage_probs_te_tab = triage_clf.predict_proba(te_tab[base_pool])[:, 1]
-                route_plus_tab = triage_probs_te_tab >= theta_used
+                triage_pred_tab = triage_clf.predict(te_tab[base_pool])
+                route_plus_tab = (np.asarray(triage_pred_tab).astype(int) == 1)
             except Exception:
                 route_plus_tab = None
         # Fallback: group by which model yields lower predicted 5-year probability
@@ -1584,11 +1574,11 @@ def run_single_split_two_model_pipeline(
     except Exception:
         triage_clf = None
 
-    # Triage routing on test using the globally trained base/plus models
+    # Triage routing on test using predicted class directly
     try:
-        if triage_clf is not None and np.isfinite(theta_used):
-            triage_probs_te = triage_clf.predict_proba(te[[f for f in base_pool if f in te.columns]])[:, 1]
-            route_plus = triage_probs_te >= float(theta_used)
+        if triage_clf is not None:
+            triage_pred_te = triage_clf.predict(te[[f for f in base_pool if f in te.columns]])
+            route_plus = (np.asarray(triage_pred_te).astype(int) == 1)
             coverage_triage = float(np.mean(route_plus))
             p5y_triage_te = np.where(route_plus, p5y_plus_te, p5y_base_te)
             cidx_triage = float(concordance_index(te[time_col], -p5y_triage_te, te[event_col]))
@@ -1671,7 +1661,7 @@ def run_single_split_two_model_pipeline(
         "p5y_soft_test": p5y_soft_te,
         "r_soft_test": r_soft_te,
         "best_route_plus": route_oracle_plus,
-        "triage_route_plus": (triage_clf is not None and np.isfinite(theta_used) and (triage_probs_te >= float(theta_used))) if 'triage_probs_te' in locals() else np.zeros(len(te), dtype=bool),
+        "triage_route_plus": (np.asarray(triage_pred_te).astype(int) == 1) if 'triage_pred_te' in locals() else np.zeros(len(te), dtype=bool),
         "metrics": {
             "c_index_base": cidx_base,
             "c_index_plus": cidx_plus,
