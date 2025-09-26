@@ -722,6 +722,12 @@ def fit_calibrated_triage(
         except Exception:
             pass
     X = X_full.loc[:, feats_for_fit].copy()
+    # Print selected features for triage
+    try:
+        print("==== Triage selected features ====")
+        print(f"Features ({len(feats_for_fit)}): {feats_for_fit}")
+    except Exception:
+        pass
     # Build base estimator by backend
     estimator = None
     if backend in ("logreg", "sgd"):
@@ -790,6 +796,16 @@ def fit_calibrated_triage(
     clf.fit(X, y)
     try:
         setattr(clf, "selected_features_", list(feats_for_fit))
+    except Exception:
+        pass
+    # Print training-set group proportions predicted by triage
+    try:
+        y_pred_tr = clf.predict(X)
+        y_pred_tr = np.asarray(y_pred_tr).astype(int)
+        prop_plus = float(np.mean(y_pred_tr == 1)) if len(y_pred_tr) > 0 else float("nan")
+        prop_base = (1.0 - prop_plus) if np.isfinite(prop_plus) else float("nan")
+        print("==== Triage training-set group proportions ====")
+        print(f"Train preds => 1 (route to plus): {prop_plus:.2%}, 0 (route to base): {prop_base:.2%} (n={len(y_pred_tr)})")
     except Exception:
         pass
     return clf
@@ -1162,7 +1178,6 @@ def run_stabilized_two_model_pipeline(
     clf_importance_excel_path: Optional[str] = None,
     train_benefit_classifier: bool = True,
     triage_tableone_excel_path: Optional[str] = None,
-    triage_km_plot_path: Optional[str] = None,
     triage_featimp_plot_path: Optional[str] = None,
     best_per_sample_tableone_excel_path: Optional[str] = None,
     plot_model_featimp: bool = True,
@@ -1485,17 +1500,7 @@ def run_stabilized_two_model_pipeline(
             )
         except Exception:
             pass
-        try:
-            ACC.plot_km_by_group(
-                df_tab,
-                group_col="BenefitGroup",
-                time_col=time_col,
-                event_col=event_col,
-                output_path=triage_km_plot_path,
-                t_star_days=T_STAR_DAYS,
-            )
-        except Exception:
-            pass
+        
     except Exception:
         pass
     clf_importance: Optional[pd.DataFrame] = None
