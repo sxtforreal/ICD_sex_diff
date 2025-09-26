@@ -1469,64 +1469,34 @@ def run_single_split_two_model_pipeline(
     except Exception:
         cidx_best = np.nan
 
-    # Train triage classifier on training set using the same method as before (crossfit OOF labels)
+    # Train triage classifier on TRAIN using best-per-sample labels from base/plus predictions and true labels
     triage_clf = None
-    theta_used = np.nan
     coverage_triage = np.nan
     p5y_triage_te = np.zeros(len(te), dtype=float)
     clf_importance: Optional[pd.DataFrame] = None
     try:
-        # Crossfit benefit labels on training set
-        _, B, tau = make_benefit_labels_crossfit(
-            train_df=tr,
-            base_features=[f for f in base_pool if f in tr.columns],
-            plus_features=[f for f in plus_pool if f in tr.columns],
-            time_col=time_col,
-            event_col=event_col,
-            k_splits=5,
-            random_state=int(random_state),
-            tau_rule="q65",
-            margin_std=0.10,
-        )
+        p5y_base_tr = np.zeros(len(tr), dtype=float)
+        p5y_plus_tr = np.zeros(len(tr), dtype=float)
+        try:
+            if final_base is not None:
+                p5y_base_tr = _predict_surv_prob_at_t_cox(final_base.model, tr, final_base.features, T_STAR_DAYS)
+        except Exception:
+            p5y_base_tr = np.zeros(len(tr), dtype=float)
+        try:
+            if final_plus is not None:
+                p5y_plus_tr = _predict_surv_prob_at_t_cox(final_plus.model, tr, final_plus.features, T_STAR_DAYS)
+        except Exception:
+            p5y_plus_tr = np.zeros(len(tr), dtype=float)
+        event_tr = tr[event_col].astype(int).to_numpy()
+        label_tr = np.where(event_tr == 1, p5y_plus_tr > p5y_base_tr, p5y_plus_tr < p5y_base_tr).astype(int)
         triage_clf = fit_calibrated_triage(
             train_df=tr,
             base_features=[f for f in base_pool if f in tr.columns],
-            B=B,
+            B=label_tr,
             random_state=int(random_state),
             backend="sgd",
             calibration="sigmoid",
         )
-        # Pick threshold theta on a small validation split from train where labels exist
-        mask_lbl = (B == 0) | (B == 1)
-        X_theta = tr.loc[mask_lbl, [f for f in base_pool if f in tr.columns]]
-        y_theta = B[mask_lbl].astype(int)
-        if len(X_theta) > 1 and triage_clf is not None:
-            X_tr_theta, X_va_theta, y_tr_theta, y_va_theta = train_test_split(
-                X_theta, y_theta, test_size=0.2, random_state=int(random_state), stratify=y_theta
-            )
-            p_va = triage_clf.predict_proba(X_va_theta)[:, 1]
-            # Build validation base/plus risks using globally trained models for c-index selection
-            try:
-                pB_va = _predict_surv_prob_at_t_cox(final_base.model, X_va_theta.join(te[[]]), final_base.features, T_STAR_DAYS) if final_base is not None else np.zeros(len(p_va))
-            except Exception:
-                pB_va = np.zeros(len(p_va))
-            try:
-                pP_va = _predict_surv_prob_at_t_cox(final_plus.model, X_va_theta.join(te[[]]), final_plus.features, T_STAR_DAYS) if final_plus is not None else np.zeros(len(p_va))
-            except Exception:
-                pP_va = np.zeros(len(p_va))
-            t_va = X_va_theta[time_col] if time_col in X_va_theta.columns else te[time_col].sample(n=len(p_va), random_state=int(random_state)).to_numpy()
-            e_va = X_va_theta[event_col] if event_col in X_va_theta.columns else te[event_col].sample(n=len(p_va), random_state=int(random_state)).to_numpy()
-            # Prefer c-index based theta
-            th_c = _choose_theta_by_cindex_mix(
-                p=p_va,
-                p_base=np.asarray(pB_va, float),
-                p_plus=np.asarray(pP_va, float),
-                time=np.asarray(t_va, float),
-                event=np.asarray(e_va, int),
-            )
-            if not np.isfinite(th_c):
-                th_c = _choose_theta(p_va, method="max_net_benefit", y_benefit=y_va_theta, harm_ratio=1.0)
-            theta_used = float(th_c)
         # Extract and display triage classifier feature importance (logistic coefficients)
         try:
             fitted_base = None
