@@ -26,7 +26,7 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import SGDClassifier, LogisticRegression
+from sklearn.linear_model import SGDClassifier, LogisticRegression, SGDRegressor
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -223,6 +223,158 @@ def compute_oof_probs_5y(
     full_plus[pos] = p_plus_oof
     return full_base, full_plus
 
+
+def make_benefit_scores_crossfit(
+    train_df: pd.DataFrame,
+    base_features: List[str],
+    plus_features: List[str],
+    time_col: str,
+    event_col: str,
+    k_splits: int = 5,
+    random_state: int = 0,
+    use_uncertainty_weight: bool = True,
+    delta_clip: float = 1e-6,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute OOF 5y probabilities for base/plus and derive continuous benefit score s and weights.
+
+    Returns:
+      pB_oof, pP_oof, s, w, delta
+        where s = (2*y5y - 1) * (p_plus - p_base), y5y = 1[event & time<=T*]
+              w = IPCW * f(|delta|) if use_uncertainty_weight else IPCW
+              delta = p_plus - p_base
+    """
+    pB_oof, pP_oof = compute_oof_probs_5y(
+        train_df=train_df,
+        base_features=base_features,
+        plus_features=plus_features,
+        time_col=time_col,
+        event_col=event_col,
+        k_splits=k_splits,
+        random_state=random_state,
+        enforce_fair_subset=False,
+    )
+    y5y = (
+        (train_df[event_col].values.astype(int) == 1)
+        & (train_df[time_col].values.astype(float) <= T_STAR_DAYS)
+    ).astype(int)
+    w_ipcw = _km_ipcw_weights(
+        train_df[time_col].values.astype(float),
+        train_df[event_col].values.astype(int),
+        T_STAR_DAYS,
+    )
+    delta = np.asarray(pP_oof, float) - np.asarray(pB_oof, float)
+    s = (2.0 * y5y.astype(float) - 1.0) * delta
+    if use_uncertainty_weight:
+        mag = np.abs(delta)
+        # Normalize magnitude to [0,1] using a robust scale
+        try:
+            scale = float(np.nanquantile(mag[np.isfinite(mag)], 0.8))
+            scale = scale if np.isfinite(scale) and scale > 0 else 1.0
+        except Exception:
+            scale = 1.0
+        u = np.clip(mag / scale, 0.0, 1.0)
+        w = w_ipcw * u
+    else:
+        w = w_ipcw
+    # Avoid degenerate extremely small deltas
+    delta = np.where(np.abs(delta) < float(delta_clip), 0.0, delta)
+    return (
+        np.asarray(pB_oof, float),
+        np.asarray(pP_oof, float),
+        np.asarray(s, float),
+        np.asarray(w, float),
+        np.asarray(delta, float),
+    )
+
+
+def _brier_ipcw_at_t(
+    time: np.ndarray, event: np.ndarray, p: np.ndarray, t_star_days: int
+) -> float:
+    time = np.asarray(time, float)
+    event = np.asarray(event, int)
+    p = np.asarray(p, float)
+    y = ((event == 1) & (time <= float(t_star_days))).astype(int)
+    w = _km_ipcw_weights(time, event, t_star_days)
+    try:
+        return float(np.nanmean(w * (y - p) ** 2))
+    except Exception:
+        return float("nan")
+
+
+def fit_soft_r_triage(
+    train_df: pd.DataFrame,
+    base_features: List[str],
+    pB_oof: np.ndarray,
+    pP_oof: np.ndarray,
+    time_col: str,
+    event_col: str,
+    random_state: int = 0,
+    min_delta: float = 1e-6,
+) -> Optional[Pipeline]:
+    """
+    Fit a soft-routing triage regressor r(x) in [0,1] by regressing the oracle r* target:
+      r*_i = clip((y5y_i - pB_i) / (pP_i - pB_i), 0, 1)
+    using only base_features as inputs. Training weights use IPCW * |delta|.
+    """
+    try:
+        y5y = (
+            (train_df[event_col].values.astype(int) == 1)
+            & (train_df[time_col].values.astype(float) <= T_STAR_DAYS)
+        ).astype(float)
+        pB = np.asarray(pB_oof, float)
+        pP = np.asarray(pP_oof, float)
+        delta = pP - pB
+        # Avoid division by very small delta
+        safe = np.isfinite(delta) & (np.abs(delta) > float(min_delta)) & np.isfinite(pB) & np.isfinite(pP)
+        if not np.any(safe):
+            return None
+        r_star = np.zeros_like(y5y, dtype=float)
+        r_star[safe] = (y5y[safe] - pB[safe]) / delta[safe]
+        r_star = np.clip(r_star, 0.0, 1.0)
+        w_ipcw = _km_ipcw_weights(
+            train_df[time_col].values.astype(float),
+            train_df[event_col].values.astype(int),
+            T_STAR_DAYS,
+        )
+        weights = w_ipcw * np.where(np.isfinite(delta), np.abs(delta), 0.0)
+        X = train_df.loc[:, [f for f in base_features if f in train_df.columns]].copy()
+        # Drop rows with any non-finite inputs or targets
+        mask = safe.copy()
+        if X.shape[1] == 0:
+            return None
+        mask &= np.all(np.isfinite(np.asarray(X, float)), axis=1)
+        if not np.any(mask):
+            return None
+        X_fit = X.loc[mask]
+        y_fit = r_star[mask]
+        w_fit = weights[mask]
+        model = Pipeline(
+            [
+                ("scaler", StandardScaler(with_mean=True, with_std=True)),
+                (
+                    "reg",
+                    SGDRegressor(
+                        loss="squared_error",
+                        penalty="l2",
+                        alpha=1e-4,
+                        max_iter=5000,
+                        random_state=int(random_state),
+                        learning_rate="optimal",
+                        early_stopping=False,
+                        average=True,
+                    ),
+                ),
+            ]
+        )
+        try:
+            model.fit(X_fit, y_fit, reg__sample_weight=w_fit)
+        except Exception:
+            # Some sklearn versions expect sample_weight at top-level
+            model.fit(X_fit, y_fit, sample_weight=w_fit)
+        return model
+    except Exception:
+        return None
 
 def make_benefit_labels_crossfit(
     train_df: pd.DataFrame,
@@ -875,12 +1027,64 @@ def run_stabilized_two_model_pipeline(
         theta_used = np.nan
         coverage_triage = np.nan
         c_index_triage = np.nan
+
+    # Soft-routing triage on full data: fit r(x) with OOF risks and evaluate mixture
+    try:
+        pB_oof_all, pP_oof_all, s_all, w_all2, d_all = make_benefit_scores_crossfit(
+            train_df=df_use,
+            base_features=base_pool,
+            plus_features=plus_pool,
+            time_col=time_col,
+            event_col=event_col,
+            k_splits=k_splits,
+            random_state=0,
+            use_uncertainty_weight=True,
+        )
+        r_soft_model = fit_soft_r_triage(
+            train_df=df_use,
+            base_features=base_pool,
+            pB_oof=pB_oof_all,
+            pP_oof=pP_oof_all,
+            time_col=time_col,
+            event_col=event_col,
+            random_state=0,
+        )
+        if r_soft_model is not None:
+            try:
+                r_soft_all = r_soft_model.predict(df_use[base_pool])
+            except Exception:
+                r_soft_all = np.zeros(len(df_use), dtype=float)
+            r_soft_all = np.clip(np.asarray(r_soft_all, float), 0.0, 1.0)
+            p5y_soft_all = r_soft_all * p5y_plus_all + (1.0 - r_soft_all) * p5y_base_all
+            c_index_soft = _cidx_safe_from_prob(p5y_soft_all)
+            brier_soft = _brier_ipcw_at_t(
+                df_use[time_col].values.astype(float),
+                df_use[event_col].values.astype(int),
+                p5y_soft_all,
+                T_STAR_DAYS,
+            )
+            coverage_soft = float(np.mean(r_soft_all >= 0.5))
+        else:
+            r_soft_all = np.zeros(len(df_use), dtype=float)
+            p5y_soft_all = r_soft_all
+            c_index_soft = np.nan
+            brier_soft = np.nan
+            coverage_soft = np.nan
+    except Exception:
+        r_soft_all = np.zeros(len(df_use), dtype=float)
+        p5y_soft_all = r_soft_all
+        c_index_soft = np.nan
+        brier_soft = np.nan
+        coverage_soft = np.nan
     metrics = {
         "c_index_all_base": _cidx_safe_from_prob(p5y_base_all),
         "c_index_all_plus": _cidx_safe_from_prob(p5y_plus_all),
         "c_index_per_sample_best": _cidx_safe_from_prob(p5y_best_all),
         "c_index_triage": c_index_triage,
+        "c_index_soft": c_index_soft,
+        "brier_soft": brier_soft,
         "coverage_triage": coverage_triage,
+        "coverage_soft": coverage_soft,
         "theta_triage": float(theta_used) if np.isfinite(theta_used) else np.nan,
         "tau": float(tau),
     }
@@ -1042,6 +1246,8 @@ def run_stabilized_two_model_pipeline(
         "final_plus_features": plus_major,
         "p5y_base_all": p5y_base_all,
         "p5y_plus_all": p5y_plus_all,
+        "p5y_soft_all": p5y_soft_all,
+        "r_soft_all": r_soft_all,
         "delta_ll_5y": dLL_all,
         "tau": tau,
         "benefit_mask": benefit_mask,
@@ -1239,6 +1445,61 @@ def run_single_split_two_model_pipeline(
     except Exception:
         cidx_triage = np.nan
 
+    # Soft-routing triage: fit r(x) on training via oracle target and evaluate mixed risk on test
+    r_soft_model = None
+    r_soft_te = np.zeros(len(te), dtype=float)
+    p5y_soft_te = np.zeros(len(te), dtype=float)
+    cidx_soft = np.nan
+    brier_soft = np.nan
+    coverage_soft = np.nan
+    try:
+        pB_oof_tr, pP_oof_tr, s_tr, w_tr, d_tr = make_benefit_scores_crossfit(
+            train_df=tr,
+            base_features=[f for f in base_pool if f in tr.columns],
+            plus_features=[f for f in plus_pool if f in tr.columns],
+            time_col=time_col,
+            event_col=event_col,
+            k_splits=5,
+            random_state=int(random_state),
+            use_uncertainty_weight=True,
+        )
+        r_soft_model = fit_soft_r_triage(
+            train_df=tr,
+            base_features=[f for f in base_pool if f in tr.columns],
+            pB_oof=pB_oof_tr,
+            pP_oof=pP_oof_tr,
+            time_col=time_col,
+            event_col=event_col,
+            random_state=int(random_state),
+        )
+        if r_soft_model is not None:
+            X_te_base = te[[f for f in base_pool if f in te.columns]]
+            try:
+                r_soft_te = r_soft_model.predict(X_te_base)
+            except Exception:
+                r_soft_te = np.zeros(len(te), dtype=float)
+            r_soft_te = np.clip(np.asarray(r_soft_te, float), 0.0, 1.0)
+            p5y_soft_te = r_soft_te * p5y_plus_te + (1.0 - r_soft_te) * p5y_base_te
+            try:
+                cidx_soft = float(concordance_index(te[time_col], -p5y_soft_te, te[event_col]))
+            except Exception:
+                cidx_soft = np.nan
+            try:
+                brier_soft = _brier_ipcw_at_t(
+                    te[time_col].values.astype(float),
+                    te[event_col].values.astype(int),
+                    p5y_soft_te,
+                    T_STAR_DAYS,
+                )
+            except Exception:
+                brier_soft = np.nan
+            try:
+                coverage_soft = float(np.mean(r_soft_te >= 0.5))
+            except Exception:
+                coverage_soft = np.nan
+    except Exception:
+        r_soft_model = None
+
     # Optional descriptive table by oracle best-per-sample routing (Benefit vs Non-Benefit)
     try:
         route_plus = route_oracle_plus
@@ -1255,6 +1516,8 @@ def run_single_split_two_model_pipeline(
         "p5y_plus_test": p5y_plus_te,
         "p5y_triage_test": p5y_triage_te,
         "p5y_best_test": p5y_best_te,
+        "p5y_soft_test": p5y_soft_te,
+        "r_soft_test": r_soft_te,
         "best_route_plus": route_oracle_plus,
         "triage_route_plus": (triage_clf is not None and np.isfinite(theta_used) and (triage_probs_te >= float(theta_used))) if 'triage_probs_te' in locals() else np.zeros(len(te), dtype=bool),
         "metrics": {
@@ -1262,6 +1525,9 @@ def run_single_split_two_model_pipeline(
             "c_index_plus": cidx_plus,
             "c_index_best": cidx_best,
             "c_index_triage": cidx_triage,
+            "c_index_soft": cidx_soft,
+            "brier_soft": brier_soft,
+            "coverage_soft": coverage_soft,
             "coverage_triage": coverage_triage,
         },
         "triage_classifier_importance": clf_importance,
