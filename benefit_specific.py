@@ -722,6 +722,12 @@ def fit_calibrated_triage(
         except Exception:
             pass
     X = X_full.loc[:, feats_for_fit].copy()
+    # Print selected features for triage
+    try:
+        print("==== Triage selected features ====")
+        print(f"Features ({len(feats_for_fit)}): {feats_for_fit}")
+    except Exception:
+        pass
     # Build base estimator by backend
     estimator = None
     if backend in ("logreg", "sgd"):
