@@ -1125,8 +1125,10 @@ def run_single_split_two_model_pipeline(
     except Exception:
         pass
 
-    # Choose the lower 5-year risk between plus and base for each sample
-    p5y_best_te = np.where(p5y_plus_te < p5y_base_te, p5y_plus_te, p5y_base_te)
+    # Oracle best-of-two by true label: if event=1 pick higher risk; if event=0 pick lower risk
+    event_te = te[event_col].astype(int).to_numpy()
+    route_oracle_plus = np.where(event_te == 1, p5y_plus_te > p5y_base_te, p5y_plus_te < p5y_base_te)
+    p5y_best_te = np.where(route_oracle_plus, p5y_plus_te, p5y_base_te)
     try:
         cidx_base = float(concordance_index(te[time_col], -p5y_base_te, te[event_col]))
     except Exception:
@@ -1237,9 +1239,9 @@ def run_single_split_two_model_pipeline(
     except Exception:
         cidx_triage = np.nan
 
-    # Optional descriptive table by best-per-sample routing (Benefit vs Non-Benefit)
+    # Optional descriptive table by oracle best-per-sample routing (Benefit vs Non-Benefit)
     try:
-        route_plus = p5y_plus_te < p5y_base_te
+        route_plus = route_oracle_plus
         te_tab = te.copy()
         te_tab["BenefitGroup"] = np.where(route_plus, "Benefit", "Non-Benefit")
         ACC.generate_tableone_by_group(te_tab, group_col="BenefitGroup", output_excel_path=tableone_excel_path)
@@ -1253,6 +1255,7 @@ def run_single_split_two_model_pipeline(
         "p5y_plus_test": p5y_plus_te,
         "p5y_triage_test": p5y_triage_te,
         "p5y_best_test": p5y_best_te,
+        "best_route_plus": route_oracle_plus,
         "triage_route_plus": (triage_clf is not None and np.isfinite(theta_used) and (triage_probs_te >= float(theta_used))) if 'triage_probs_te' in locals() else np.zeros(len(te), dtype=bool),
         "metrics": {
             "c_index_base": cidx_base,
