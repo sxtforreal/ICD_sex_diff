@@ -1530,9 +1530,8 @@ def run_stabilized_two_model_pipeline(
                         clf_importance.to_excel(clf_importance_excel_path, index=False)
                     # Print top-k importance here so it shows up even when imported
                     try:
-                        top_show = int(min(20, len(clf_importance)))
-                        print("==== Triage Classifier Feature Importance (|coef|) - Top 20 ====")
-                        print(clf_importance.head(top_show))
+                        print("==== Triage Classifier Feature Importance (|coef|) - All Selected ====")
+                        print(clf_importance)
                     except Exception:
                         pass
                     # Plot and save feature importance if requested
@@ -1732,8 +1731,8 @@ def run_single_split_two_model_pipeline(
                         df_imp["odds_ratio"] = np.exp(df_imp["coef"])
                     clf_importance = df_imp.sort_values("abs_coef", ascending=False).reset_index(drop=True)
                     try:
-                        print("==== Triage Classifier Feature Importance (|coef|) - Top 20 ====")
-                        print(clf_importance.head(int(min(20, len(clf_importance)))))
+                        print("==== Triage Classifier Feature Importance (|coef|) - All Selected ====")
+                        print(clf_importance)
                     except Exception:
                         pass
                     if plot_model_featimp and len(clf_importance) > 0:
@@ -2056,13 +2055,12 @@ if __name__ == "__main__":
                     f"==== Triage test predictions ====> 1 (route to plus): {prop_plus:.2%}, 0 (route to base): {prop_base:.2%}"
                 )
 
-            # Triage classifier coefficients (top 20 by |coef|)
+            # Triage classifier coefficients (all selected)
             imp = result.get("triage_classifier_importance", None)
             if imp is not None:
                 try:
-                    top_show = int(min(20, len(imp)))
-                    print("==== Triage Classifier Coefficients (Top by |coef|) ====")
-                    print(imp.head(top_show))
+                    print("==== Triage Classifier Coefficients (All Selected) ====")
+                    print(imp)
                 except Exception:
                     pass
         except Exception:
