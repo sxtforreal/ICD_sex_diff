@@ -800,7 +800,7 @@ def _sanitize_cox_features_matrix(
     nunique = X.nunique(dropna=True)
     constant_cols = nunique[nunique <= 1].index.tolist()
     if constant_cols and verbose:
-        print(f"[Cox] 删除常量/无信息列: {constant_cols}")
+        print(f"[Cox] Dropping constant/no-information columns: {constant_cols}")
     X = X.drop(columns=constant_cols, errors="ignore")
 
     if X.shape[1] == 0:
@@ -812,7 +812,7 @@ def _sanitize_cox_features_matrix(
     if duplicated_mask.any():
         dup_cols = X.columns[duplicated_mask.values].tolist()
         if verbose:
-            print(f"[Cox] 删除重复列: {dup_cols}")
+            print(f"[Cox] Dropping duplicated columns: {dup_cols}")
         X = X.loc[:, ~duplicated_mask.values]
 
     if X.shape[1] <= 1:
@@ -820,7 +820,7 @@ def _sanitize_cox_features_matrix(
         if verbose:
             removed = [c for c in original_features if c not in kept]
             if removed:
-                print(f"[Cox] 净化后仅保留 {kept}，删除: {removed}")
+                print(f"[Cox] After sanitization kept {kept}, removed: {removed}")
         return X, kept
 
     # Remove highly correlated columns (keep the first in order)
@@ -828,15 +828,15 @@ def _sanitize_cox_features_matrix(
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
     to_drop = [col for col in upper.columns if (upper[col] >= corr_threshold).any()]
     if to_drop and verbose:
-        print(f"[Cox] 删除高相关列(|r|>={corr_threshold}): {to_drop}")
+        print(f"[Cox] Dropping highly correlated columns (|r|>={corr_threshold}): {to_drop}")
     X = X.drop(columns=to_drop, errors="ignore")
 
     kept = list(X.columns)
     if verbose:
         removed = [c for c in original_features if c not in kept]
         if removed:
-            print(f"[Cox] 特征保留 {len(kept)}/{len(original_features)}: {kept}")
-            print(f"[Cox] 总计删除: {removed}")
+            print(f"[Cox] Kept {len(kept)}/{len(original_features)} features: {kept}")
+            print(f"[Cox] Removed: {removed}")
     return X, kept
 
 

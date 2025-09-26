@@ -17,6 +17,9 @@ from ACC import (
     predict_risk,
     drop_rows_with_missing_local_features,
     FEATURE_SETS,
+    stability_select_features,
+    select_features_max_cindex_forward,
+    plot_cox_coefficients,
 )
 
 from sklearn.model_selection import StratifiedKFold, train_test_split
@@ -322,6 +325,10 @@ def _train_group_model(
     event_col: str,
     stability_seeds: List[int],
     verbose: bool = False,
+    do_feature_selection: bool = True,
+    fs_max_features: Optional[int] = None,
+    stability_threshold: float = 0.4,
+    plot_importance: bool = False,
 ) -> Optional[GroupModel]:
     if df_group is None or df_group.empty:
         return None
@@ -329,12 +336,45 @@ def _train_group_model(
     if not kept:
         return None
     try:
-        cph = fit_cox_model(df_group, kept, time_col, event_col)
-        p5y_tr = _predict_surv_prob_at_t_cox(cph, df_group, kept, T_STAR_DAYS)
+        feats_for_fit = list(kept)
+        if do_feature_selection:
+            try:
+                rs = int(stability_seeds[0]) if stability_seeds else 0
+                selected = select_features_max_cindex_forward(
+                    train_df=df_group.dropna(subset=[time_col, event_col]).copy(),
+                    candidate_features=feats_for_fit,
+                    time_col=time_col,
+                    event_col=event_col,
+                    random_state=rs,
+                    max_features=fs_max_features,
+                    verbose=verbose,
+                )
+                if selected:
+                    feats_for_fit = list(selected)
+                    if verbose:
+                        try:
+                            print(f"[FS] Selected {len(feats_for_fit)} features: {feats_for_fit}")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        cph = fit_cox_model(df_group, feats_for_fit, time_col, event_col)
+        p5y_tr = _predict_surv_prob_at_t_cox(cph, df_group, feats_for_fit, T_STAR_DAYS)
         thr = float(np.nanmedian(p5y_tr))
-        model_feats = list(getattr(getattr(cph, "params_", pd.Series()), "index", kept))
+        model_feats = list(getattr(getattr(cph, "params_", pd.Series()), "index", feats_for_fit))
+        if plot_importance:
+            try:
+                plot_cox_coefficients(
+                    cph,
+                    title="Cox Coefficients (Selected Features)",
+                    reference_df=df_group,
+                    effect_scale="per_sd",
+                )
+            except Exception:
+                pass
         return GroupModel(
-            features=(model_feats if model_feats else list(kept)),
+            features=(model_feats if model_feats else list(feats_for_fit)),
             threshold=thr,
             model=cph,
         )
@@ -651,6 +691,7 @@ def run_stabilized_two_model_pipeline(
     triage_km_plot_path: Optional[str] = None,
     triage_featimp_plot_path: Optional[str] = None,
     best_per_sample_tableone_excel_path: Optional[str] = None,
+    plot_model_featimp: bool = True,
 ) -> Dict[str, object]:
     base_pool = list(FEATURE_SETS.get("Proposed", []))
     plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
@@ -727,6 +768,7 @@ def run_stabilized_two_model_pipeline(
         event_col=event_col,
         stability_seeds=list(range(10)),
         verbose=False,
+        plot_importance=False,
     )
     p5y_base_all = np.zeros(len(df_use), dtype=float)
     p5y_plus_all = np.zeros(len(df_use), dtype=float)
@@ -776,6 +818,29 @@ def run_stabilized_two_model_pipeline(
         )
     except Exception:
         pass
+
+    # Plot feature importance (Cox coefficients) for final base/plus models trained on the full training set
+    if plot_model_featimp:
+        try:
+            if final_base is not None:
+                plot_cox_coefficients(
+                    final_base.model,
+                    title="Final Base Model - Cox Coefficients (per SD)",
+                    reference_df=df_use,
+                    effect_scale="per_sd",
+                )
+        except Exception:
+            pass
+        try:
+            if final_plus is not None:
+                plot_cox_coefficients(
+                    final_plus.model,
+                    title="Final Plus Model - Cox Coefficients (per SD)",
+                    reference_df=df_use,
+                    effect_scale="per_sd",
+                )
+        except Exception:
+            pass
 
     def _cidx_safe_from_prob(p: np.ndarray) -> float:
         try:
@@ -987,6 +1052,170 @@ def run_stabilized_two_model_pipeline(
         "classifier_importance": clf_importance,
     }
 
+
+def run_single_split_two_model_pipeline(
+    df: pd.DataFrame,
+    time_col: str = "PE_Time",
+    event_col: str = "VT/VF/SCD",
+    test_size: float = 0.3,
+    random_state: int = 0,
+    enforce_fair_subset: bool = True,
+    plot_model_featimp: bool = True,
+    tableone_excel_path: Optional[str] = None,
+) -> Dict[str, object]:
+    base_pool = list(FEATURE_SETS.get("Proposed", []))
+    plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
+    exclude_features = {"Age by decade", "CrCl>45", "NYHA>2", "Significant LGE"}
+    base_pool = [f for f in base_pool if f not in exclude_features]
+    plus_pool = [f for f in plus_pool if f not in exclude_features]
+    try:
+        print("==== Feature Pools (Single Split) ====")
+        print(f"Base (Proposed) features ({len(base_pool)}): {base_pool}")
+        print(f"Plus (Proposed Plus) features ({len(plus_pool)}): {plus_pool}")
+    except Exception:
+        pass
+
+    df_use = drop_rows_with_missing_local_features(df) if enforce_fair_subset else df.copy()
+    data_use = df_use.dropna(subset=[time_col, event_col]).copy()
+
+    strat_labels = _make_joint_stratify_labels(data_use, ["ICD", "Female", event_col])
+    stratify_arg = (
+        strat_labels if (strat_labels is not None and strat_labels.nunique() > 1) else (
+            data_use[event_col] if data_use[event_col].nunique() > 1 else None
+        )
+    )
+    tr, te = train_test_split(
+        data_use,
+        test_size=float(test_size),
+        random_state=int(random_state),
+        stratify=stratify_arg,
+    )
+
+    # Train one base model and one plus model on the training set with single-run forward selection
+    final_base = _train_group_model(
+        df_group=tr,
+        candidate_features=[f for f in base_pool if f in tr.columns],
+        time_col=time_col,
+        event_col=event_col,
+        stability_seeds=[int(random_state)],
+        verbose=False,
+        do_feature_selection=True,
+        fs_max_features=None,
+        plot_importance=plot_model_featimp,
+    )
+    final_plus = _train_group_model(
+        df_group=tr,
+        candidate_features=[f for f in plus_pool if f in tr.columns],
+        time_col=time_col,
+        event_col=event_col,
+        stability_seeds=[int(random_state)],
+        verbose=False,
+        do_feature_selection=True,
+        fs_max_features=None,
+        plot_importance=plot_model_featimp,
+    )
+
+    p5y_base_te = np.zeros(len(te), dtype=float)
+    p5y_plus_te = np.zeros(len(te), dtype=float)
+    try:
+        if final_base is not None:
+            p5y_base_te = _predict_surv_prob_at_t_cox(final_base.model, te, final_base.features, T_STAR_DAYS)
+    except Exception:
+        pass
+    try:
+        if final_plus is not None:
+            p5y_plus_te = _predict_surv_prob_at_t_cox(final_plus.model, te, final_plus.features, T_STAR_DAYS)
+    except Exception:
+        pass
+
+    # Choose the lower 5-year risk between plus and base for each sample
+    p5y_best_te = np.where(p5y_plus_te < p5y_base_te, p5y_plus_te, p5y_base_te)
+    try:
+        cidx_base = float(concordance_index(te[time_col], -p5y_base_te, te[event_col]))
+    except Exception:
+        cidx_base = np.nan
+    try:
+        cidx_plus = float(concordance_index(te[time_col], -p5y_plus_te, te[event_col]))
+    except Exception:
+        cidx_plus = np.nan
+    try:
+        cidx_best = float(concordance_index(te[time_col], -p5y_best_te, te[event_col]))
+    except Exception:
+        cidx_best = np.nan
+
+    # Train triage classifier on training set using the same method as before (crossfit OOF labels)
+    triage_clf = None
+    theta_used = np.nan
+    coverage_triage = np.nan
+    try:
+        # Crossfit benefit labels on training set
+        _, B, tau = make_benefit_labels_crossfit(
+            train_df=tr,
+            base_features=[f for f in base_pool if f in tr.columns],
+            plus_features=[f for f in plus_pool if f in tr.columns],
+            time_col=time_col,
+            event_col=event_col,
+            k_splits=5,
+            random_state=int(random_state),
+            tau_rule="q65",
+            margin_std=0.10,
+        )
+        triage_clf = fit_calibrated_triage(
+            train_df=tr,
+            base_features=[f for f in base_pool if f in tr.columns],
+            B=B,
+            random_state=int(random_state),
+            backend="sgd",
+            calibration="sigmoid",
+        )
+        # Pick threshold theta on a small validation split from train where labels exist
+        mask_lbl = (B == 0) | (B == 1)
+        X_theta = tr.loc[mask_lbl, [f for f in base_pool if f in tr.columns]]
+        y_theta = B[mask_lbl].astype(int)
+        if len(X_theta) > 1 and triage_clf is not None:
+            X_tr_theta, X_va_theta, y_tr_theta, y_va_theta = train_test_split(
+                X_theta, y_theta, test_size=0.2, random_state=int(random_state), stratify=y_theta
+            )
+            p_va = triage_clf.predict_proba(X_va_theta)[:, 1]
+            theta_used = _choose_theta(p_va, method="max_net_benefit", y_benefit=y_va_theta, harm_ratio=1.0)
+    except Exception:
+        triage_clf = None
+
+    # Triage routing on test using the globally trained base/plus models
+    try:
+        if triage_clf is not None and np.isfinite(theta_used):
+            triage_probs_te = triage_clf.predict_proba(te[[f for f in base_pool if f in te.columns]])[:, 1]
+            route_plus = triage_probs_te >= float(theta_used)
+            coverage_triage = float(np.mean(route_plus))
+            p5y_triage_te = np.where(route_plus, p5y_plus_te, p5y_base_te)
+            cidx_triage = float(concordance_index(te[time_col], -p5y_triage_te, te[event_col]))
+        else:
+            cidx_triage = np.nan
+    except Exception:
+        cidx_triage = np.nan
+
+    # Optional descriptive table by best-per-sample routing (Benefit vs Non-Benefit)
+    try:
+        route_plus = p5y_plus_te < p5y_base_te
+        te_tab = te.copy()
+        te_tab["BenefitGroup"] = np.where(route_plus, "Benefit", "Non-Benefit")
+        ACC.generate_tableone_by_group(te_tab, group_col="BenefitGroup", output_excel_path=tableone_excel_path)
+    except Exception:
+        pass
+
+    return {
+        "final_base_features": (final_base.features if final_base is not None else []),
+        "final_plus_features": (final_plus.features if final_plus is not None else []),
+        "p5y_base_test": p5y_base_te,
+        "p5y_plus_test": p5y_plus_te,
+        "metrics": {
+            "c_index_base": cidx_base,
+            "c_index_plus": cidx_plus,
+            "c_index_best": cidx_best,
+            "c_index_triage": cidx_triage,
+            "coverage_triage": coverage_triage,
+        },
+    }
 
 def run_benefit_specific_experiments(
     df: pd.DataFrame,

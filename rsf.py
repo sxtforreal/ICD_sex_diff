@@ -98,7 +98,7 @@ LOCAL_FEATURES = [str(c).strip() for c in LOCAL_FEATURES]
 
 
 # =============================
-# 数据清洗（沿用原实现）
+# Data cleaning (same as original implementation)
 # =============================
 
 
@@ -200,9 +200,10 @@ def load_dataframes(
     sheet_no_icd: str = "No_ICD",
 ) -> pd.DataFrame:
     """
-    读取原始 Excel, 合并 ICD/No_ICD, 计算随访时间, 丢弃无用列, 并做基本类型规范化与简单插补。
+    Read raw Excel, merge ICD/No_ICD, compute follow-up time, drop unused columns,
+    and perform basic type normalization and simple imputation.
 
-    注意：默认路径保持与旧脚本一致，可通过 --data-file 覆盖。
+    Note: default path remains consistent with the legacy script and can be overridden via --data-file.
     """
     if data_file is None:
         base = "/home/sunx/data/aiiih/projects/sunx/projects/ICD"
@@ -726,7 +727,7 @@ def _stability_select_features(
     return list(kept_final)
 
 # =============================
-# Step 1: K 折 OOF 双模型损失（global vs global+local）
+# Step 1: K-fold OOF dual-model losses (global vs global+local)
 # =============================
 
 
@@ -755,7 +756,7 @@ def compute_oof_losses(
     # Use curated union for 'all' instead of all available columns to avoid noise leakage
     all_cols = sorted(set(global_cols) | set(local_cols))
     if len(global_cols) == 0 or len(local_cols) == 0:
-        raise ValueError("GLOBAL_FEATURES 或 LOCAL_FEATURES 为空或与数据不匹配。")
+        raise ValueError("GLOBAL_FEATURES or LOCAL_FEATURES is empty or does not match the data.")
 
     n = len(X_all)
     # Progress: feature selection status and pools
@@ -914,7 +915,7 @@ def compute_oof_losses(
 
 
 # =============================
-# Step 2 & 3: 硬阈值选择 + meta-label 生成
+# Step 2 & 3: Hard-threshold selection + meta-label generation
 # =============================
 
 
@@ -927,8 +928,8 @@ def apply_hard_threshold_rule_binary(
     complexity: Optional[Dict[str, float]] = None,
 ) -> Dict[str, np.ndarray]:
     """
-    基于双模型（global vs global+local）的 OOF 损失生成二元严格标签：
-    z_i ∈ {0: global, 1: all}，并返回 margin = L_second - L_best。
+    Generate binary strict labels based on OOF losses of two models (global vs global+local):
+    z_i ∈ {0: global, 1: all}. Also return margin = L_second - L_best.
     """
     if complexity is None:
         complexity = {"global": 1.0, "all": 1.2}
@@ -964,7 +965,7 @@ def apply_hard_threshold_rule_binary(
 
 
 # =============================
-# Step 4: 学 gating（离散三分类）
+# Step 4: Learn gating classifier (discrete)
 # =============================
 
 
@@ -982,7 +983,7 @@ def train_gating_classifier(
     Xy = Xy[feature_cols]
 
     if Xy.shape[0] == 0:
-        raise ValueError("没有可用于训练 gating 的样本标签。")
+        raise ValueError("No labeled samples available to train the gating classifier.")
 
     pipe = Pipeline(
         steps=[
@@ -1016,7 +1017,7 @@ def train_gating_classifier(
 
 
 # =============================
-# Step 5: 最终评估（独立测试集）
+# Step 5: Final evaluation (independent test set)
 # =============================
 
 
@@ -1262,75 +1263,75 @@ def evaluate_on_holdout(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "三模型+gating 框架：\n"
-            "1) K 折 OOF 生成 per-sample 三元损失；\n"
-            "2) 最小改进幅度 α 的硬阈值规则产出严格 meta-label；\n"
-            "3) 训练 gating 三分类；\n"
-            "4) 在独立测试集上评估混合模型 (C-index/Brier)。"
+            "Gating framework:\n"
+            "1) K-fold OOF to generate per-sample dual-model losses;\n"
+            "2) Hard-threshold rule with minimum improvement to produce strict meta-labels;\n"
+            "3) Train a gating classifier;\n"
+            "4) Evaluate the mixture model on an independent test set (C-index/Brier)."
         )
     )
     parser.add_argument(
-        "--data-file", type=str, default=None, help="Excel 路径，默认与旧脚本一致"
+        "--data-file", type=str, default=None, help="Excel path; defaults consistent with legacy script"
     )
     parser.add_argument(
-        "--horizon-days", type=float, default=1825.0, help="评估时点 t0 (天)"
+        "--horizon-days", type=float, default=1825.0, help="Evaluation time t0 (days)"
     )
-    parser.add_argument("--kfold", type=int, default=5, help="K 折数")
-    parser.add_argument("--repeats", type=int, default=1, help="重复 CV 次数")
-    parser.add_argument("--test-size", type=float, default=0.25, help="独立测试集占比")
+    parser.add_argument("--kfold", type=int, default=5, help="Number of folds")
+    parser.add_argument("--repeats", type=int, default=1, help="Number of CV repeats")
+    parser.add_argument("--test-size", type=float, default=0.25, help="Holdout test size ratio")
     parser.add_argument(
-        "--alpha-abs", type=float, default=0.005, help="最小绝对改进阈值"
+        "--alpha-abs", type=float, default=0.005, help="Minimum absolute improvement threshold"
     )
-    parser.add_argument("--alpha-rel", type=float, default=0.0, help="最小相对改进阈值")
+    parser.add_argument("--alpha-rel", type=float, default=0.0, help="Minimum relative improvement threshold")
     parser.add_argument(
-        "--lambda-penalty", type=float, default=0.0, help="复杂度惩罚系数 λ"
+        "--lambda-penalty", type=float, default=0.0, help="Complexity penalty coefficient (lambda)"
     )
-    parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    parser.add_argument("--no-progress", action="store_true", help="关闭进度输出")
-    parser.add_argument("--cox-alpha", type=float, default=0.1, help="Cox L2 正则强度 alpha")
-    parser.add_argument("--topk-importance", type=int, default=20, help="打印 gating 特征重要性 Top-K")
-    parser.add_argument("--include-female", action="store_true", help="是否将 Female 作为特征纳入 Cox 与 gating")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--no-progress", action="store_true", help="Disable progress output")
+    parser.add_argument("--cox-alpha", type=float, default=0.1, help="Cox L2 regularization strength (alpha)")
+    parser.add_argument("--topk-importance", type=int, default=20, help="Top-K gating feature importance to display")
+    parser.add_argument("--include-female", action="store_true", help="Include Female as a feature in Cox and gating")
     parser.add_argument(
         "--cox-clip-value",
         type=float,
         default=8.0,
-        help="标准化后特征的裁剪阈值(避免线性预测过大导致溢出)",
+        help="Clipping threshold after standardization (avoid overly large linear predictors)",
     )
     parser.add_argument(
         "--use-feature-selection",
         dest="use_feature_selection",
         action="store_true",
         default=True,
-        help="是否对 global/all 基模型启用前向特征选择（仅在训练集/折内进行，避免泄漏）[默认开启]",
+        help="Enable forward feature selection for global/all base models (train-fold only; avoid leakage) [default on]",
     )
     parser.add_argument(
         "--no-feature-selection",
         dest="use_feature_selection",
         action="store_false",
-        help="关闭前向特征选择以加速调试（覆盖默认开启）",
+        help="Disable forward feature selection to speed up debugging (overrides default)",
     )
     parser.add_argument(
         "--use-stability-selection",
         action="store_true",
-        help="启用稳定性选择：多随机种子重复前向选择，保留高频特征（与 cox.py 一致）",
+        help="Enable stability selection: multiple random seeds for forward selection, keep high-frequency features",
     )
     parser.add_argument(
         "--stability-seeds",
         type=int,
         default=20,
-        help="稳定性选择使用的随机种子数量（默认 20）",
+        help="Number of random seeds for stability selection (default 20)",
     )
     parser.add_argument(
         "--stability-threshold",
         type=float,
         default=0.4,
-        help="特征保留频率阈值（默认 0.4）",
+        help="Feature retention frequency threshold (default 0.4)",
     )
     parser.add_argument(
         "--fs-max-features",
         type=int,
         default=None,
-        help="前向特征选择的最大特征数（默认不限制）",
+        help="Maximum number of features in forward selection (default unlimited)",
     )
     args = parser.parse_args()
 
@@ -1345,7 +1346,7 @@ def main() -> None:
     global_cols = [c for c in GLOBAL_FEATURES if c in clean_df.columns]
     local_cols = [c for c in LOCAL_FEATURES if c in clean_df.columns]
     if len(global_cols) == 0 or len(local_cols) == 0:
-        raise ValueError("GLOBAL_FEATURES/LOCAL_FEATURES 与数据列不匹配，请调整名称。")
+        raise ValueError("GLOBAL_FEATURES/LOCAL_FEATURES do not match data columns; please adjust names.")
 
     _log("Running end-to-end training and evaluation ...")
     results = evaluate_on_holdout(
