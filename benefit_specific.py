@@ -1867,5 +1867,35 @@ if __name__ == "__main__":
                 print("Saved best-per-sample TableOne:", table_path)
         except Exception:
             pass
+        # Extra reporting for triage parameters, feature selection, and coverage
+        try:
+            # Feature selection results
+            base_feats = result.get("final_base_features", [])
+            plus_feats = result.get("final_plus_features", [])
+            print("==== Final Selected Features (Train) ====")
+            print(f"Base features ({len(base_feats)}): {base_feats}")
+            print(f"Plus features ({len(plus_feats)}): {plus_feats}")
+
+            # Triage test-set 1/0 prediction percentages
+            triage_mask = result.get("triage_route_plus", None)
+            if triage_mask is not None:
+                triage_mask = np.asarray(triage_mask).astype(bool)
+                prop_plus = float(np.mean(triage_mask)) if len(triage_mask) > 0 else float("nan")
+                prop_base = (1.0 - prop_plus) if np.isfinite(prop_plus) else float("nan")
+                print(
+                    f"==== Triage test predictions ====> 1 (route to plus): {prop_plus:.2%}, 0 (route to base): {prop_base:.2%}"
+                )
+
+            # Triage classifier coefficients (top 20 by |coef|)
+            imp = result.get("triage_classifier_importance", None)
+            if imp is not None:
+                try:
+                    top_show = int(min(20, len(imp)))
+                    print("==== Triage Classifier Coefficients (Top by |coef|) ====")
+                    print(imp.head(top_show))
+                except Exception:
+                    pass
+        except Exception:
+            pass
     except Exception as e:
         print(f"Single-split pipeline failed: {e}")
