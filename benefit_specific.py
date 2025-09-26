@@ -18,6 +18,7 @@ from ACC import (
     drop_rows_with_missing_local_features,
     FEATURE_SETS,
     stability_select_features,
+    select_features_max_cindex_forward,
     plot_cox_coefficients,
 )
 
@@ -338,15 +339,14 @@ def _train_group_model(
         feats_for_fit = list(kept)
         if do_feature_selection:
             try:
-                selected = stability_select_features(
-                    df=df_group.dropna(subset=[time_col, event_col]).copy(),
+                rs = int(stability_seeds[0]) if stability_seeds else 0
+                selected = select_features_max_cindex_forward(
+                    train_df=df_group.dropna(subset=[time_col, event_col]).copy(),
                     candidate_features=feats_for_fit,
                     time_col=time_col,
                     event_col=event_col,
-                    seeds=list(stability_seeds),
+                    random_state=rs,
                     max_features=fs_max_features,
-                    threshold=float(stability_threshold),
-                    min_features=None,
                     verbose=verbose,
                 )
                 if selected:
@@ -1052,6 +1052,117 @@ def run_stabilized_two_model_pipeline(
         "classifier_importance": clf_importance,
     }
 
+
+def run_single_split_two_model_pipeline(
+    df: pd.DataFrame,
+    time_col: str = "PE_Time",
+    event_col: str = "VT/VF/SCD",
+    test_size: float = 0.3,
+    random_state: int = 0,
+    enforce_fair_subset: bool = True,
+    plot_model_featimp: bool = True,
+    tableone_excel_path: Optional[str] = None,
+) -> Dict[str, object]:
+    base_pool = list(FEATURE_SETS.get("Proposed", []))
+    plus_pool = list(FEATURE_SETS.get("Proposed Plus", []))
+    exclude_features = {"Age by decade", "CrCl>45", "NYHA>2", "Significant LGE"}
+    base_pool = [f for f in base_pool if f not in exclude_features]
+    plus_pool = [f for f in plus_pool if f not in exclude_features]
+    try:
+        print("==== Feature Pools (Single Split) ====")
+        print(f"Base (Proposed) features ({len(base_pool)}): {base_pool}")
+        print(f"Plus (Proposed Plus) features ({len(plus_pool)}): {plus_pool}")
+    except Exception:
+        pass
+
+    df_use = drop_rows_with_missing_local_features(df) if enforce_fair_subset else df.copy()
+    data_use = df_use.dropna(subset=[time_col, event_col]).copy()
+
+    strat_labels = _make_joint_stratify_labels(data_use, ["ICD", "Female", event_col])
+    stratify_arg = (
+        strat_labels if (strat_labels is not None and strat_labels.nunique() > 1) else (
+            data_use[event_col] if data_use[event_col].nunique() > 1 else None
+        )
+    )
+    tr, te = train_test_split(
+        data_use,
+        test_size=float(test_size),
+        random_state=int(random_state),
+        stratify=stratify_arg,
+    )
+
+    # Train one base model and one plus model on the training set with single-run forward selection
+    final_base = _train_group_model(
+        df_group=tr,
+        candidate_features=[f for f in base_pool if f in tr.columns],
+        time_col=time_col,
+        event_col=event_col,
+        stability_seeds=[int(random_state)],
+        verbose=False,
+        do_feature_selection=True,
+        fs_max_features=None,
+        plot_importance=plot_model_featimp,
+    )
+    final_plus = _train_group_model(
+        df_group=tr,
+        candidate_features=[f for f in plus_pool if f in tr.columns],
+        time_col=time_col,
+        event_col=event_col,
+        stability_seeds=[int(random_state)],
+        verbose=False,
+        do_feature_selection=True,
+        fs_max_features=None,
+        plot_importance=plot_model_featimp,
+    )
+
+    p5y_base_te = np.zeros(len(te), dtype=float)
+    p5y_plus_te = np.zeros(len(te), dtype=float)
+    try:
+        if final_base is not None:
+            p5y_base_te = _predict_surv_prob_at_t_cox(final_base.model, te, final_base.features, T_STAR_DAYS)
+    except Exception:
+        pass
+    try:
+        if final_plus is not None:
+            p5y_plus_te = _predict_surv_prob_at_t_cox(final_plus.model, te, final_plus.features, T_STAR_DAYS)
+    except Exception:
+        pass
+
+    # Choose the lower 5-year risk between plus and base for each sample
+    p5y_best_te = np.where(p5y_plus_te < p5y_base_te, p5y_plus_te, p5y_base_te)
+    try:
+        cidx_base = float(concordance_index(te[time_col], -p5y_base_te, te[event_col]))
+    except Exception:
+        cidx_base = np.nan
+    try:
+        cidx_plus = float(concordance_index(te[time_col], -p5y_plus_te, te[event_col]))
+    except Exception:
+        cidx_plus = np.nan
+    try:
+        cidx_best = float(concordance_index(te[time_col], -p5y_best_te, te[event_col]))
+    except Exception:
+        cidx_best = np.nan
+
+    # Optional descriptive table by best-per-sample routing (Benefit vs Non-Benefit)
+    try:
+        route_plus = p5y_plus_te < p5y_base_te
+        te_tab = te.copy()
+        te_tab["BenefitGroup"] = np.where(route_plus, "Benefit", "Non-Benefit")
+        ACC.generate_tableone_by_group(te_tab, group_col="BenefitGroup", output_excel_path=tableone_excel_path)
+    except Exception:
+        pass
+
+    return {
+        "final_base_features": (final_base.features if final_base is not None else []),
+        "final_plus_features": (final_plus.features if final_plus is not None else []),
+        "p5y_base_test": p5y_base_te,
+        "p5y_plus_test": p5y_plus_te,
+        "metrics": {
+            "c_index_base": cidx_base,
+            "c_index_plus": cidx_plus,
+            "c_index_best": cidx_best,
+        },
+    }
 
 def run_benefit_specific_experiments(
     df: pd.DataFrame,
