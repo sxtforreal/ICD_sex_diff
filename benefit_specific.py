@@ -27,6 +27,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import SGDClassifier, LogisticRegression, SGDRegressor
+from sklearn.metrics import roc_auc_score, accuracy_score
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -45,6 +46,134 @@ except Exception:
 T_STAR_YEARS = 5
 T_STAR_DAYS = int(round(365.25 * T_STAR_YEARS))
 EPS = 1e-9
+def _build_triage_estimator(backend: str, random_state: int):
+    if backend in ("logreg", "sgd"):
+        if backend == "sgd":
+            base = SGDClassifier(
+                loss="log_loss",
+                penalty="l2",
+                alpha=1e-4,
+                max_iter=5000,
+                random_state=random_state,
+                class_weight="balanced",
+            )
+        else:
+            base = LogisticRegression(
+                solver="liblinear",
+                penalty="l2",
+                C=1.0,
+                class_weight="balanced",
+                max_iter=2000,
+                random_state=random_state,
+            )
+        return Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", base),
+        ])
+    elif backend == "xgb" and _HAS_XGB:
+        xgb = XGBClassifier(
+            n_estimators=300,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            reg_alpha=0.0,
+            reg_lambda=1.0,
+            random_state=random_state,
+            n_jobs=-1,
+            objective="binary:logistic",
+            eval_metric="logloss",
+        )
+        return Pipeline([("clf", xgb)])
+    else:
+        return Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(
+                solver="liblinear",
+                penalty="l2",
+                C=1.0,
+                class_weight="balanced",
+                max_iter=2000,
+                random_state=random_state,
+            )),
+        ])
+
+
+def _cv_auc_for_features(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    feats: List[str],
+    backend: str,
+    random_state: int,
+    cv: int,
+) -> float:
+    if len(feats) == 0:
+        return float("nan")
+    Xf = X.loc[:, feats].copy()
+    if Xf.shape[1] == 0:
+        return float("nan")
+    try:
+        skf = StratifiedKFold(n_splits=int(cv), shuffle=True, random_state=int(random_state))
+        aucs: List[float] = []
+        for tr_idx, va_idx in skf.split(Xf, y):
+            Xtr, Xva = Xf.iloc[tr_idx], Xf.iloc[va_idx]
+            ytr, yva = y[tr_idx], y[va_idx]
+            est = _build_triage_estimator(backend, random_state)
+            try:
+                est.fit(Xtr, ytr)
+                if hasattr(est, "predict_proba"):
+                    p = est.predict_proba(Xva)[:, 1]
+                else:
+                    # Try decision_function fallback
+                    try:
+                        s = est.decision_function(Xva)
+                        from scipy.special import expit
+                        p = expit(s)
+                    except Exception:
+                        p = np.zeros(len(yva), dtype=float)
+                if len(np.unique(yva)) > 1:
+                    aucs.append(float(roc_auc_score(yva, p)))
+            except Exception:
+                continue
+        if len(aucs) == 0:
+            return float("nan")
+        return float(np.nanmean(aucs))
+    except Exception:
+        return float("nan")
+
+
+def _forward_select_classifier_features(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    candidate_features: List[str],
+    backend: str,
+    random_state: int,
+    cv: int = 5,
+    max_features: Optional[int] = None,
+    min_improve: float = 1e-4,
+) -> List[str]:
+    pool = [f for f in candidate_features if f in X.columns]
+    if len(pool) <= 1:
+        return list(pool)
+    selected: List[str] = []
+    best_auc = -np.inf
+    remaining = list(pool)
+    max_iters = len(remaining) if max_features is None else max(0, min(len(remaining), int(max_features)))
+    for _ in range(max_iters):
+        best_feat = None
+        best_feat_auc = best_auc
+        for feat in remaining:
+            feats_try = selected + [feat]
+            auc_val = _cv_auc_for_features(X, y, feats_try, backend, random_state, cv)
+            if np.isfinite(auc_val) and (auc_val > best_feat_auc + min_improve):
+                best_feat_auc = float(auc_val)
+                best_feat = feat
+        if best_feat is None:
+            break
+        selected.append(best_feat)
+        remaining.remove(best_feat)
+        best_auc = best_feat_auc
+    return selected if selected else pool[: max_iters if max_features is not None else len(pool)]
 
 
 @dataclass
@@ -377,6 +506,9 @@ def fit_triage_best_per_sample(
     random_state: int = 0,
     backend: str = "sgd",
     calibration: str = "sigmoid",
+    do_feature_selection: bool = False,
+    fs_max_features: Optional[int] = None,
+    fs_cv: int = 5,
 ):
     """
     用 best-per-sample 标签训练分诊分类器。
@@ -397,6 +529,9 @@ def fit_triage_best_per_sample(
             random_state=int(random_state),
             backend=backend,
             calibration=calibration,
+            do_feature_selection=do_feature_selection,
+            fs_max_features=fs_max_features,
+            fs_cv=fs_cv,
         )
     except Exception:
         return None
@@ -417,7 +552,10 @@ def route_with_triage(
     try:
         if triage_clf is None:
             return np.asarray(p_base, float), np.zeros(len(p_base), dtype=bool)
-        kept = [f for f in base_features if f in df_part.columns]
+        if hasattr(triage_clf, "selected_features_"):
+            kept = [f for f in getattr(triage_clf, "selected_features_", []) if f in df_part.columns]
+        else:
+            kept = [f for f in base_features if f in df_part.columns]
         if len(kept) == 0:
             return np.asarray(p_base, float), np.zeros(len(p_base), dtype=bool)
         pred = triage_clf.predict(df_part[kept])
@@ -562,13 +700,28 @@ def fit_calibrated_triage(
     backend: str = "sgd",
     calibration: str = "sigmoid",
     monotone_constraints: Optional[Dict[str, int]] = None,
+    do_feature_selection: bool = False,
+    fs_max_features: Optional[int] = None,
+    fs_cv: int = 5,
 ):
     y = np.asarray(B, int)
     mask = (y == 0) | (y == 1)
-    X = train_df.loc[mask, base_features].copy()
+    X_full = train_df.loc[mask, [f for f in base_features if f in train_df.columns]].copy()
     y = y[mask]
-    if X.shape[1] == 0 or len(np.unique(y)) < 2:
+    if X_full.shape[1] == 0 or len(np.unique(y)) < 2:
         return None
+    # Optional forward feature selection for triage
+    feats_for_fit = list(X_full.columns)
+    if do_feature_selection and len(feats_for_fit) > 1:
+        try:
+            feats_sel = _forward_select_classifier_features(
+                X_full, y, feats_for_fit, backend=backend, random_state=int(random_state), cv=int(fs_cv), max_features=fs_max_features
+            )
+            if feats_sel:
+                feats_for_fit = list(feats_sel)
+        except Exception:
+            pass
+    X = X_full.loc[:, feats_for_fit].copy()
     # Build base estimator by backend
     estimator = None
     if backend in ("logreg", "sgd"):
@@ -635,6 +788,10 @@ def fit_calibrated_triage(
 
     clf = CalibratedClassifierCV(estimator, method=calibration, cv=calibrate_cv)
     clf.fit(X, y)
+    try:
+        setattr(clf, "selected_features_", list(feats_for_fit))
+    except Exception:
+        pass
     return clf
 
 
@@ -747,12 +904,17 @@ def evaluate_benefit_specific_split(
         p_base_tr=p5y_base_tr_all,
         p_plus_tr=p5y_plus_tr_all,
         random_state=int(random_state),
+        do_feature_selection=True,
+        fs_max_features=None,
+        fs_cv=5,
     )
     # Predict benefit on test directly with triage classifier
     try:
-        triage_pred_te = (
-            triage_clf.predict(test_df[base_pool]) if triage_clf is not None else np.zeros(len(test_df), int)
-        )
+        if triage_clf is not None:
+            feats_use = getattr(triage_clf, "selected_features_", [f for f in base_pool if f in test_df.columns])
+            triage_pred_te = triage_clf.predict(test_df[[f for f in feats_use if f in test_df.columns]])
+        else:
+            triage_pred_te = np.zeros(len(test_df), int)
         test_pred_benefit = (np.asarray(triage_pred_te).astype(int) == 1)
     except Exception:
         test_pred_benefit = np.zeros(len(test_df), dtype=bool)
@@ -1171,6 +1333,9 @@ def run_stabilized_two_model_pipeline(
             p_base_tr=p5y_base_all,
             p_plus_tr=p5y_plus_all,
             random_state=0,
+            do_feature_selection=True,
+            fs_max_features=None,
+            fs_cv=5,
         )
     except Exception:
         triage_clf = None
@@ -1286,7 +1451,8 @@ def run_stabilized_two_model_pipeline(
         # Prefer grouping by triage classifier prediction when available
         if triage_clf is not None:
             try:
-                triage_pred_tab = triage_clf.predict(te_tab[base_pool])
+                feats_use = getattr(triage_clf, "selected_features_", [f for f in base_pool if f in te_tab.columns])
+                triage_pred_tab = triage_clf.predict(te_tab[[f for f in feats_use if f in te_tab.columns]])
                 route_plus_tab = (np.asarray(triage_pred_tab).astype(int) == 1)
             except Exception:
                 route_plus_tab = None
@@ -1539,6 +1705,9 @@ def run_single_split_two_model_pipeline(
             random_state=int(random_state),
             backend="sgd",
             calibration="sigmoid",
+            do_feature_selection=True,
+            fs_max_features=None,
+            fs_cv=5,
         )
         # Extract and display triage classifier feature importance (logistic coefficients)
         try:
@@ -1555,7 +1724,7 @@ def run_single_split_two_model_pipeline(
                 inner = fitted_base
             if inner is not None and hasattr(inner, "coef_"):
                 coefs = np.asarray(inner.coef_).reshape(-1)
-                feats = [f for f in base_pool if f in tr.columns]
+                feats = list(getattr(triage_clf, "selected_features_", [f for f in base_pool if f in tr.columns]))
                 if len(coefs) == len(feats):
                     df_imp = pd.DataFrame({"feature": feats, "coef": coefs})
                     df_imp["abs_coef"] = df_imp["coef"].abs()
@@ -1590,7 +1759,8 @@ def run_single_split_two_model_pipeline(
     # Triage routing on test using predicted class directly
     try:
         if triage_clf is not None:
-            triage_pred_te = triage_clf.predict(te[[f for f in base_pool if f in te.columns]])
+            feats_use = getattr(triage_clf, "selected_features_", [f for f in base_pool if f in te.columns])
+            triage_pred_te = triage_clf.predict(te[[f for f in feats_use if f in te.columns]])
             route_plus = (np.asarray(triage_pred_te).astype(int) == 1)
             coverage_triage = float(np.mean(route_plus))
             p5y_triage_te = np.where(route_plus, p5y_plus_te, p5y_base_te)
