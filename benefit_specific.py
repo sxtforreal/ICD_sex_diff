@@ -1143,6 +1143,57 @@ def run_single_split_two_model_pipeline(
     except Exception:
         cidx_best = np.nan
 
+    # Train triage classifier on training set using the same method as before (crossfit OOF labels)
+    triage_clf = None
+    theta_used = np.nan
+    coverage_triage = np.nan
+    try:
+        # Crossfit benefit labels on training set
+        _, B, tau = make_benefit_labels_crossfit(
+            train_df=tr,
+            base_features=[f for f in base_pool if f in tr.columns],
+            plus_features=[f for f in plus_pool if f in tr.columns],
+            time_col=time_col,
+            event_col=event_col,
+            k_splits=5,
+            random_state=int(random_state),
+            tau_rule="q65",
+            margin_std=0.10,
+        )
+        triage_clf = fit_calibrated_triage(
+            train_df=tr,
+            base_features=[f for f in base_pool if f in tr.columns],
+            B=B,
+            random_state=int(random_state),
+            backend="sgd",
+            calibration="sigmoid",
+        )
+        # Pick threshold theta on a small validation split from train where labels exist
+        mask_lbl = (B == 0) | (B == 1)
+        X_theta = tr.loc[mask_lbl, [f for f in base_pool if f in tr.columns]]
+        y_theta = B[mask_lbl].astype(int)
+        if len(X_theta) > 1 and triage_clf is not None:
+            X_tr_theta, X_va_theta, y_tr_theta, y_va_theta = train_test_split(
+                X_theta, y_theta, test_size=0.2, random_state=int(random_state), stratify=y_theta
+            )
+            p_va = triage_clf.predict_proba(X_va_theta)[:, 1]
+            theta_used = _choose_theta(p_va, method="max_net_benefit", y_benefit=y_va_theta, harm_ratio=1.0)
+    except Exception:
+        triage_clf = None
+
+    # Triage routing on test using the globally trained base/plus models
+    try:
+        if triage_clf is not None and np.isfinite(theta_used):
+            triage_probs_te = triage_clf.predict_proba(te[[f for f in base_pool if f in te.columns]])[:, 1]
+            route_plus = triage_probs_te >= float(theta_used)
+            coverage_triage = float(np.mean(route_plus))
+            p5y_triage_te = np.where(route_plus, p5y_plus_te, p5y_base_te)
+            cidx_triage = float(concordance_index(te[time_col], -p5y_triage_te, te[event_col]))
+        else:
+            cidx_triage = np.nan
+    except Exception:
+        cidx_triage = np.nan
+
     # Optional descriptive table by best-per-sample routing (Benefit vs Non-Benefit)
     try:
         route_plus = p5y_plus_te < p5y_base_te
@@ -1161,6 +1212,8 @@ def run_single_split_two_model_pipeline(
             "c_index_base": cidx_base,
             "c_index_plus": cidx_plus,
             "c_index_best": cidx_best,
+            "c_index_triage": cidx_triage,
+            "coverage_triage": coverage_triage,
         },
     }
 
