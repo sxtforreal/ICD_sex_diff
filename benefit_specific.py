@@ -1168,7 +1168,6 @@ def run_stabilized_two_model_pipeline(
     clf_importance_excel_path: Optional[str] = None,
     train_benefit_classifier: bool = True,
     triage_tableone_excel_path: Optional[str] = None,
-    triage_km_plot_path: Optional[str] = None,
     triage_featimp_plot_path: Optional[str] = None,
     best_per_sample_tableone_excel_path: Optional[str] = None,
     plot_model_featimp: bool = True,
@@ -1491,17 +1490,7 @@ def run_stabilized_two_model_pipeline(
             )
         except Exception:
             pass
-        try:
-            ACC.plot_km_by_group(
-                df_tab,
-                group_col="BenefitGroup",
-                time_col=time_col,
-                event_col=event_col,
-                output_path=triage_km_plot_path,
-                t_star_days=T_STAR_DAYS,
-            )
-        except Exception:
-            pass
+        
     except Exception:
         pass
     clf_importance: Optional[pd.DataFrame] = None
