@@ -83,6 +83,56 @@ def _choose_theta(
     return best_theta
 
 
+def _choose_theta_by_cindex_mix(
+    p: np.ndarray,
+    p_base: np.ndarray,
+    p_plus: np.ndarray,
+    time: np.ndarray,
+    event: np.ndarray,
+    grid: Optional[np.ndarray] = None,
+) -> float:
+    """
+    Choose theta to maximize c-index of the mixed probability m(theta) = I(p>=theta)*p_plus + (1-I)*p_base
+    evaluated on the provided validation set.
+    """
+    try:
+        p = np.asarray(p, float)
+        p_base = np.asarray(p_base, float)
+        p_plus = np.asarray(p_plus, float)
+        time = np.asarray(time, float)
+        event = np.asarray(event, int)
+        mask = (
+            np.isfinite(p)
+            & np.isfinite(p_base)
+            & np.isfinite(p_plus)
+            & np.isfinite(time)
+            & np.isfinite(event)
+        )
+        p = p[mask]
+        p_base = p_base[mask]
+        p_plus = p_plus[mask]
+        time = time[mask]
+        event = event[mask]
+        if p.size == 0:
+            return 0.5
+        if grid is None:
+            # Use a reasonably fine grid based on quantiles of p
+            qs = np.linspace(0.05, 0.95, 19)
+            grid = np.unique(np.quantile(p, qs))
+        best_c, best_theta = -1e9, 0.5
+        for th in grid:
+            mixed = np.where(p >= th, p_plus, p_base)
+            try:
+                cval = float(concordance_index(time, -mixed, event))
+            except Exception:
+                cval = float("nan")
+            if np.isfinite(cval) and cval > best_c:
+                best_c, best_theta = cval, float(th)
+        return best_theta
+    except Exception:
+        return 0.5
+
+
 def _make_joint_stratify_labels(
     df: pd.DataFrame, cols: List[str]
 ) -> Optional[pd.Series]:
@@ -443,26 +493,71 @@ def fit_calibrated_triage(
     y = y[mask]
     if X.shape[1] == 0 or len(np.unique(y)) < 2:
         return None
-
-    pipe = Pipeline(
-        [
+    # Build base estimator by backend
+    estimator = None
+    if backend in ("logreg", "sgd"):
+        if backend == "sgd":
+            base = SGDClassifier(
+                loss="log_loss",
+                penalty="l2",
+                alpha=1e-4,
+                max_iter=5000,
+                random_state=random_state,
+                class_weight="balanced",
+            )
+        else:
+            base = LogisticRegression(
+                solver="liblinear",
+                penalty="l2",
+                C=1.0,
+                class_weight="balanced",
+                max_iter=2000,
+                random_state=random_state,
+            )
+        estimator = Pipeline([
             ("scaler", StandardScaler()),
-            (
-                "clf",
-                LogisticRegression(
-                    solver="liblinear",
-                    penalty="l2",
-                    C=1.0,
-                    class_weight="balanced",
-                    max_iter=2000,
-                    random_state=random_state,
-                ),
-            ),
-        ]
-    )
-    pipe.fit(X, y)
+            ("clf", base),
+        ])
+    elif backend == "xgb" and _HAS_XGB:
+        # Balance with scale_pos_weight if possible
+        pos = int((y == 1).sum())
+        neg = int((y == 0).sum())
+        spw = float(neg / max(1, pos)) if pos > 0 else 1.0
+        xgb = XGBClassifier(
+            n_estimators=400,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            reg_alpha=0.0,
+            reg_lambda=1.0,
+            random_state=random_state,
+            n_jobs=-1,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            scale_pos_weight=spw,
+        )
+        estimator = Pipeline([("clf", xgb)])
+    else:
+        # Fallback to logistic regression
+        estimator = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(
+                solver="liblinear",
+                penalty="l2",
+                C=1.0,
+                class_weight="balanced",
+                max_iter=2000,
+                random_state=random_state,
+            )),
+        ])
 
-    clf = CalibratedClassifierCV(pipe, method=calibration, cv=calibrate_cv)
+    try:
+        estimator.fit(X, y)
+    except Exception:
+        pass
+
+    clf = CalibratedClassifierCV(estimator, method=calibration, cv=calibrate_cv)
     clf.fit(X, y)
     return clf
 
@@ -566,7 +661,7 @@ def evaluate_benefit_specific_split(
         base_features=base_pool,
         B=B,
         random_state=random_state,
-        backend="sgd",
+        backend="xgb",
         calibration="sigmoid",
     )
     if triage_clf is None:
@@ -584,9 +679,32 @@ def evaluate_benefit_specific_split(
         if triage_clf is not None
         else np.zeros(len(X_va_theta))
     )
-    theta = _choose_theta(
-        p_va, method="max_net_benefit", y_benefit=y_va_theta, harm_ratio=1.0
-    )
+    # Prefer c-index-based theta using OOF base/plus risks on training
+    try:
+        pB_oof_tr, pP_oof_tr = compute_oof_probs_5y(
+            train_df=train_df,
+            base_features=base_pool,
+            plus_features=plus_pool,
+            time_col=time_col,
+            event_col=event_col,
+            k_splits=k_splits,
+            random_state=random_state,
+            enforce_fair_subset=False,
+        )
+        idx_va = X_va_theta.index
+        pB_va = pB_oof_tr[idx_va]
+        pP_va = pP_oof_tr[idx_va]
+        t_va = train_df.loc[idx_va, time_col].values.astype(float)
+        e_va = train_df.loc[idx_va, event_col].values.astype(int)
+        theta = _choose_theta_by_cindex_mix(p_va, pB_va, pP_va, t_va, e_va)
+        if not np.isfinite(theta):
+            theta = _choose_theta(
+                p_va, method="max_net_benefit", y_benefit=y_va_theta, harm_ratio=1.0
+            )
+    except Exception:
+        theta = _choose_theta(
+            p_va, method="max_net_benefit", y_benefit=y_va_theta, harm_ratio=1.0
+        )
     triage_probs_te = (
         triage_clf.predict_proba(test_df[base_pool])[:, 1]
         if triage_clf is not None
@@ -1011,14 +1129,27 @@ def run_stabilized_two_model_pipeline(
         triage_probs_all = triage_clf.predict_proba(df_use[base_pool])[:, 1]
         labels_all = (dLL_all > tau).astype(int)
         mask_lbl = np.isfinite(triage_probs_all) & np.isfinite(labels_all)
+        df_lbl = df_use.loc[mask_lbl]
         p_all = triage_probs_all[mask_lbl]
         y_all = labels_all[mask_lbl]
-        p_tr, p_va, y_tr, y_va = train_test_split(
-            p_all, y_all, test_size=0.2, random_state=0, stratify=y_all
+        pB_lbl = p5y_base_all[mask_lbl]
+        pP_lbl = p5y_plus_all[mask_lbl]
+        t_lbl = df_lbl[time_col].values.astype(float)
+        e_lbl = df_lbl[event_col].values.astype(int)
+        p_tr, p_va, pB_tr, pB_va, pP_tr, pP_va, t_tr, t_va, e_tr, e_va, y_tr, y_va = train_test_split(
+            p_all, pB_lbl, pP_lbl, t_lbl, e_lbl, y_all,
+            test_size=0.2, random_state=0, stratify=y_all
         )
-        theta_used = _choose_theta(
-            p_va, method="max_net_benefit", y_benefit=y_va, harm_ratio=1.0
+        # Choose theta by maximizing validation mixed c-index
+        theta_by_c = _choose_theta_by_cindex_mix(
+            p=p_va, p_base=pB_va, p_plus=pP_va, time=t_va, event=e_va
         )
+        # Fallback to net benefit if needed (e.g., nan)
+        if not np.isfinite(theta_by_c):
+            theta_by_c = _choose_theta(
+                p_va, method="max_net_benefit", y_benefit=y_va, harm_ratio=1.0
+            )
+        theta_used = float(theta_by_c)
         route_plus = triage_probs_all >= theta_used
         coverage_triage = float(np.mean(route_plus))
         p5y_triage_all = np.where(route_plus, p5y_plus_all, p5y_base_all)
@@ -1384,7 +1515,28 @@ def run_single_split_two_model_pipeline(
                 X_theta, y_theta, test_size=0.2, random_state=int(random_state), stratify=y_theta
             )
             p_va = triage_clf.predict_proba(X_va_theta)[:, 1]
-            theta_used = _choose_theta(p_va, method="max_net_benefit", y_benefit=y_va_theta, harm_ratio=1.0)
+            # Build validation base/plus risks using globally trained models for c-index selection
+            try:
+                pB_va = _predict_surv_prob_at_t_cox(final_base.model, X_va_theta.join(te[[]]), final_base.features, T_STAR_DAYS) if final_base is not None else np.zeros(len(p_va))
+            except Exception:
+                pB_va = np.zeros(len(p_va))
+            try:
+                pP_va = _predict_surv_prob_at_t_cox(final_plus.model, X_va_theta.join(te[[]]), final_plus.features, T_STAR_DAYS) if final_plus is not None else np.zeros(len(p_va))
+            except Exception:
+                pP_va = np.zeros(len(p_va))
+            t_va = X_va_theta[time_col] if time_col in X_va_theta.columns else te[time_col].sample(n=len(p_va), random_state=int(random_state)).to_numpy()
+            e_va = X_va_theta[event_col] if event_col in X_va_theta.columns else te[event_col].sample(n=len(p_va), random_state=int(random_state)).to_numpy()
+            # Prefer c-index based theta
+            th_c = _choose_theta_by_cindex_mix(
+                p=p_va,
+                p_base=np.asarray(pB_va, float),
+                p_plus=np.asarray(pP_va, float),
+                time=np.asarray(t_va, float),
+                event=np.asarray(e_va, int),
+            )
+            if not np.isfinite(th_c):
+                th_c = _choose_theta(p_va, method="max_net_benefit", y_benefit=y_va_theta, harm_ratio=1.0)
+            theta_used = float(th_c)
         # Extract and display triage classifier feature importance (logistic coefficients)
         try:
             fitted_base = None
