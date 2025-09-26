@@ -798,6 +798,16 @@ def fit_calibrated_triage(
         setattr(clf, "selected_features_", list(feats_for_fit))
     except Exception:
         pass
+    # Print training-set group proportions predicted by triage
+    try:
+        y_pred_tr = clf.predict(X)
+        y_pred_tr = np.asarray(y_pred_tr).astype(int)
+        prop_plus = float(np.mean(y_pred_tr == 1)) if len(y_pred_tr) > 0 else float("nan")
+        prop_base = (1.0 - prop_plus) if np.isfinite(prop_plus) else float("nan")
+        print("==== Triage training-set group proportions ====")
+        print(f"Train preds => 1 (route to plus): {prop_plus:.2%}, 0 (route to base): {prop_base:.2%} (n={len(y_pred_tr)})")
+    except Exception:
+        pass
     return clf
 
 
