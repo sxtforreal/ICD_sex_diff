@@ -1799,6 +1799,7 @@ FEATURE_SETS = {
         "AAD",
         "Significant LGE",
     ],
+    "DERIVATIVE": ["Female", "LVEF", "LGE_Score"],
     "Proposed": [
         "Female",
         "Age at CMR",
@@ -1824,6 +1825,51 @@ FEATURE_SETS = {
         "QTc",
         "CrCl>45",
     ],
+    "Advanced": [
+        "Female",
+        "Age at CMR",
+        "BMI",
+        "DM",
+        "HTN",
+        "HLP",
+        "AF",
+        "NYHA Class",
+        "LVEDVi",
+        "LVEF",
+        "LV Mass Index",
+        "RVEDVi",
+        "RVEF",
+        "LA EF",
+        "LAVi",
+        "LGE Burden 5SD",
+        "MRF (%)",
+        "Sphericity Index",
+        "Relative Wall Thickness",
+        "MV Annular Diameter",
+        "QRS",
+        "QTc",
+        "CrCl>45",
+        "LGE_Circumural",
+        "LGE_Ring-Like",
+        "LGE_Basal anterior  (0; No, 1; yes)",
+        "LGE_Basal anterior septum",
+        "LGE_Basal inferoseptum",
+        "LGE_Basal inferio",
+        "LGE_Basal inferolateral",
+        "LGE_Basal anterolateral ",
+        "LGE_mid anterior",
+        "LGE_mid anterior septum",
+        "LGE_mid inferoseptum",
+        "LGE_mid inferior",
+        "LGE_mid inferolateral ",
+        "LGE_mid anterolateral ",
+        "LGE_apical anterior",
+        "LGE_apical septum",
+        "LGE_apical inferior",
+        "LGE_apical lateral",
+        "LGE_Apical cap",
+        "LGE_RV insertion site (1 superior, 2 inferior. 3 both)",
+    ],
 }
 
 
@@ -1847,7 +1893,7 @@ if __name__ == "__main__":
     _, summary = run_cox_experiments(
         df=df,
         feature_sets=FEATURE_SETS,
-        N=100,
+        N=10,
         time_col="PE_Time",
         event_col="VT/VF/SCD",
         export_excel_path=export_path,
@@ -1869,9 +1915,25 @@ if __name__ == "__main__":
 
     print("Running sex-specific full-data inference (excludes Female in submodels)...")
     _ = sex_specific_full_inference(df, features)
+    
+    # Full-data inference and analysis - DERIVATIVE
+    features = FEATURE_SETS["DERIVATIVE"]
+    print("Running sex-agnostic full-data inference (includes Female)...")
+    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+
+    print("Running sex-specific full-data inference (excludes Female in submodels)...")
+    _ = sex_specific_full_inference(df, features)
 
     # Full-data inference and analysis - Proposed
     features = FEATURE_SETS["Proposed"]
+    print("Running sex-agnostic full-data inference (includes Female)...")
+    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+
+    print("Running sex-specific full-data inference (excludes Female in submodels)...")
+    _ = sex_specific_full_inference(df, features)
+
+    # Full-data inference and analysis - Advanced
+    features = FEATURE_SETS["Advanced"]
     print("Running sex-agnostic full-data inference (includes Female)...")
     _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
 
