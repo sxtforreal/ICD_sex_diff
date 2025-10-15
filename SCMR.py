@@ -1,8 +1,10 @@
 import os
 import warnings
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+plt.switch_backend("Agg")
 from typing import Dict, List, Tuple, Any
 
 # ==========================================
@@ -42,6 +44,38 @@ except Exception:
 # ==========================================
 # Utilities
 # ==========================================
+
+
+def _normalize_column_name(name: Any) -> Any:
+    """Trim and collapse internal whitespace for column labels."""
+    if not isinstance(name, str):
+        return name
+    name = name.strip()
+    # Collapse multiple whitespace to single spaces
+    name = " ".join(name.split())
+    return name
+
+
+def _simplify_name(name: str) -> str:
+    """Lowercase and strip non-alphanumeric to enable fuzzy column matching."""
+    if not isinstance(name, str):
+        return ""
+    lowered = name.lower()
+    simplified = re.sub(r"[^a-z0-9]+", " ", lowered).strip()
+    return simplified
+
+
+def _build_alias_map(columns: List[str]) -> Dict[str, str]:
+    """Map simplified column names to their original labels.
+
+    If duplicates occur after simplification, the first occurrence is kept.
+    """
+    alias: Dict[str, str] = {}
+    for col in columns:
+        key = _simplify_name(col)
+        if key and key not in alias:
+            alias[key] = col
+    return alias
 
 
 def create_undersampled_dataset(
@@ -171,7 +205,7 @@ def plot_cox_coefficients(
     plt.ylabel(ylabel)
     plt.title(title)
     plt.tight_layout()
-    plt.show()
+    plt.close()
 
 
 def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame) -> None:
@@ -244,7 +278,7 @@ def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame) -> None:
 
     plt.suptitle("Primary Endpoint - Survival by Gender and Risk Group", y=1.02)
     plt.tight_layout()
-    plt.show()
+    plt.close()
 
 
 # ==========================================
@@ -515,7 +549,7 @@ def _sanitize_cox_features_matrix(
     nunique = X.nunique(dropna=True)
     constant_cols = nunique[nunique <= 1].index.tolist()
     if constant_cols and verbose:
-        print(f"[Cox] 删除常量/无信息列: {constant_cols}")
+        print(f"[Cox] Dropping constant/no-information columns: {constant_cols}")
     X = X.drop(columns=constant_cols, errors="ignore")
 
     if X.shape[1] == 0:
@@ -527,7 +561,7 @@ def _sanitize_cox_features_matrix(
     if duplicated_mask.any():
         dup_cols = X.columns[duplicated_mask.values].tolist()
         if verbose:
-            print(f"[Cox] 删除重复列: {dup_cols}")
+            print(f"[Cox] Dropping duplicated columns: {dup_cols}")
         X = X.loc[:, ~duplicated_mask.values]
 
     if X.shape[1] <= 1:
@@ -535,7 +569,7 @@ def _sanitize_cox_features_matrix(
         if verbose:
             removed = [c for c in original_features if c not in kept]
             if removed:
-                print(f"[Cox] 净化后仅保留 {kept}，删除: {removed}")
+                print(f"[Cox] After sanitization kept {kept}, removed: {removed}")
         return X, kept
 
     # Remove highly correlated columns (keep the first in order)
@@ -543,15 +577,15 @@ def _sanitize_cox_features_matrix(
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
     to_drop = [col for col in upper.columns if (upper[col] >= corr_threshold).any()]
     if to_drop and verbose:
-        print(f"[Cox] 删除高相关列(|r|>={corr_threshold}): {to_drop}")
+        print(f"[Cox] Dropping highly correlated columns (|r|>={corr_threshold}): {to_drop}")
     X = X.drop(columns=to_drop, errors="ignore")
 
     kept = list(X.columns)
     if verbose:
         removed = [c for c in original_features if c not in kept]
         if removed:
-            print(f"[Cox] 特征保留 {len(kept)}/{len(original_features)}: {kept}")
-            print(f"[Cox] 总计删除: {removed}")
+            print(f"[Cox] Kept {len(kept)}/{len(original_features)} features: {kept}")
+            print(f"[Cox] Total removed: {removed}")
     return X, kept
 
 
@@ -563,11 +597,15 @@ def _sanitize_cox_features_matrix(
 def fit_cox_model(
     train_df: pd.DataFrame, feature_cols: List[str], time_col: str, event_col: str
 ) -> CoxPHFitter:
+    # Guard against missing columns in feature list
+    present_features = [c for c in feature_cols if c in train_df.columns]
     X_sanitized, kept_features = _sanitize_cox_features_matrix(
-        train_df, feature_cols, corr_threshold=0.995
+        train_df, present_features, corr_threshold=0.995
     )
     if len(kept_features) == 0:
-        candidates = [c for c in feature_cols if train_df[c].nunique(dropna=False) > 1]
+        candidates = [
+            c for c in present_features if train_df[c].nunique(dropna=False) > 1
+        ]
         if not candidates:
             raise ValueError("No usable features for CoxPH model after sanitization.")
         X_sanitized = train_df[[candidates[0]]].copy()
@@ -1353,7 +1391,46 @@ def conversion_and_imputation(
     df: pd.DataFrame, features: List[str], labels: List[str]
 ) -> pd.DataFrame:
     df = df.copy()
-    df = df[features + labels]
+
+    # Normalize column labels to reduce breakage due to stray spaces
+    df.columns = [_normalize_column_name(c) for c in df.columns]
+
+    # Resolve aliases for requested columns (features + labels)
+    requested = list(dict.fromkeys(list(features) + list(labels)))
+    alias_map = _build_alias_map(df.columns.tolist())
+
+    resolved_columns: List[str] = []
+    rename_map: Dict[str, str] = {}
+    missing_requested: List[str] = []
+
+    for col in requested:
+        # Exact match first
+        if col in df.columns:
+            resolved_columns.append(col)
+            continue
+        # Try simplified alias mapping
+        key = _simplify_name(col)
+        matched = alias_map.get(key)
+        if matched is not None:
+            resolved_columns.append(matched)
+            # Rename matched column to the canonical requested name
+            if matched != col:
+                rename_map[matched] = col
+        else:
+            missing_requested.append(col)
+
+    if missing_requested:
+        warnings.warn(
+            "The following requested columns were not found and will be ignored: "
+            + ", ".join(missing_requested)
+        )
+
+    # Keep only the resolved columns (present in df)
+    if not resolved_columns:
+        return pd.DataFrame()
+    df = df[resolved_columns]
+    if rename_map:
+        df = df.rename(columns=rename_map)
 
     # Encode ordinal NYHA Class if present
     ordinal = "NYHA Class"
@@ -1383,6 +1460,20 @@ def conversion_and_imputation(
                 {"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0}
             )
         df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Broadly coerce all requested feature columns to numeric when possible
+    # This covers Advanced/DERIVATIVE columns that are binary-like but not in known list
+    yes_no_map = {"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0}
+    for c in features:
+        if c in df.columns and df[c].dtype == "object":
+            df[c] = df[c].replace(yes_no_map)
+            # Extract numerics from strings like "1 superior" -> 1
+            try:
+                df[c] = df[c].astype(str).str.extract(r"(-?\d+(?:\.\d+)?)").astype(float)
+            except Exception:
+                pass
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # Imputation on feature matrix
     X = df[features].copy()
@@ -1414,9 +1505,25 @@ def conversion_and_imputation(
 
 
 def load_dataframes() -> pd.DataFrame:
-    base = "/home/sunx/data/aiiih/projects/sunx/projects/ICD"
-    icd = pd.read_excel(os.path.join(base, "NICM.xlsx"), sheet_name="ICD")
-    noicd = pd.read_excel(os.path.join(base, "NICM.xlsx"), sheet_name="No_ICD")
+    # Resolve NICM.xlsx location with env overrides and safe fallbacks
+    base_default = "/home/sunx/data/aiiih/projects/sunx/projects/ICD"
+    base = os.environ.get("ICD_DATA_BASE", base_default)
+    nicm_path = os.environ.get("NICM_XLSX", os.path.join(base, "NICM.xlsx"))
+    if not os.path.exists(nicm_path):
+        alt = os.path.join(os.getcwd(), "NICM.xlsx")
+        if os.path.exists(alt):
+            nicm_path = alt
+        else:
+            raise FileNotFoundError(
+                f"NICM.xlsx not found at '{nicm_path}'. Set env 'NICM_XLSX' or 'ICD_DATA_BASE'."
+            )
+
+    icd = pd.read_excel(nicm_path, sheet_name="ICD")
+    noicd = pd.read_excel(nicm_path, sheet_name="No_ICD")
+
+    # Normalize column labels to avoid subtle whitespace mismatches
+    icd.columns = [_normalize_column_name(c) for c in icd.columns]
+    noicd.columns = [_normalize_column_name(c) for c in noicd.columns]
 
     # Cockcroft-Gault
     noicd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = noicd.apply(
@@ -1433,13 +1540,13 @@ def load_dataframes() -> pd.DataFrame:
         axis=1,
     )
 
-    # Stack dfs
-    common_cols = icd.columns.intersection(noicd.columns)
-    icd_common = icd[common_cols].copy()
-    noicd_common = noicd[common_cols].copy()
-    icd_common["ICD"] = 1
-    noicd_common["ICD"] = 0
-    nicm = pd.concat([icd_common, noicd_common], ignore_index=True)
+    # Align to the UNION of columns to retain variables unique to either sheet
+    all_cols = sorted(set(icd.columns).union(set(noicd.columns)))
+    icd_aligned = icd.reindex(columns=all_cols).copy()
+    noicd_aligned = noicd.reindex(columns=all_cols).copy()
+    icd_aligned["ICD"] = 1
+    noicd_aligned["ICD"] = 0
+    nicm = pd.concat([icd_aligned, noicd_aligned], ignore_index=True)
 
     # PE time
     nicm["MRI Date"] = pd.to_datetime(nicm["MRI Date"])
@@ -1875,25 +1982,35 @@ FEATURE_SETS = {
 
 if __name__ == "__main__":
     # Load and prepare data
-    df = load_dataframes()
+    try:
+        df = load_dataframes()
+    except Exception as e:
+        warnings.warn(f"[Main] Data loading failed: {e}")
+        raise
+
+    # Output directory override
+    results_dir = os.environ.get("SCMR_RESULTS_DIR") or os.path.join(os.getcwd(), "results")
+    os.makedirs(results_dir, exist_ok=True)
 
     # Generate TableOne grouped by Sex x ICD (four groups)
     try:
         generate_tableone_by_sex_icd(
             df,
-            output_excel_path="/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/results_tableone_sex_icd.xlsx",
+            output_excel_path=os.path.join(results_dir, "results_tableone_sex_icd.xlsx"),
         )
     except Exception as e:
         warnings.warn(f"[Main] TableOne generation skipped due to error: {e}")
 
-    # Run experiments (50 random splits; PE as event; PE_Time as duration)
-    export_path = (
-        "/home/sunx/data/aiiih/projects/sunx/projects/ICD_sex_diff/results_cox.xlsx"
-    )
+    # Run experiments (splits controlled via env SCMR_N_SPLITS)
+    try:
+        n_splits_env = int(os.environ.get("SCMR_N_SPLITS", "10"))
+    except Exception:
+        n_splits_env = 10
+    export_path = os.path.join(results_dir, "results_cox.xlsx")
     _, summary = run_cox_experiments(
         df=df,
         feature_sets=FEATURE_SETS,
-        N=10,
+        N=n_splits_env,
         time_col="PE_Time",
         event_col="VT/VF/SCD",
         export_excel_path=export_path,
