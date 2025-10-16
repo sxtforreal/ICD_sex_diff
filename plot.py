@@ -222,7 +222,8 @@ def plot_metrics_with_ci_groups(df):
     )
 
     sns.despine()
-    plt.tight_layout()
+    # Reserve space on the right so legends never overlap the axes
+    plt.tight_layout(rect=[0, 0, 0.80, 1])
     plt.show()
 
 
@@ -330,7 +331,8 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric", save_path: str 
     )
 
     sns.despine()
-    plt.tight_layout()
+    # Reserve space on the right so legends never overlap the axes
+    plt.tight_layout(rect=[0, 0, 0.80, 1])
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.show()
