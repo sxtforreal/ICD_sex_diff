@@ -8,11 +8,18 @@ plt.switch_backend("Agg")
 from typing import Dict, List, Tuple, Any
 
 # ==========================================
-# Global store for Proposed selected features
+# Global store for selected features (Proposed & Advanced only)
 # ==========================================
 SELECTED_FEATURES_STORE: Dict[str, Any] = {
+    # Proposed
     "proposed_sex_agnostic": None,  # type: List[str] | None
     "proposed_sex_specific": {  # type: Dict[str, List[str]] | None
+        "male": None,
+        "female": None,
+    },
+    # Advanced
+    "advanced_sex_agnostic": None,  # type: List[str] | None
+    "advanced_sex_specific": {  # type: Dict[str, List[str]] | None
         "male": None,
         "female": None,
     },
@@ -938,12 +945,15 @@ def sex_specific_full_inference(
 
     if not data_m.empty:
         used_features_m = list(used_features)
-        # Feature selection only if this is the Proposed set
+        # Feature selection only if this is the Proposed or Advanced set
         try:
-            if set(features) == set(FEATURE_SETS.get("Proposed", [])):
-                selected_m = SELECTED_FEATURES_STORE.get(
-                    "proposed_sex_specific", {}
-                ).get("male")
+            if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(features) == set(FEATURE_SETS.get("Advanced", [])):
+                store_key = (
+                    "proposed_sex_specific"
+                    if set(features) == set(FEATURE_SETS.get("Proposed", []))
+                    else "advanced_sex_specific"
+                )
+                selected_m = SELECTED_FEATURES_STORE.get(store_key, {}).get("male")
                 if not selected_m:
                     selected_m = select_features_max_cindex_forward(
                         data_m,
@@ -955,11 +965,12 @@ def sex_specific_full_inference(
                     )
                     if selected_m:
                         try:
-                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["male"] = (
-                                list(selected_m)
+                            SELECTED_FEATURES_STORE[store_key]["male"] = list(selected_m)
+                            model_name = (
+                                "Proposed" if store_key == "proposed_sex_specific" else "Advanced"
                             )
                             print(
-                                f"[FS][Store] Proposed male-specific features stored: {len(selected_m)}"
+                                f"[FS][Store] {model_name} male-specific features stored: {len(selected_m)}"
                             )
                         except Exception:
                             pass
@@ -981,12 +992,15 @@ def sex_specific_full_inference(
         )
     if not data_f.empty:
         used_features_f = list(used_features)
-        # Feature selection only if this is the Proposed set
+        # Feature selection only if this is the Proposed or Advanced set
         try:
-            if set(features) == set(FEATURE_SETS.get("Proposed", [])):
-                selected_f = SELECTED_FEATURES_STORE.get(
-                    "proposed_sex_specific", {}
-                ).get("female")
+            if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(features) == set(FEATURE_SETS.get("Advanced", [])):
+                store_key = (
+                    "proposed_sex_specific"
+                    if set(features) == set(FEATURE_SETS.get("Proposed", []))
+                    else "advanced_sex_specific"
+                )
+                selected_f = SELECTED_FEATURES_STORE.get(store_key, {}).get("female")
                 if not selected_f:
                     selected_f = select_features_max_cindex_forward(
                         data_f,
@@ -998,11 +1012,12 @@ def sex_specific_full_inference(
                     )
                     if selected_f:
                         try:
-                            SELECTED_FEATURES_STORE["proposed_sex_specific"][
-                                "female"
-                            ] = list(selected_f)
+                            SELECTED_FEATURES_STORE[store_key]["female"] = list(selected_f)
+                            model_name = (
+                                "Proposed" if store_key == "proposed_sex_specific" else "Advanced"
+                            )
                             print(
-                                f"[FS][Store] Proposed female-specific features stored: {len(selected_f)}"
+                                f"[FS][Store] {model_name} female-specific features stored: {len(selected_f)}"
                             )
                         except Exception:
                             pass
@@ -1120,11 +1135,13 @@ def sex_agnostic_full_inference(
         create_undersampled_dataset(df, label_col, 42) if use_undersampling else df
     )
     used_features = features
-    # If features correspond to Proposed, perform feature selection to maximize c-index
+    # If features correspond to Proposed/Advanced, perform feature selection to maximize c-index
     try:
-        if set(features) == set(FEATURE_SETS.get("Proposed", [])):
+        if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(features) == set(FEATURE_SETS.get("Advanced", [])):
             # Reuse from store if available; otherwise select once and store
-            selected = SELECTED_FEATURES_STORE.get("proposed_sex_agnostic")
+            is_proposed = set(features) == set(FEATURE_SETS.get("Proposed", []))
+            store_key = "proposed_sex_agnostic" if is_proposed else "advanced_sex_agnostic"
+            selected = SELECTED_FEATURES_STORE.get(store_key)
             if not selected:
                 selected = select_features_max_cindex_forward(
                     df_base,
@@ -1135,9 +1152,9 @@ def sex_agnostic_full_inference(
                     verbose=True,
                 )
                 if selected:
-                    SELECTED_FEATURES_STORE["proposed_sex_agnostic"] = list(selected)
+                    SELECTED_FEATURES_STORE[store_key] = list(selected)
                     print(
-                        f"[FS][Store] Proposed sex-agnostic features stored: {len(selected)}"
+                        f"[FS][Store] {'Proposed' if is_proposed else 'Advanced'} sex-agnostic features stored: {len(selected)}"
                     )
             if selected:
                 used_features = list(selected)
@@ -1202,17 +1219,22 @@ def evaluate_split(
             if use_undersampling
             else train_df
         )
-        # Feature selection only for Proposed set
+        # Feature selection only for Proposed/Advanced set
         if not disable_within_split_feature_selection:
             try:
-                if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
+                if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])) or set(feature_cols) == set(FEATURE_SETS.get("Advanced", [])):
                     selected = select_features_max_cindex_forward(
                         tr, list(feature_cols), time_col, event_col, random_state=seed
                     )
                     if selected:
                         used_features = selected
+                        model_name = (
+                            "Proposed"
+                            if set(feature_cols) == set(FEATURE_SETS.get("Proposed", []))
+                            else "Advanced"
+                        )
                         print(
-                            f"[FS] Sex-agnostic: selected {len(selected)} features for Proposed: {selected}"
+                            f"[FS] Sex-agnostic: selected {len(selected)} features for {model_name}: {selected}"
                         )
             except Exception:
                 pass
@@ -1289,9 +1311,9 @@ def evaluate_split(
             else:
                 used_features_m = used_features
                 if not disable_within_split_feature_selection:
-                    # Feature selection for Proposed per sex (male)
+                    # Feature selection for Proposed/Advanced per sex (male)
                     try:
-                        if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
+                        if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])) or set(feature_cols) == set(FEATURE_SETS.get("Advanced", [])):
                             selected_m = select_features_max_cindex_forward(
                                 tr_m,
                                 list(used_features),
@@ -1301,8 +1323,13 @@ def evaluate_split(
                             )
                             if selected_m:
                                 used_features_m = selected_m
+                                model_name = (
+                                    "Proposed"
+                                    if set(feature_cols) == set(FEATURE_SETS.get("Proposed", []))
+                                    else "Advanced"
+                                )
                                 print(
-                                    f"[FS] Sex-specific (male): selected {len(selected_m)} features for Proposed: {selected_m}"
+                                    f"[FS] Sex-specific (male): selected {len(selected_m)} features for {model_name}: {selected_m}"
                                 )
                     except Exception:
                         pass
@@ -1327,9 +1354,9 @@ def evaluate_split(
             else:
                 used_features_f = used_features
                 if not disable_within_split_feature_selection:
-                    # Feature selection for Proposed per sex (female)
+                    # Feature selection for Proposed/Advanced per sex (female)
                     try:
-                        if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
+                        if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])) or set(feature_cols) == set(FEATURE_SETS.get("Advanced", [])):
                             selected_f = select_features_max_cindex_forward(
                                 tr_f,
                                 list(used_features),
@@ -1339,8 +1366,13 @@ def evaluate_split(
                             )
                             if selected_f:
                                 used_features_f = selected_f
+                                model_name = (
+                                    "Proposed"
+                                    if set(feature_cols) == set(FEATURE_SETS.get("Proposed", []))
+                                    else "Advanced"
+                                )
                                 print(
-                                    f"[FS] Sex-specific (female): selected {len(selected_f)} features for Proposed: {selected_f}"
+                                    f"[FS] Sex-specific (female): selected {len(selected_f)} features for {model_name}: {selected_f}"
                                 )
                     except Exception:
                         pass
@@ -1452,6 +1484,9 @@ def conversion_and_imputation(
         "AAD",
         "CRT",
         "ICD",
+        # Newly added binary variables
+        "LGE_Circumural",
+        "LGE_Ring-Like",
     ]
     exist_bin = [c for c in binary_cols if c in df.columns]
     for c in exist_bin:
@@ -1591,6 +1626,34 @@ def load_dataframes() -> pd.DataFrame:
         "CRT",
         "ICD",
     ]
+    # Extend with newly introduced nominal/binary LGE columns when present
+    new_lge_nominal = [
+        "LGE_Basal anterior (0; No, 1; yes)",
+        "LGE_Basal anterior septum",
+        "LGE_Basal inferoseptum",
+        "LGE_Basal inferio",
+        "LGE_Basal inferolateral",
+        "LGE_Basal anterolateral",
+        "LGE_mid anterior",
+        "LGE_mid anterior septum",
+        "LGE_mid inferoseptum",
+        "LGE_mid inferior",
+        "LGE_mid inferolateral",
+        "LGE_mid anterolateral",
+        "LGE_apical anterior",
+        "LGE_apical septum",
+        "LGE_apical inferior",
+        "LGE_apical lateral",
+        "LGE_Apical cap",
+        "LGE_RV insertion site (1 superior, 2 inferior. 3 both)",
+        "LGE_Circumural",
+        "LGE_Ring-Like",
+    ]
+    # Normalize list to match earlier _normalize_column_name behavior
+    new_lge_nominal = [
+        _normalize_column_name(c) for c in new_lge_nominal
+    ]
+    categorical += [c for c in new_lge_nominal if c in nicm.columns]
     nicm[categorical] = nicm[categorical].astype("object")
     var = nicm.columns.tolist()
     labels = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
@@ -1657,9 +1720,10 @@ def run_cox_experiments(
             "female": [f for f in feature_cols if f != "Female"],
         }
 
-        # Only Proposed set uses selection; stabilize it once globally
+        # Only Proposed/Advanced sets use selection; stabilize them once globally
         try:
-            if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])):
+            if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])) or set(feature_cols) == set(FEATURE_SETS.get("Advanced", [])):
+                is_proposed = set(feature_cols) == set(FEATURE_SETS.get("Proposed", []))
                 # Sex-agnostic stabilization
                 sel_agn = stability_select_features(
                     df.dropna(subset=[time_col, event_col]).copy(),
@@ -1676,12 +1740,12 @@ def run_cox_experiments(
                     stable_agnostic_features[featset_name] = sel_agn
                     try:
                         if featset_name == "Proposed":
-                            SELECTED_FEATURES_STORE["proposed_sex_agnostic"] = list(
-                                sel_agn
-                            )
-                            print(
-                                f"[FS][Store] Proposed sex-agnostic features: {len(sel_agn)} selected"
-                            )
+                            SELECTED_FEATURES_STORE["proposed_sex_agnostic"] = list(sel_agn)
+                        elif featset_name == "Advanced":
+                            SELECTED_FEATURES_STORE["advanced_sex_agnostic"] = list(sel_agn)
+                        print(
+                            f"[FS][Store] {'Proposed' if is_proposed else 'Advanced'} sex-agnostic features: {len(sel_agn)} selected"
+                        )
                     except Exception:
                         pass
 
@@ -1725,24 +1789,24 @@ def run_cox_experiments(
                     stable_sex_specific_features[featset_name]["male"] = sel_m
                     try:
                         if featset_name == "Proposed":
-                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["male"] = (
-                                list(sel_m)
-                            )
-                            print(
-                                f"[FS][Store] Proposed male-specific features: {len(sel_m)} selected"
-                            )
+                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["male"] = list(sel_m)
+                        elif featset_name == "Advanced":
+                            SELECTED_FEATURES_STORE["advanced_sex_specific"]["male"] = list(sel_m)
+                        print(
+                            f"[FS][Store] {'Proposed' if is_proposed else 'Advanced'} male-specific features: {len(sel_m)} selected"
+                        )
                     except Exception:
                         pass
                 if sel_f:
                     stable_sex_specific_features[featset_name]["female"] = sel_f
                     try:
                         if featset_name == "Proposed":
-                            SELECTED_FEATURES_STORE["proposed_sex_specific"][
-                                "female"
-                            ] = list(sel_f)
-                            print(
-                                f"[FS][Store] Proposed female-specific features: {len(sel_f)} selected"
-                            )
+                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["female"] = list(sel_f)
+                        elif featset_name == "Advanced":
+                            SELECTED_FEATURES_STORE["advanced_sex_specific"]["female"] = list(sel_f)
+                        print(
+                            f"[FS][Store] {'Proposed' if is_proposed else 'Advanced'} female-specific features: {len(sel_f)} selected"
+                        )
                     except Exception:
                         pass
         except Exception:
@@ -2056,3 +2120,44 @@ if __name__ == "__main__":
 
     print("Running sex-specific full-data inference (excludes Female in submodels)...")
     _ = sex_specific_full_inference(df, features)
+
+    # =============================
+    # Print features used by models
+    # =============================
+    try:
+        print("\n==== Features used by each model ====")
+        # Guideline/Benchmark/DERIVATIVE: no feature selection
+        gl_feats = FEATURE_SETS.get("Guideline", [])
+        bm_feats = FEATURE_SETS.get("Benchmark", [])
+        dv_feats = FEATURE_SETS.get("DERIVATIVE", [])
+        print(f"Guideline (sex-agnostic): {gl_feats}")
+        print(f"Benchmark (sex-agnostic): {bm_feats}")
+        print(f"DERIVATIVE (sex-agnostic): {dv_feats}")
+
+        # Proposed: sex-agnostic + sex-specific if available
+        prop_agn = SELECTED_FEATURES_STORE.get("proposed_sex_agnostic")
+        prop_agn = prop_agn if prop_agn else FEATURE_SETS.get("Proposed", [])
+        prop_m = SELECTED_FEATURES_STORE.get("proposed_sex_specific", {}).get("male")
+        prop_f = SELECTED_FEATURES_STORE.get("proposed_sex_specific", {}).get("female")
+        if not prop_m:
+            prop_m = [f for f in FEATURE_SETS.get("Proposed", []) if f != "Female"]
+        if not prop_f:
+            prop_f = [f for f in FEATURE_SETS.get("Proposed", []) if f != "Female"]
+        print(f"Proposed (sex-agnostic): {prop_agn}")
+        print(f"Proposed (male-specific): {prop_m}")
+        print(f"Proposed (female-specific): {prop_f}")
+
+        # Advanced: sex-agnostic + sex-specific if available
+        adv_agn = SELECTED_FEATURES_STORE.get("advanced_sex_agnostic")
+        adv_agn = adv_agn if adv_agn else FEATURE_SETS.get("Advanced", [])
+        adv_m = SELECTED_FEATURES_STORE.get("advanced_sex_specific", {}).get("male")
+        adv_f = SELECTED_FEATURES_STORE.get("advanced_sex_specific", {}).get("female")
+        if not adv_m:
+            adv_m = [f for f in FEATURE_SETS.get("Advanced", []) if f != "Female"]
+        if not adv_f:
+            adv_f = [f for f in FEATURE_SETS.get("Advanced", []) if f != "Female"]
+        print(f"Advanced (sex-agnostic): {adv_agn}")
+        print(f"Advanced (male-specific): {adv_m}")
+        print(f"Advanced (female-specific): {adv_f}")
+    except Exception as e:
+        warnings.warn(f"[Main] Failed to print feature sets: {e}")
