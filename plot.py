@@ -40,6 +40,52 @@ def _is_sex_specific(model_label: str) -> bool:
     return bool(re.search(r"\bsex[-\s]*specific\b", str(model_label), flags=re.IGNORECASE))
 
 
+# ---------- Styling helpers (for nicer aesthetics) ----------
+def _apply_pretty_style(context: str = "talk", font_scale: float = 0.95) -> None:
+    """Set a clean, publication-friendly seaborn/matplotlib style."""
+    sns.set_theme(style="whitegrid", context=context)
+    sns.set_context(context=context, font_scale=font_scale)
+    plt.rcParams.update(
+        {
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.grid": True,
+            "axes.axisbelow": True,
+            "grid.alpha": 0.25,
+            "grid.linestyle": "--",
+            "axes.edgecolor": "0.5",
+            "axes.linewidth": 1.0,
+            "legend.frameon": False,
+        }
+    )
+
+
+def _build_color_mapping(model_names):
+    """Return (unique_base_models, base_to_color) with a colorblind-safe palette."""
+    base_models = [_clean_base_model_name(m) for m in model_names]
+    unique_base_models = list(dict.fromkeys(base_models))
+    color_palette = sns.color_palette("colorblind", n_colors=len(unique_base_models))
+    base_to_color = {bm: color_palette[i] for i, bm in enumerate(unique_base_models)}
+    return base_models, unique_base_models, base_to_color
+
+
+def _overall_y_bounds(df: pd.DataFrame) -> tuple[float, float]:
+    """Compute overall [min(lower), max(upper)] across all value cells."""
+    min_lower, max_upper = np.inf, -np.inf
+    for _, row in df.iterrows():
+        for col in df.columns[1:]:
+            mean, lower, upper = parse_value(row[col])
+            if np.isfinite(lower):
+                min_lower = min(min_lower, lower)
+            if np.isfinite(upper):
+                max_upper = max(max_upper, upper)
+    if not np.isfinite(min_lower) or not np.isfinite(max_upper):
+        return 0.0, 1.0
+    # Add a small visual headroom
+    margin = max(0.02, (max_upper - min_lower) * 0.04)
+    return min_lower - margin, max_upper + margin
+
+
 # Function to create subplots per metric, x-axis = [all, male, female]; color = model
 def plot_metrics_with_ci_groups(df):
     # Expect rows repeating by [All, Male, Female] for each metric
@@ -72,18 +118,26 @@ def plot_metrics_with_ci_groups(df):
     group_names = ["ALL", "MALE", "FEMALE"]
 
     # Determine base models and assign consistent colors to each base model
-    base_models = [_clean_base_model_name(m) for m in models]
-    unique_base_models = list(dict.fromkeys(base_models))  # preserve order
-    color_palette = sns.color_palette("Set2", n_colors=len(unique_base_models))
-    base_to_color = {bm: color_palette[i] for i, bm in enumerate(unique_base_models)}
+    base_models, unique_base_models, base_to_color = _build_color_mapping(models)
 
     num_metrics = num_rows // 3
 
-    sns.set_theme(style="whitegrid")
+    _apply_pretty_style(context="talk", font_scale=0.95)
 
-    fig, axs = plt.subplots(1, num_metrics, figsize=(5 * num_metrics, 6), sharey=True)
+    fig, axs = plt.subplots(
+        1,
+        num_metrics,
+        figsize=(5.6 * num_metrics + 1.5, 5.4),
+        sharey=True,
+    )
     if num_metrics == 1:
         axs = [axs]
+
+    # Reserve room for legends on the right
+    fig.subplots_adjust(right=0.80)
+
+    # Consistent y-range across subplots
+    y_min, y_max = _overall_y_bounds(df)
 
     for metric_index in range(num_metrics):
         # Rows for this metric: All, Male, Female (in order)
@@ -95,7 +149,8 @@ def plot_metrics_with_ci_groups(df):
 
         # x-axis: groups (all, male, female)
         x = np.arange(len(group_names))
-        width = 0.8 / max(num_models, 1)
+        group_width = 0.78
+        width = group_width / max(num_models, 1)
 
         ax = axs[metric_index]
 
@@ -119,18 +174,20 @@ def plot_metrics_with_ci_groups(df):
                 width,
                 color=base_to_color.get(base_name, "C0"),
                 yerr=[lowers, uppers],
-                capsize=3,
+                error_kw={"ecolor": "0.3", "lw": 1.2, "capthick": 1.2, "capsize": 3},
                 hatch=hatch_style,
-                edgecolor="black",
-                linewidth=0.6,
+                edgecolor="0.35",
+                linewidth=0.8,
+                alpha=0.95,
             )
 
         ax.set_xticks(x)
-        ax.set_xticklabels(group_names, ha="center", fontsize=12)
+        ax.set_xticklabels(group_names, ha="center", fontsize=13)
 
-        ax.set_ylabel("Metric Value", fontsize=12)
-        ax.set_title(metric_label, fontsize=14)
+        ax.set_ylabel("Metric Value", fontsize=13)
+        ax.set_title(metric_label, fontsize=18, weight="bold")
         ax.grid(axis="y", linestyle="--", alpha=0.3)
+        ax.set_ylim(y_min, y_max)
 
     # Dual legends: colors for models, hatch for type (sex-agnostic vs sex-specific)
     color_handles = [
@@ -146,7 +203,7 @@ def plot_metrics_with_ci_groups(df):
     leg1 = fig.legend(
         handles=color_handles,
         loc="upper left",
-        bbox_to_anchor=(1.02, 1.0),
+        bbox_to_anchor=(0.83, 1.0),
         title="Model",
         fontsize=12,
         title_fontsize=12,
@@ -157,18 +214,19 @@ def plot_metrics_with_ci_groups(df):
     fig.legend(
         handles=hatch_handles,
         loc="lower left",
-        bbox_to_anchor=(1.02, 0.0),
+        bbox_to_anchor=(0.83, 0.0),
         title="Type",
         fontsize=12,
         title_fontsize=12,
         frameon=False,
     )
 
-    plt.tight_layout(rect=[0, 0, 0.75, 1])
+    sns.despine()
+    plt.tight_layout()
     plt.show()
 
 
-def plot_single_metric_rows_as_models(df, metric_title="Metric"):
+def plot_single_metric_rows_as_models(df, metric_title="Metric", save_path: str | None = None):
     """
     Plot a single metric from a table where:
     - Column 0 contains row names (treated as model labels)
@@ -187,16 +245,20 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
     num_models = len(model_labels)
     num_groups = len(group_names)
 
-    sns.set_theme(style="whitegrid")
-    fig, ax = plt.subplots(1, 1, figsize=(6.5, 6))
+    _apply_pretty_style(context="talk", font_scale=1.0)
+    fig, ax = plt.subplots(1, 1, figsize=(7.2, 5.6))
 
     x = np.arange(num_groups)
-    width = 0.8 / max(num_models, 1)
+    group_width = 0.78
+    width = group_width / max(num_models, 1)
     # Determine base models and assign colors consistently per base model
-    base_model_labels = [_clean_base_model_name(m) for m in model_labels]
-    unique_base_models = list(dict.fromkeys(base_model_labels))
-    color_palette = sns.color_palette("Set2", n_colors=len(unique_base_models))
-    base_to_color = {bm: color_palette[i] for i, bm in enumerate(unique_base_models)}
+    base_model_labels, unique_base_models, base_to_color = _build_color_mapping(
+        model_labels
+    )
+
+    # Reserve room for legends on the right and set consistent y range
+    fig.subplots_adjust(right=0.80)
+    y_min, y_max = _overall_y_bounds(df)
 
     for model_index, model_label in enumerate(model_labels):
         row = df.iloc[model_index]
@@ -221,18 +283,20 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
             width,
             color=base_to_color.get(base_name, "C0"),
             yerr=[lower_errors_for_groups, upper_errors_for_groups],
-            capsize=3,
+            error_kw={"ecolor": "0.3", "lw": 1.2, "capthick": 1.2, "capsize": 3},
             hatch=hatch_style,
-            edgecolor="black",
-            linewidth=0.6,
+            edgecolor="0.35",
+            linewidth=0.8,
+            alpha=0.95,
         )
 
     ax.set_xticks(x)
-    ax.set_xticklabels([c.upper() for c in df.columns[1:]], ha="center", fontsize=15)
+    ax.set_xticklabels([c.upper() for c in df.columns[1:]], ha="center", fontsize=14)
 
-    ax.set_ylabel("Metric Value", fontsize=15)
-    ax.set_title(metric_title, fontsize=18)
+    ax.set_ylabel("Metric Value", fontsize=14)
+    ax.set_title(metric_title, fontsize=20, weight="bold")
     ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.set_ylim(y_min, y_max)
 
     # Dual legends: colors for base models; hatch indicates sex-specific vs agnostic
     color_handles = [
@@ -247,7 +311,7 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
     leg1 = fig.legend(
         handles=color_handles,
         loc="upper left",
-        bbox_to_anchor=(1.02, 1.0),
+        bbox_to_anchor=(0.83, 1.0),
         title="Model",
         fontsize=15,
         title_fontsize=15,
@@ -258,14 +322,17 @@ def plot_single_metric_rows_as_models(df, metric_title="Metric"):
     fig.legend(
         handles=hatch_handles,
         loc="lower left",
-        bbox_to_anchor=(1.02, 0.0),
+        bbox_to_anchor=(0.83, 0.0),
         title="Type",
         fontsize=15,
         title_fontsize=15,
         frameon=False,
     )
 
-    plt.tight_layout(rect=[0, 0, 0.75, 1])
+    sns.despine()
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.show()
 
 
