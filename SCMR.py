@@ -945,7 +945,7 @@ def sex_specific_full_inference(
 
     if not data_m.empty:
         used_features_m = list(used_features)
-        # Feature selection only if this is the Proposed or Advanced set
+        # Use stabilized selection once, then freeze; only for Proposed/Advanced
         try:
             if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(features) == set(FEATURE_SETS.get("Advanced", [])):
                 store_key = (
@@ -955,12 +955,18 @@ def sex_specific_full_inference(
                 )
                 selected_m = SELECTED_FEATURES_STORE.get(store_key, {}).get("male")
                 if not selected_m:
-                    selected_m = select_features_max_cindex_forward(
-                        data_m,
-                        list(used_features),
-                        "PE_Time",
-                        "VT/VF/SCD",
-                        random_state=42,
+                    # Stabilize across multiple seeds and cache
+                    seeds_for_stability = list(range(20))
+                    base_feats_m = [f for f in used_features if f != "Female"]
+                    selected_m = stability_select_features(
+                        df=data_m,
+                        candidate_features=list(base_feats_m),
+                        time_col="PE_Time",
+                        event_col="VT/VF/SCD",
+                        seeds=seeds_for_stability,
+                        max_features=None,
+                        threshold=0.4,
+                        min_features=None,
                         verbose=True,
                     )
                     if selected_m:
@@ -992,7 +998,7 @@ def sex_specific_full_inference(
         )
     if not data_f.empty:
         used_features_f = list(used_features)
-        # Feature selection only if this is the Proposed or Advanced set
+        # Use stabilized selection once, then freeze; only for Proposed/Advanced
         try:
             if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(features) == set(FEATURE_SETS.get("Advanced", [])):
                 store_key = (
@@ -1002,12 +1008,18 @@ def sex_specific_full_inference(
                 )
                 selected_f = SELECTED_FEATURES_STORE.get(store_key, {}).get("female")
                 if not selected_f:
-                    selected_f = select_features_max_cindex_forward(
-                        data_f,
-                        list(used_features),
-                        "PE_Time",
-                        "VT/VF/SCD",
-                        random_state=42,
+                    # Stabilize across multiple seeds and cache
+                    seeds_for_stability = list(range(20))
+                    base_feats_f = [f for f in used_features if f != "Female"]
+                    selected_f = stability_select_features(
+                        df=data_f,
+                        candidate_features=list(base_feats_f),
+                        time_col="PE_Time",
+                        event_col="VT/VF/SCD",
+                        seeds=seeds_for_stability,
+                        max_features=None,
+                        threshold=0.4,
+                        min_features=None,
                         verbose=True,
                     )
                     if selected_f:
@@ -1135,20 +1147,23 @@ def sex_agnostic_full_inference(
         create_undersampled_dataset(df, label_col, 42) if use_undersampling else df
     )
     used_features = features
-    # If features correspond to Proposed/Advanced, perform feature selection to maximize c-index
+    # If features correspond to Proposed/Advanced, perform stability selection ONCE and freeze
     try:
         if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(features) == set(FEATURE_SETS.get("Advanced", [])):
-            # Reuse from store if available; otherwise select once and store
             is_proposed = set(features) == set(FEATURE_SETS.get("Proposed", []))
             store_key = "proposed_sex_agnostic" if is_proposed else "advanced_sex_agnostic"
             selected = SELECTED_FEATURES_STORE.get(store_key)
             if not selected:
-                selected = select_features_max_cindex_forward(
-                    df_base,
-                    list(features),
-                    "PE_Time",
-                    label_col,
-                    random_state=42,
+                seeds_for_stability = list(range(20))
+                selected = stability_select_features(
+                    df=df_base.dropna(subset=["PE_Time", label_col]).copy(),
+                    candidate_features=list(features),
+                    time_col="PE_Time",
+                    event_col=label_col,
+                    seeds=seeds_for_stability,
+                    max_features=None,
+                    threshold=0.4,
+                    min_features=None,
                     verbose=True,
                 )
                 if selected:
@@ -1239,8 +1254,10 @@ def evaluate_split(
             except Exception:
                 pass
         cph = fit_cox_model(tr, used_features, time_col, event_col)
+        # Threshold must be derived from training risks (avoid test leakage)
+        tr_risk = predict_risk(cph, tr, used_features)
+        thr = threshold_by_top_quantile(tr_risk, 0.5)
         risk_scores = predict_risk(cph, test_df, used_features)
-        thr = threshold_by_top_quantile(risk_scores, 0.5)
         pred = (risk_scores >= thr).astype(int)
         cidx = concordance_index(test_df[time_col], -risk_scores, test_df[event_col])
         return pred, risk_scores, {"c_index": cidx}
@@ -1257,8 +1274,10 @@ def evaluate_split(
                 {"c_index": np.nan},
             )
         cph = fit_cox_model(tr_m, used_features, time_col, event_col)
+        # Threshold from training male subset
+        tr_risk_m = predict_risk(cph, tr_m, used_features)
+        thr = threshold_by_top_quantile(tr_risk_m, 0.5)
         risk_m = predict_risk(cph, te_m, used_features)
-        thr = threshold_by_top_quantile(risk_m, 0.5)
         pred_m = (risk_m >= thr).astype(int)
         pred = np.zeros(len(test_df), dtype=int)
         risk_scores = np.zeros(len(test_df))
@@ -1280,8 +1299,10 @@ def evaluate_split(
                 {"c_index": np.nan},
             )
         cph = fit_cox_model(tr_f, used_features, time_col, event_col)
+        # Threshold from training female subset
+        tr_risk_f = predict_risk(cph, tr_f, used_features)
+        thr = threshold_by_top_quantile(tr_risk_f, 0.5)
         risk_f = predict_risk(cph, te_f, used_features)
-        thr = threshold_by_top_quantile(risk_f, 0.5)
         pred_f = (risk_f >= thr).astype(int)
         pred = np.zeros(len(test_df), dtype=int)
         risk_scores = np.zeros(len(test_df))
@@ -1334,8 +1355,10 @@ def evaluate_split(
                     except Exception:
                         pass
             cph_m = fit_cox_model(tr_m, used_features_m, time_col, event_col)
+            # Threshold from training male subset
+            tr_risk_m = predict_risk(cph_m, tr_m, used_features_m)
+            thr_m = threshold_by_top_quantile(tr_risk_m, 0.5)
             risk_m = predict_risk(cph_m, te_m, used_features_m)
-            thr_m = threshold_by_top_quantile(risk_m, 0.5)
             pred_m = (risk_m >= thr_m).astype(int)
             mask_m = test_df["Female"].values == 0
             pred[mask_m] = pred_m
@@ -1377,8 +1400,10 @@ def evaluate_split(
                     except Exception:
                         pass
             cph_f = fit_cox_model(tr_f, used_features_f, time_col, event_col)
+            # Threshold from training female subset
+            tr_risk_f = predict_risk(cph_f, tr_f, used_features_f)
+            thr_f = threshold_by_top_quantile(tr_risk_f, 0.5)
             risk_f = predict_risk(cph_f, te_f, used_features_f)
-            thr_f = threshold_by_top_quantile(risk_f, 0.5)
             pred_f = (risk_f >= thr_f).astype(int)
             mask_f = test_df["Female"].values == 1
             pred[mask_f] = pred_f
