@@ -847,6 +847,44 @@ def stability_select_features(
     return []
 
 
+def compute_shared_features(
+    df: pd.DataFrame,
+    base_features: List[str],
+    time_col: str = "PE_Time",
+    event_col: str = "VT/VF/SCD",
+    seeds: List[int] = None,
+    threshold: float = 0.4,
+    verbose: bool = True,
+) -> List[str]:
+    """Compute a single, shared feature set to be used for both sexes.
+
+    - Excludes `Female` from candidates.
+    - Runs stability selection on the full cohort (male+female together) to
+      produce a consistent subset. Falls back to the provided candidates when
+      selection yields empty.
+    """
+    if seeds is None:
+        seeds = list(range(20))
+    candidates = [f for f in base_features if f != "Female"]
+    try:
+        sel = stability_select_features(
+            df=df.dropna(subset=[time_col, event_col]).copy(),
+            candidate_features=list(candidates),
+            time_col=time_col,
+            event_col=event_col,
+            seeds=seeds,
+            max_features=None,
+            threshold=threshold,
+            min_features=None,
+            verbose=verbose,
+        )
+        if sel:
+            return list(sel)
+    except Exception:
+        pass
+    return list(candidates)
+
+
 def sex_specific_inference(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -858,7 +896,34 @@ def sex_specific_inference(
     Assumes survival labels/time are in the input dataframes (uses PE_Time and VT/VF/SCD).
     Female is excluded from features for single-sex models.
     """
-    used_features = [f for f in features if f != "Female"]
+    # Build one shared feature set for both sexes (exclude Female)
+    base_candidates = [f for f in features if f != "Female"]
+    try:
+        # Unify features for Proposed/Advanced using stability selection once
+        if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(features) == set(
+            FEATURE_SETS.get("Advanced", [])
+        ):
+            is_proposed = set(features) == set(FEATURE_SETS.get("Proposed", []))
+            shared_features = compute_shared_features(
+                df=train_df,
+                base_features=base_candidates,
+                time_col="PE_Time",
+                event_col="VT/VF/SCD",
+                seeds=list(range(20)),
+                threshold=0.4,
+                verbose=True,
+            )
+            # Cache into store for traceability/consistency
+            store_key = "proposed_sex_specific" if is_proposed else "advanced_sex_specific"
+            try:
+                SELECTED_FEATURES_STORE[store_key]["male"] = list(shared_features)
+                SELECTED_FEATURES_STORE[store_key]["female"] = list(shared_features)
+            except Exception:
+                pass
+        else:
+            shared_features = list(base_candidates)
+    except Exception:
+        shared_features = list(base_candidates)
 
     train_m = (
         train_df[train_df["Female"] == 0].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
@@ -873,8 +938,8 @@ def sex_specific_inference(
     thresholds = {}
 
     if not train_m.empty:
-        cph_m = fit_cox_model(train_m, used_features, "PE_Time", "VT/VF/SCD")
-        tr_risk_m = predict_risk(cph_m, train_m, used_features)
+        cph_m = fit_cox_model(train_m, shared_features, "PE_Time", "VT/VF/SCD")
+        tr_risk_m = predict_risk(cph_m, train_m, shared_features)
         thresholds["male"] = float(np.nanmedian(tr_risk_m))
         models["male"] = cph_m
         plot_cox_coefficients(
@@ -886,8 +951,8 @@ def sex_specific_inference(
             effect_scale="per_sd",
         )
     if not train_f.empty:
-        cph_f = fit_cox_model(train_f, used_features, "PE_Time", "VT/VF/SCD")
-        tr_risk_f = predict_risk(cph_f, train_f, used_features)
+        cph_f = fit_cox_model(train_f, shared_features, "PE_Time", "VT/VF/SCD")
+        tr_risk_f = predict_risk(cph_f, train_f, shared_features)
         thresholds["female"] = float(np.nanmedian(tr_risk_f))
         models["female"] = cph_f
         plot_cox_coefficients(
@@ -901,13 +966,13 @@ def sex_specific_inference(
 
     df_out = test_df.copy()
     if "male" in models and not test_m.empty:
-        risk_m = predict_risk(models["male"], test_m, used_features)
+        risk_m = predict_risk(models["male"], test_m, shared_features)
         df_out.loc[df_out["Female"] == 0, "pred_prob"] = risk_m
         df_out.loc[df_out["Female"] == 0, "pred_label"] = (
             risk_m >= thresholds["male"]
         ).astype(int)
     if "female" in models and not test_f.empty:
-        risk_f = predict_risk(models["female"], test_f, used_features)
+        risk_f = predict_risk(models["female"], test_f, shared_features)
         df_out.loc[df_out["Female"] == 1, "pred_prob"] = risk_f
         df_out.loc[df_out["Female"] == 1, "pred_label"] = (
             risk_f >= thresholds["female"]
@@ -935,7 +1000,32 @@ def sex_specific_full_inference(
     - Excludes Female from submodel features
     - Dichotomizes by sex-specific median risks
     """
-    used_features = [f for f in features if f != "Female"]
+    # Build one shared feature set for both sexes (exclude Female)
+    base_candidates = [f for f in features if f != "Female"]
+    try:
+        if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(features) == set(
+            FEATURE_SETS.get("Advanced", [])
+        ):
+            is_proposed = set(features) == set(FEATURE_SETS.get("Proposed", []))
+            shared_features = compute_shared_features(
+                df=df,
+                base_features=base_candidates,
+                time_col="PE_Time",
+                event_col="VT/VF/SCD",
+                seeds=list(range(20)),
+                threshold=0.4,
+                verbose=True,
+            )
+            store_key = "proposed_sex_specific" if is_proposed else "advanced_sex_specific"
+            try:
+                SELECTED_FEATURES_STORE[store_key]["male"] = list(shared_features)
+                SELECTED_FEATURES_STORE[store_key]["female"] = list(shared_features)
+            except Exception:
+                pass
+        else:
+            shared_features = list(base_candidates)
+    except Exception:
+        shared_features = list(base_candidates)
 
     data_m = df[df["Female"] == 0].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
     data_f = df[df["Female"] == 1].dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
@@ -944,46 +1034,7 @@ def sex_specific_full_inference(
     thresholds = {}
 
     if not data_m.empty:
-        used_features_m = list(used_features)
-        # Use stabilized selection once, then freeze; only for Proposed/Advanced
-        try:
-            if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(features) == set(FEATURE_SETS.get("Advanced", [])):
-                store_key = (
-                    "proposed_sex_specific"
-                    if set(features) == set(FEATURE_SETS.get("Proposed", []))
-                    else "advanced_sex_specific"
-                )
-                selected_m = SELECTED_FEATURES_STORE.get(store_key, {}).get("male")
-                if not selected_m:
-                    # Stabilize across multiple seeds and cache
-                    seeds_for_stability = list(range(20))
-                    base_feats_m = [f for f in used_features if f != "Female"]
-                    selected_m = stability_select_features(
-                        df=data_m,
-                        candidate_features=list(base_feats_m),
-                        time_col="PE_Time",
-                        event_col="VT/VF/SCD",
-                        seeds=seeds_for_stability,
-                        max_features=None,
-                        threshold=0.4,
-                        min_features=None,
-                        verbose=True,
-                    )
-                    if selected_m:
-                        try:
-                            SELECTED_FEATURES_STORE[store_key]["male"] = list(selected_m)
-                            model_name = (
-                                "Proposed" if store_key == "proposed_sex_specific" else "Advanced"
-                            )
-                            print(
-                                f"[FS][Store] {model_name} male-specific features stored: {len(selected_m)}"
-                            )
-                        except Exception:
-                            pass
-                if selected_m:
-                    used_features_m = list(selected_m)
-        except Exception:
-            pass
+        used_features_m = list(shared_features)
         cph_m = fit_cox_model(data_m, used_features_m, "PE_Time", "VT/VF/SCD")
         r_m = predict_risk(cph_m, data_m, used_features_m)
         thresholds["male"] = float(np.nanmedian(r_m))
@@ -997,46 +1048,7 @@ def sex_specific_full_inference(
             effect_scale="per_sd",
         )
     if not data_f.empty:
-        used_features_f = list(used_features)
-        # Use stabilized selection once, then freeze; only for Proposed/Advanced
-        try:
-            if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(features) == set(FEATURE_SETS.get("Advanced", [])):
-                store_key = (
-                    "proposed_sex_specific"
-                    if set(features) == set(FEATURE_SETS.get("Proposed", []))
-                    else "advanced_sex_specific"
-                )
-                selected_f = SELECTED_FEATURES_STORE.get(store_key, {}).get("female")
-                if not selected_f:
-                    # Stabilize across multiple seeds and cache
-                    seeds_for_stability = list(range(20))
-                    base_feats_f = [f for f in used_features if f != "Female"]
-                    selected_f = stability_select_features(
-                        df=data_f,
-                        candidate_features=list(base_feats_f),
-                        time_col="PE_Time",
-                        event_col="VT/VF/SCD",
-                        seeds=seeds_for_stability,
-                        max_features=None,
-                        threshold=0.4,
-                        min_features=None,
-                        verbose=True,
-                    )
-                    if selected_f:
-                        try:
-                            SELECTED_FEATURES_STORE[store_key]["female"] = list(selected_f)
-                            model_name = (
-                                "Proposed" if store_key == "proposed_sex_specific" else "Advanced"
-                            )
-                            print(
-                                f"[FS][Store] {model_name} female-specific features stored: {len(selected_f)}"
-                            )
-                        except Exception:
-                            pass
-                if selected_f:
-                    used_features_f = list(selected_f)
-        except Exception:
-            pass
+        used_features_f = list(shared_features)
         cph_f = fit_cox_model(data_f, used_features_f, "PE_Time", "VT/VF/SCD")
         r_f = predict_risk(cph_f, data_f, used_features_f)
         thresholds["female"] = float(np.nanmedian(r_f))
@@ -1774,63 +1786,32 @@ def run_cox_experiments(
                     except Exception:
                         pass
 
-                # Sex-specific stabilization per sex
-                df_m = df[df["Female"] == 0].dropna(subset=[time_col, event_col]).copy()
-                df_f = df[df["Female"] == 1].dropna(subset=[time_col, event_col]).copy()
+                # Sex-specific stabilization: compute ONE shared set across all data
                 base_feats = [f for f in feature_cols if f != "Female"]
-
-                sel_m = (
-                    stability_select_features(
-                        df=df_m,
-                        candidate_features=list(base_feats),
-                        time_col=time_col,
-                        event_col=event_col,
-                        seeds=seeds_for_stability,
-                        max_features=None,
-                        threshold=0.4,
-                        min_features=None,
-                        verbose=True,
-                    )
-                    if not df_m.empty
-                    else []
-                )
-                sel_f = (
-                    stability_select_features(
-                        df=df_f,
-                        candidate_features=list(base_feats),
-                        time_col=time_col,
-                        event_col=event_col,
-                        seeds=seeds_for_stability,
-                        max_features=None,
-                        threshold=0.4,
-                        min_features=None,
-                        verbose=True,
-                    )
-                    if not df_f.empty
-                    else []
+                sel_shared = stability_select_features(
+                    df=df.dropna(subset=[time_col, event_col]).copy(),
+                    candidate_features=list(base_feats),
+                    time_col=time_col,
+                    event_col=event_col,
+                    seeds=seeds_for_stability,
+                    max_features=None,
+                    threshold=0.4,
+                    min_features=None,
+                    verbose=True,
                 )
 
-                if sel_m:
-                    stable_sex_specific_features[featset_name]["male"] = sel_m
+                if sel_shared:
+                    stable_sex_specific_features[featset_name]["male"] = sel_shared
+                    stable_sex_specific_features[featset_name]["female"] = sel_shared
                     try:
                         if featset_name == "Proposed":
-                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["male"] = list(sel_m)
+                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["male"] = list(sel_shared)
+                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["female"] = list(sel_shared)
                         elif featset_name == "Advanced":
-                            SELECTED_FEATURES_STORE["advanced_sex_specific"]["male"] = list(sel_m)
+                            SELECTED_FEATURES_STORE["advanced_sex_specific"]["male"] = list(sel_shared)
+                            SELECTED_FEATURES_STORE["advanced_sex_specific"]["female"] = list(sel_shared)
                         print(
-                            f"[FS][Store] {'Proposed' if is_proposed else 'Advanced'} male-specific features: {len(sel_m)} selected"
-                        )
-                    except Exception:
-                        pass
-                if sel_f:
-                    stable_sex_specific_features[featset_name]["female"] = sel_f
-                    try:
-                        if featset_name == "Proposed":
-                            SELECTED_FEATURES_STORE["proposed_sex_specific"]["female"] = list(sel_f)
-                        elif featset_name == "Advanced":
-                            SELECTED_FEATURES_STORE["advanced_sex_specific"]["female"] = list(sel_f)
-                        print(
-                            f"[FS][Store] {'Proposed' if is_proposed else 'Advanced'} female-specific features: {len(sel_f)} selected"
+                            f"[FS][Store] {'Proposed' if is_proposed else 'Advanced'} shared sex-specific features: {len(sel_shared)} selected"
                         )
                     except Exception:
                         pass
