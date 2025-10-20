@@ -1,6 +1,8 @@
 import os
 import warnings
 import re
+import json
+import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -121,6 +123,7 @@ def plot_cox_coefficients(
     red_features: List[str] = None,
     reference_df: pd.DataFrame = None,
     effect_scale: str = "raw",  # one of {"raw", "per_sd", "per_iqr"}
+    save_path: str = None,
 ) -> None:
     """Plot Cox coefficients with optional standardized scaling.
 
@@ -212,10 +215,19 @@ def plot_cox_coefficients(
     plt.ylabel(ylabel)
     plt.title(title)
     plt.tight_layout()
+    if save_path:
+        try:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        except Exception:
+            pass
     plt.close()
 
 
-def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame) -> None:
+def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame, save_path: str = None) -> None:
     """Plot KM curves in two subplots (Male left, Female right) using Primary Endpoint (PE).
     Each subplot contains two curves: Low risk (pred0) and High risk (pred1), with within-sex log-rank test.
     """
@@ -285,7 +297,483 @@ def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame) -> None:
 
     plt.suptitle("Primary Endpoint - Survival by Gender and Risk Group", y=1.02)
     plt.tight_layout()
+    if save_path:
+        try:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        except Exception:
+            pass
     plt.close()
+
+
+# ==========================================
+# Persistence and evaluation helpers
+# ==========================================
+
+
+def _ensure_dir(path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _save_pickle(obj: Any, path: str) -> None:
+    _ensure_dir(os.path.dirname(path))
+    try:
+        with open(path, "wb") as f:
+            pickle.dump(obj, f)
+    except Exception:
+        warnings.warn(f"[Save] Failed to pickle object to {path}")
+
+
+def _save_json(obj: Any, path: str) -> None:
+    _ensure_dir(os.path.dirname(path))
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, ensure_ascii=False)
+    except Exception:
+        warnings.warn(f"[Save] Failed to write JSON to {path}")
+
+
+def _safe_cindex(t: np.ndarray, e: np.ndarray, r: np.ndarray) -> float:
+    try:
+        if t is None or e is None or r is None:
+            return float("nan")
+        t = np.asarray(t)
+        e = np.asarray(e)
+        r = np.asarray(r)
+        if len(t) < 2:
+            return float("nan")
+        if np.all(~np.isfinite(r)) or np.allclose(r, r[0], equal_nan=True):
+            return float("nan")
+        return float(concordance_index(t, -r, e))
+    except Exception:
+        return float("nan")
+
+
+def _compute_logrank_pvalues_by_gender(df_with_preds: pd.DataFrame) -> Dict[str, float]:
+    out: Dict[str, float] = {"male": float("nan"), "female": float("nan")}
+    try:
+        ep_time_col, ep_event_col = "PE_Time", "PE"
+        for sex_val, key in [(0, "male"), (1, "female")]:
+            subset = df_with_preds[df_with_preds["Female"] == sex_val]
+            if subset.empty:
+                out[key] = float("nan")
+                continue
+            low = subset[subset["pred_label"] == 0]
+            high = subset[subset["pred_label"] == 1]
+            if low.empty or high.empty:
+                out[key] = float("nan")
+                continue
+            lr = logrank_test(
+                low[ep_time_col], high[ep_time_col], low[ep_event_col], high[ep_event_col]
+            )
+            out[key] = float(lr.p_value)
+    except Exception:
+        pass
+    return out
+
+
+def stratified_train_test_split_by_columns(
+    df: pd.DataFrame,
+    cols: List[str],
+    test_size: float = 0.2,
+    random_state: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Stratify by combined categories in cols. Robustly falls back if needed."""
+    df_local = df.copy()
+    for c in cols:
+        if c not in df_local.columns:
+            raise ValueError(f"Missing stratification column: {c}")
+    # Build combined label; convert to string to avoid NaNs
+    combo = (
+        df_local[cols]
+        .astype(str)
+        .agg("|".join, axis=1)
+        .fillna("missing")
+    )
+    try:
+        tr, te = train_test_split(
+            df_local, test_size=test_size, random_state=random_state, stratify=combo
+        )
+        return tr.reset_index(drop=True), te.reset_index(drop=True)
+    except Exception:
+        # iterative fallback: use fewer columns
+        for k in range(len(cols) - 1, -1, -1):
+            try_cols = cols[:k]
+            if not try_cols:
+                break
+            try:
+                combo2 = (
+                    df_local[try_cols]
+                    .astype(str)
+                    .agg("|".join, axis=1)
+                    .fillna("missing")
+                )
+                tr, te = train_test_split(
+                    df_local,
+                    test_size=test_size,
+                    random_state=random_state,
+                    stratify=combo2,
+                )
+                return tr.reset_index(drop=True), te.reset_index(drop=True)
+            except Exception:
+                continue
+        # last resort no stratify
+        tr, te = train_test_split(
+            df_local, test_size=test_size, random_state=random_state
+        )
+        return tr.reset_index(drop=True), te.reset_index(drop=True)
+
+
+def run_heldout_training_and_evaluation(
+    df: pd.DataFrame,
+    feature_sets: Dict[str, List[str]],
+    time_col: str = "PE_Time",
+    event_col: str = "VT/VF/SCD",
+    results_dir: str = None,
+    test_size: float = 0.2,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Train models on a single held-out split and evaluate on test.
+
+    - Stratifies by Female/PE/ICD when possible
+    - Persists models and thresholds from training
+    - Evaluates on held-out test set (c-index, log-rank) and saves KM plots
+    - Returns a summary dataframe of metrics
+    """
+    if results_dir is None:
+        results_dir = os.path.join(os.getcwd(), "results")
+    models_dir = os.path.join(results_dir, "heldout", "models")
+    figs_dir = os.path.join(results_dir, "heldout", "figs")
+    preds_dir = os.path.join(results_dir, "heldout", "preds")
+    meta_dir = os.path.join(results_dir, "heldout", "meta")
+    for d in [models_dir, figs_dir, preds_dir, meta_dir]:
+        _ensure_dir(d)
+
+    # Split
+    tr, te = stratified_train_test_split_by_columns(
+        df.dropna(subset=[time_col, event_col]).copy(),
+        cols=["Female", event_col, "ICD"],
+        test_size=test_size,
+        random_state=random_state,
+    )
+
+    # Save distributions
+    try:
+        def distro(x: pd.DataFrame) -> Dict[str, int]:
+            key = (
+                x[["Female", event_col, "ICD"]]
+                .astype(int)
+                .astype(str)
+                .agg("|".join, axis=1)
+            )
+            return key.value_counts().to_dict()
+
+        split_meta = {
+            "train_size": int(len(tr)),
+            "test_size": int(len(te)),
+            "train_distribution": distro(tr),
+            "test_distribution": distro(te),
+        }
+        _save_json(split_meta, os.path.join(meta_dir, "split_distribution.json"))
+    except Exception:
+        pass
+
+    # Collect metrics
+    rows: List[Dict[str, Any]] = []
+
+    # Stability selection seeds limited for speed if small data
+    seeds_for_stability = list(range(20))
+
+    for featset_name, feature_cols in feature_sets.items():
+        # Stabilize features on TRAIN ONLY for Proposed/Advanced
+        used_agnostic_feats = list(feature_cols)
+        used_shared_specific_feats: List[str] = [f for f in feature_cols if f != "Female"]
+        is_proposed = set(feature_cols) == set(FEATURE_SETS.get("Proposed", []))
+        is_advanced = set(feature_cols) == set(FEATURE_SETS.get("Advanced", []))
+        try:
+            if is_proposed or is_advanced:
+                # sex-agnostic selection (includes Female)
+                sel_agn = stability_select_features(
+                    df=tr,
+                    candidate_features=list(feature_cols),
+                    time_col=time_col,
+                    event_col=event_col,
+                    seeds=seeds_for_stability,
+                    max_features=None,
+                    threshold=0.4,
+                    min_features=None,
+                    verbose=True,
+                )
+                if sel_agn:
+                    used_agnostic_feats = list(sel_agn)
+                # sex-specific shared selection (exclude Female)
+                base_feats = [f for f in feature_cols if f != "Female"]
+                sel_shared = stability_select_features(
+                    df=tr,
+                    candidate_features=list(base_feats),
+                    time_col=time_col,
+                    event_col=event_col,
+                    seeds=seeds_for_stability,
+                    max_features=None,
+                    threshold=0.4,
+                    min_features=None,
+                    verbose=True,
+                )
+                if sel_shared:
+                    used_shared_specific_feats = list(sel_shared)
+        except Exception:
+            pass
+
+        # ===== Train and persist: sex-agnostic =====
+        try:
+            tr_agn_base = create_undersampled_dataset(tr, event_col, random_state)
+            tr_agn = tr_agn_base.dropna(subset=[time_col, event_col]).copy()
+            if not tr_agn.empty:
+                cph = fit_cox_model(tr_agn, used_agnostic_feats, time_col, event_col)
+                tr_risk = predict_risk(cph, tr_agn, used_agnostic_feats)
+                thr = float(np.nanmedian(tr_risk))
+
+                # Persist
+                base_path = os.path.join(models_dir, featset_name, "sex_agnostic")
+                _ensure_dir(base_path)
+                _save_pickle(cph, os.path.join(base_path, "model.pkl"))
+                _save_json(
+                    {"threshold": thr, "features": used_agnostic_feats},
+                    os.path.join(base_path, "meta.json"),
+                )
+                # Coef plot
+                plot_cox_coefficients(
+                    cph,
+                    f"{featset_name} Sex-Agnostic Cox Coefficients",
+                    reference_df=tr_agn,
+                    effect_scale="per_sd",
+                    save_path=os.path.join(figs_dir, f"{featset_name}_sex_agnostic_coefs.png"),
+                )
+
+                # Evaluate on heldout test
+                te_eval = te.copy()
+                risk = predict_risk(cph, te_eval, used_agnostic_feats)
+                te_eval["pred_prob"] = risk
+                te_eval["pred_label"] = (risk >= thr).astype(int)
+                merged = (
+                    te_eval[["MRN", "Female", "pred_label", time_col, event_col]]
+                    .dropna(subset=[time_col, event_col])
+                    .drop_duplicates(subset=["MRN"])  # one row per MRN
+                    .rename(columns={event_col: "PE"})
+                )
+                # Save preds
+                merged.to_csv(
+                    os.path.join(
+                        preds_dir, f"{featset_name}_sex_agnostic_test_preds.csv"
+                    ),
+                    index=False,
+                )
+                # KM + log-rank
+                plot_km_two_subplots_by_gender(
+                    merged,
+                    save_path=os.path.join(
+                        figs_dir, f"{featset_name}_sex_agnostic_km_by_gender.png"
+                    ),
+                )
+                # Metrics
+                mask_m = merged["Female"].values == 0
+                mask_f = merged["Female"].values == 1
+                c_all = _safe_cindex(
+                    merged["PE_Time"].values, merged["PE"].values, merged["pred_prob"].values
+                )
+                c_m = _safe_cindex(
+                    merged.loc[mask_m, "PE_Time"].values,
+                    merged.loc[mask_m, "PE"].values,
+                    merged.loc[mask_m, "pred_prob"].values,
+                )
+                c_f = _safe_cindex(
+                    merged.loc[mask_f, "PE_Time"].values,
+                    merged.loc[mask_f, "PE"].values,
+                    merged.loc[mask_f, "pred_prob"].values,
+                )
+                pvals = _compute_logrank_pvalues_by_gender(merged)
+                rows.append(
+                    {
+                        "feature_set": featset_name,
+                        "mode": "sex_agnostic",
+                        "c_index_all": c_all,
+                        "c_index_male": c_m,
+                        "c_index_female": c_f,
+                        "logrank_p_male": pvals.get("male"),
+                        "logrank_p_female": pvals.get("female"),
+                    }
+                )
+        except Exception as e:
+            warnings.warn(f"[Heldout][{featset_name}] sex-agnostic failed: {e}")
+
+        # ===== Train and persist: sex-specific =====
+        try:
+            tr_m = tr[tr["Female"] == 0].dropna(subset=[time_col, event_col]).copy()
+            tr_f = tr[tr["Female"] == 1].dropna(subset=[time_col, event_col]).copy()
+            te_m = te[te["Female"] == 0].copy()
+            te_f = te[te["Female"] == 1].copy()
+
+            base_path = os.path.join(models_dir, featset_name, "sex_specific")
+            _ensure_dir(base_path)
+
+            models_specific: Dict[str, CoxPHFitter] = {}
+            thresholds_specific: Dict[str, float] = {}
+
+            if not tr_m.empty:
+                cph_m = fit_cox_model(tr_m, used_shared_specific_feats, time_col, event_col)
+                tr_risk_m = predict_risk(cph_m, tr_m, used_shared_specific_feats)
+                thr_m = float(np.nanmedian(tr_risk_m))
+                models_specific["male"] = cph_m
+                thresholds_specific["male"] = thr_m
+                _save_pickle(cph_m, os.path.join(base_path, "male_model.pkl"))
+                # coefs
+                plot_cox_coefficients(
+                    cph_m,
+                    f"{featset_name} Male Cox Coefficients",
+                    reference_df=tr_m,
+                    effect_scale="per_sd",
+                    save_path=os.path.join(figs_dir, f"{featset_name}_male_coefs.png"),
+                )
+                # coef table
+                try:
+                    cph_m.summary.to_csv(
+                        os.path.join(base_path, "male_summary.csv"), index=True
+                    )
+                except Exception:
+                    pass
+                try:
+                    cph_m.params_.to_frame("coef").to_csv(
+                        os.path.join(base_path, "male_coef.csv")
+                    )
+                except Exception:
+                    pass
+
+            if not tr_f.empty:
+                cph_f = fit_cox_model(tr_f, used_shared_specific_feats, time_col, event_col)
+                tr_risk_f = predict_risk(cph_f, tr_f, used_shared_specific_feats)
+                thr_f = float(np.nanmedian(tr_risk_f))
+                models_specific["female"] = cph_f
+                thresholds_specific["female"] = thr_f
+                _save_pickle(cph_f, os.path.join(base_path, "female_model.pkl"))
+                plot_cox_coefficients(
+                    cph_f,
+                    f"{featset_name} Female Cox Coefficients",
+                    reference_df=tr_f,
+                    effect_scale="per_sd",
+                    save_path=os.path.join(figs_dir, f"{featset_name}_female_coefs.png"),
+                )
+                try:
+                    cph_f.summary.to_csv(
+                        os.path.join(base_path, "female_summary.csv"), index=True
+                    )
+                except Exception:
+                    pass
+                try:
+                    cph_f.params_.to_frame("coef").to_csv(
+                        os.path.join(base_path, "female_coef.csv")
+                    )
+                except Exception:
+                    pass
+
+            # Persist thresholds and features used
+            _save_json(
+                {
+                    "features": used_shared_specific_feats,
+                    "thresholds": thresholds_specific,
+                },
+                os.path.join(base_path, "meta.json"),
+            )
+
+            # Evaluate on test
+            te_out = te.copy()
+            if "male" in models_specific and not te_m.empty:
+                r_m = predict_risk(
+                    models_specific["male"], te_m, used_shared_specific_feats
+                )
+                te_out.loc[te_out["Female"] == 0, "pred_prob"] = r_m
+                te_out.loc[te_out["Female"] == 0, "pred_label"] = (
+                    r_m >= thresholds_specific.get("male", float("nan"))
+                ).astype(int)
+            if "female" in models_specific and not te_f.empty:
+                r_f = predict_risk(
+                    models_specific["female"], te_f, used_shared_specific_feats
+                )
+                te_out.loc[te_out["Female"] == 1, "pred_prob"] = r_f
+                te_out.loc[te_out["Female"] == 1, "pred_label"] = (
+                    r_f >= thresholds_specific.get("female", float("nan"))
+                ).astype(int)
+
+            merged = (
+                te_out[["MRN", "Female", "pred_label", time_col, event_col]]
+                .dropna(subset=[time_col, event_col])
+                .drop_duplicates(subset=["MRN"])
+                .rename(columns={event_col: "PE"})
+            )
+            # Save preds
+            merged.to_csv(
+                os.path.join(preds_dir, f"{featset_name}_sex_specific_test_preds.csv"),
+                index=False,
+            )
+            # KM + log-rank
+            plot_km_two_subplots_by_gender(
+                merged,
+                save_path=os.path.join(
+                    figs_dir, f"{featset_name}_sex_specific_km_by_gender.png"
+                ),
+            )
+            # Metrics
+            mask_m = merged["Female"].values == 0
+            mask_f = merged["Female"].values == 1
+            c_all = _safe_cindex(
+                merged["PE_Time"].values, merged["PE"].values, merged["pred_prob"].values
+            )
+            c_m = _safe_cindex(
+                merged.loc[mask_m, "PE_Time"].values,
+                merged.loc[mask_m, "PE"].values,
+                merged.loc[mask_m, "pred_prob"].values,
+            )
+            c_f = _safe_cindex(
+                merged.loc[mask_f, "PE_Time"].values,
+                merged.loc[mask_f, "PE"].values,
+                merged.loc[mask_f, "pred_prob"].values,
+            )
+            pvals = _compute_logrank_pvalues_by_gender(merged)
+            rows.append(
+                {
+                    "feature_set": featset_name,
+                    "mode": "sex_specific",
+                    "c_index_all": c_all,
+                    "c_index_male": c_m,
+                    "c_index_female": c_f,
+                    "logrank_p_male": pvals.get("male"),
+                    "logrank_p_female": pvals.get("female"),
+                }
+            )
+        except Exception as e:
+            warnings.warn(f"[Heldout][{featset_name}] sex-specific failed: {e}")
+
+    summary_df = pd.DataFrame(rows)
+    try:
+        summary_path_csv = os.path.join(results_dir, "heldout", "summary_metrics.csv")
+        _ensure_dir(os.path.dirname(summary_path_csv))
+        summary_df.to_csv(summary_path_csv, index=False)
+    except Exception:
+        pass
+
+    try:
+        summary_path_xlsx = os.path.join(results_dir, "heldout", "summary_metrics.xlsx")
+        _ensure_dir(os.path.dirname(summary_path_xlsx))
+        summary_df.to_excel(summary_path_xlsx, index=False)
+    except Exception:
+        pass
+
+    return summary_df
 
 
 # ==========================================
@@ -2071,61 +2559,84 @@ if __name__ == "__main__":
     except Exception as e:
         warnings.warn(f"[Main] TableOne generation skipped due to error: {e}")
 
-    # Run experiments (splits controlled via env SCMR_N_SPLITS)
-    try:
-        n_splits_env = int(os.environ.get("SCMR_N_SPLITS", "10"))
-    except Exception:
-        n_splits_env = 10
-    export_path = os.path.join(results_dir, "results_cox.xlsx")
-    _, summary = run_cox_experiments(
-        df=df,
-        feature_sets=FEATURE_SETS,
-        N=n_splits_env,
-        time_col="PE_Time",
-        event_col="VT/VF/SCD",
-        export_excel_path=export_path,
-    )
-    print("Saved Excel:", export_path)
+    # Toggle legacy multi-split experiments
+    enable_legacy = os.environ.get("SCMR_ENABLE_LEGACY_EXPERIMENTS", "1") == "1"
+    if enable_legacy:
+        try:
+            n_splits_env = int(os.environ.get("SCMR_N_SPLITS", "10"))
+        except Exception:
+            n_splits_env = 10
+        export_path = os.path.join(results_dir, "results_cox.xlsx")
+        _, summary = run_cox_experiments(
+            df=df,
+            feature_sets=FEATURE_SETS,
+            N=n_splits_env,
+            time_col="PE_Time",
+            event_col="VT/VF/SCD",
+            export_excel_path=export_path,
+        )
+        print("Saved Excel:", export_path)
 
-    # Full-data inference and analysis - Guideline
-    features = FEATURE_SETS["Guideline"]
-    print("Running sex-agnostic full-data inference (includes Female)...")
-    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+    # Held-out single split training + evaluation across all feature sets
+    enable_heldout = os.environ.get("SCMR_ENABLE_HELDOUT", "1") == "1"
+    if enable_heldout:
+        try:
+            heldout_test_size = float(os.environ.get("SCMR_HELDOUT_TEST_SIZE", "0.3"))
+        except Exception:
+            heldout_test_size = 0.3
+        try:
+            heldout_seed = int(os.environ.get("SCMR_HELDOUT_SEED", "42"))
+        except Exception:
+            heldout_seed = 42
+        print("Running held-out training and evaluation...")
+        heldout_summary = run_heldout_training_and_evaluation(
+            df=df,
+            feature_sets=FEATURE_SETS,
+            time_col="PE_Time",
+            event_col="VT/VF/SCD",
+            results_dir=results_dir,
+            test_size=heldout_test_size,
+            random_state=heldout_seed,
+        )
+        print("Held-out summary saved to results/heldout/")
 
-    print("Running sex-specific full-data inference (excludes Female in submodels)...")
-    _ = sex_specific_full_inference(df, features)
+    # Toggle legacy full-data inference blocks (for visualizations not saved by default)
+    enable_full_data_blocks = os.environ.get("SCMR_ENABLE_FULLDATA_BLOCKS", "0") == "1"
+    if enable_full_data_blocks:
+        # Full-data inference and analysis - Guideline
+        features = FEATURE_SETS["Guideline"]
+        print("Running sex-agnostic full-data inference (includes Female)...")
+        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+        print("Running sex-specific full-data inference (excludes Female in submodels)...")
+        _ = sex_specific_full_inference(df, features)
 
-    # Full-data inference and analysis - Benchmark
-    features = FEATURE_SETS["Benchmark"]
-    print("Running sex-agnostic full-data inference (includes Female)...")
-    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+        # Full-data inference and analysis - Benchmark
+        features = FEATURE_SETS["Benchmark"]
+        print("Running sex-agnostic full-data inference (includes Female)...")
+        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+        print("Running sex-specific full-data inference (excludes Female in submodels)...")
+        _ = sex_specific_full_inference(df, features)
 
-    print("Running sex-specific full-data inference (excludes Female in submodels)...")
-    _ = sex_specific_full_inference(df, features)
-    
-    # Full-data inference and analysis - DERIVATIVE
-    features = FEATURE_SETS["DERIVATIVE"]
-    print("Running sex-agnostic full-data inference (includes Female)...")
-    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+        # Full-data inference and analysis - DERIVATIVE
+        features = FEATURE_SETS["DERIVATIVE"]
+        print("Running sex-agnostic full-data inference (includes Female)...")
+        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+        print("Running sex-specific full-data inference (excludes Female in submodels)...")
+        _ = sex_specific_full_inference(df, features)
 
-    print("Running sex-specific full-data inference (excludes Female in submodels)...")
-    _ = sex_specific_full_inference(df, features)
+        # Full-data inference and analysis - Proposed
+        features = FEATURE_SETS["Proposed"]
+        print("Running sex-agnostic full-data inference (includes Female)...")
+        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+        print("Running sex-specific full-data inference (excludes Female in submodels)...")
+        _ = sex_specific_full_inference(df, features)
 
-    # Full-data inference and analysis - Proposed
-    features = FEATURE_SETS["Proposed"]
-    print("Running sex-agnostic full-data inference (includes Female)...")
-    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-
-    print("Running sex-specific full-data inference (excludes Female in submodels)...")
-    _ = sex_specific_full_inference(df, features)
-
-    # Full-data inference and analysis - Advanced
-    features = FEATURE_SETS["Advanced"]
-    print("Running sex-agnostic full-data inference (includes Female)...")
-    _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-
-    print("Running sex-specific full-data inference (excludes Female in submodels)...")
-    _ = sex_specific_full_inference(df, features)
+        # Full-data inference and analysis - Advanced
+        features = FEATURE_SETS["Advanced"]
+        print("Running sex-agnostic full-data inference (includes Female)...")
+        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+        print("Running sex-specific full-data inference (excludes Female in submodels)...")
+        _ = sex_specific_full_inference(df, features)
 
     # =============================
     # Print features used by models
