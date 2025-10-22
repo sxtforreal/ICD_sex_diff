@@ -6,6 +6,7 @@ import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
 plt.switch_backend("Agg")
 from typing import Dict, List, Tuple, Any
 
@@ -167,7 +168,6 @@ ADV_LGE_NOMINAL: List[str] = [
 ]
 
 
-
 def create_undersampled_dataset(
     train_df: pd.DataFrame, label_col: str, random_state: int
 ) -> pd.DataFrame:
@@ -308,7 +308,9 @@ def plot_cox_coefficients(
     plt.close()
 
 
-def plot_km_two_subplots_by_gender(merged_df: pd.DataFrame, save_path: str = None) -> None:
+def plot_km_two_subplots_by_gender(
+    merged_df: pd.DataFrame, save_path: str = None
+) -> None:
     """Plot KM curves in two subplots (Male left, Female right) using Primary Endpoint (PE).
     Each subplot contains two curves: Low risk (pred0) and High risk (pred1), with within-sex log-rank test.
     """
@@ -451,7 +453,10 @@ def _compute_logrank_pvalues_by_gender(df_with_preds: pd.DataFrame) -> Dict[str,
                 out[key] = float("nan")
                 continue
             lr = logrank_test(
-                low[ep_time_col], high[ep_time_col], low[ep_event_col], high[ep_event_col]
+                low[ep_time_col],
+                high[ep_time_col],
+                low[ep_event_col],
+                high[ep_event_col],
             )
             out[key] = float(lr.p_value)
     except Exception:
@@ -459,7 +464,9 @@ def _compute_logrank_pvalues_by_gender(df_with_preds: pd.DataFrame) -> Dict[str,
     return out
 
 
-def _compute_hr_by_gender(df_with_preds: pd.DataFrame) -> Dict[str, Tuple[float, float, float]]:
+def _compute_hr_by_gender(
+    df_with_preds: pd.DataFrame,
+) -> Dict[str, Tuple[float, float, float]]:
     """Compute univariate HR (High vs Low) by gender using pred_label as exposure.
 
     Returns dict: {"male": (HR, CI_low, CI_high), "female": (...)} with NaNs when unavailable.
@@ -503,12 +510,7 @@ def stratified_train_test_split_by_columns(
         if c not in df_local.columns:
             raise ValueError(f"Missing stratification column: {c}")
     # Build combined label; convert to string to avoid NaNs
-    combo = (
-        df_local[cols]
-        .astype(str)
-        .agg("|".join, axis=1)
-        .fillna("missing")
-    )
+    combo = df_local[cols].astype(str).agg("|".join, axis=1).fillna("missing")
     try:
         tr, te = train_test_split(
             df_local, test_size=test_size, random_state=random_state, stratify=combo
@@ -579,6 +581,7 @@ def run_heldout_training_and_evaluation(
 
     # Save distributions
     try:
+
         def distro(x: pd.DataFrame) -> Dict[str, int]:
             key = (
                 x[["Female", event_col, "ICD"]]
@@ -608,13 +611,17 @@ def run_heldout_training_and_evaluation(
         _progress(f"[Heldout] Processing feature set: {featset_name}")
         # Stabilize features on TRAIN ONLY for Proposed/Advanced
         used_agnostic_feats = list(feature_cols)
-        used_shared_specific_feats: List[str] = [f for f in feature_cols if f != "Female"]
+        used_shared_specific_feats: List[str] = [
+            f for f in feature_cols if f != "Female"
+        ]
         is_proposed = set(feature_cols) == set(FEATURE_SETS.get("Proposed", []))
         is_advanced = set(feature_cols) == set(FEATURE_SETS.get("Advanced", []))
         try:
             if is_proposed or is_advanced:
                 # sex-agnostic selection (includes Female)
-                _progress(f"[Heldout] {featset_name}: Running sex-agnostic stability selection...")
+                _progress(
+                    f"[Heldout] {featset_name}: Running sex-agnostic stability selection..."
+                )
                 sel_agn = stability_select_features(
                     df=tr,
                     candidate_features=list(feature_cols),
@@ -630,7 +637,9 @@ def run_heldout_training_and_evaluation(
                     used_agnostic_feats = list(sel_agn)
                 # sex-specific shared selection (exclude Female)
                 base_feats = [f for f in feature_cols if f != "Female"]
-                _progress(f"[Heldout] {featset_name}: Running sex-specific shared stability selection...")
+                _progress(
+                    f"[Heldout] {featset_name}: Running sex-specific shared stability selection..."
+                )
                 sel_shared = stability_select_features(
                     df=tr,
                     candidate_features=list(base_feats),
@@ -649,7 +658,9 @@ def run_heldout_training_and_evaluation(
 
         # ===== Train and persist: sex-agnostic =====
         try:
-            _progress(f"[Heldout] {featset_name}: Training sex-agnostic model and saving artifacts...")
+            _progress(
+                f"[Heldout] {featset_name}: Training sex-agnostic model and saving artifacts..."
+            )
             tr_agn_base = create_undersampled_dataset(tr, event_col, random_state)
             tr_agn = tr_agn_base.dropna(subset=[time_col, event_col]).copy()
             if not tr_agn.empty:
@@ -671,17 +682,30 @@ def run_heldout_training_and_evaluation(
                     f"{featset_name} Sex-Agnostic Cox Coefficients",
                     reference_df=tr_agn,
                     effect_scale="per_sd",
-                    save_path=os.path.join(figs_dir, f"{featset_name}_sex_agnostic_coefs.png"),
+                    save_path=os.path.join(
+                        figs_dir, f"{featset_name}_sex_agnostic_coefs.png"
+                    ),
                 )
 
                 # Evaluate on heldout test
-                _progress(f"[Heldout] {featset_name}: Evaluating sex-agnostic on test and exporting plots...")
+                _progress(
+                    f"[Heldout] {featset_name}: Evaluating sex-agnostic on test and exporting plots..."
+                )
                 te_eval = te.copy()
                 risk = predict_risk(cph, te_eval, used_agnostic_feats)
                 te_eval["pred_prob"] = risk
                 te_eval["pred_label"] = (risk >= thr).astype(int)
                 merged = (
-                    te_eval[["MRN", "Female", "pred_label", "pred_prob", time_col, event_col]]
+                    te_eval[
+                        [
+                            "MRN",
+                            "Female",
+                            "pred_label",
+                            "pred_prob",
+                            time_col,
+                            event_col,
+                        ]
+                    ]
                     .dropna(subset=[time_col, event_col])
                     .drop_duplicates(subset=["MRN"])  # one row per MRN
                     .rename(columns={event_col: "PE"})
@@ -704,7 +728,9 @@ def run_heldout_training_and_evaluation(
                 mask_m = merged["Female"].values == 0
                 mask_f = merged["Female"].values == 1
                 c_all = _safe_cindex(
-                    merged["PE_Time"].values, merged["PE"].values, merged["pred_prob"].values
+                    merged["PE_Time"].values,
+                    merged["PE"].values,
+                    merged["pred_prob"].values,
                 )
                 c_m = _safe_cindex(
                     merged.loc[mask_m, "PE_Time"].values,
@@ -719,22 +745,26 @@ def run_heldout_training_and_evaluation(
                 pvals = _compute_logrank_pvalues_by_gender(merged)
                 hrs = _compute_hr_by_gender(merged)
                 rows.append(
-                        {
-                            "feature_set": featset_name,
-                            "mode": "sex_agnostic",
-                            "c_index_all": c_all,
-                            "c_index_male": c_m,
-                            "c_index_female": c_f,
-                            "logrank_p_male": pvals.get("male"),
-                            "logrank_p_female": pvals.get("female"),
+                    {
+                        "feature_set": featset_name,
+                        "mode": "sex_agnostic",
+                        "c_index_all": c_all,
+                        "c_index_male": c_m,
+                        "c_index_female": c_f,
+                        "logrank_p_male": pvals.get("male"),
+                        "logrank_p_female": pvals.get("female"),
                         "hr_male": hrs.get("male", (np.nan, np.nan, np.nan))[0],
                         "hr_male_ci_low": hrs.get("male", (np.nan, np.nan, np.nan))[1],
                         "hr_male_ci_high": hrs.get("male", (np.nan, np.nan, np.nan))[2],
                         "hr_female": hrs.get("female", (np.nan, np.nan, np.nan))[0],
-                        "hr_female_ci_low": hrs.get("female", (np.nan, np.nan, np.nan))[1],
-                        "hr_female_ci_high": hrs.get("female", (np.nan, np.nan, np.nan))[2],
-                        }
-                    )
+                        "hr_female_ci_low": hrs.get("female", (np.nan, np.nan, np.nan))[
+                            1
+                        ],
+                        "hr_female_ci_high": hrs.get(
+                            "female", (np.nan, np.nan, np.nan)
+                        )[2],
+                    }
+                )
         except Exception as e:
             warnings.warn(f"[Heldout][{featset_name}] sex-agnostic failed: {e}")
 
@@ -743,7 +773,9 @@ def run_heldout_training_and_evaluation(
             # Only Proposed/Advanced run sex-specific per requirement
             if featset_name not in {"Proposed", "Advanced"}:
                 raise RuntimeError("Skip sex-specific for non P/A feature sets")
-            _progress(f"[Heldout] {featset_name}: Training sex-specific models (male/female) and saving artifacts...")
+            _progress(
+                f"[Heldout] {featset_name}: Training sex-specific models (male/female) and saving artifacts..."
+            )
             tr_m = tr[tr["Female"] == 0].dropna(subset=[time_col, event_col]).copy()
             tr_f = tr[tr["Female"] == 1].dropna(subset=[time_col, event_col]).copy()
             te_m = te[te["Female"] == 0].copy()
@@ -756,7 +788,9 @@ def run_heldout_training_and_evaluation(
             thresholds_specific: Dict[str, float] = {}
 
             if not tr_m.empty:
-                cph_m = fit_cox_model(tr_m, used_shared_specific_feats, time_col, event_col)
+                cph_m = fit_cox_model(
+                    tr_m, used_shared_specific_feats, time_col, event_col
+                )
                 tr_risk_m = predict_risk(cph_m, tr_m, used_shared_specific_feats)
                 thr_m = float(np.nanmedian(tr_risk_m))
                 models_specific["male"] = cph_m
@@ -785,7 +819,9 @@ def run_heldout_training_and_evaluation(
                     pass
 
             if not tr_f.empty:
-                cph_f = fit_cox_model(tr_f, used_shared_specific_feats, time_col, event_col)
+                cph_f = fit_cox_model(
+                    tr_f, used_shared_specific_feats, time_col, event_col
+                )
                 tr_risk_f = predict_risk(cph_f, tr_f, used_shared_specific_feats)
                 thr_f = float(np.nanmedian(tr_risk_f))
                 models_specific["female"] = cph_f
@@ -796,7 +832,9 @@ def run_heldout_training_and_evaluation(
                     f"{featset_name} Female Cox Coefficients",
                     reference_df=tr_f,
                     effect_scale="per_sd",
-                    save_path=os.path.join(figs_dir, f"{featset_name}_female_coefs.png"),
+                    save_path=os.path.join(
+                        figs_dir, f"{featset_name}_female_coefs.png"
+                    ),
                 )
                 try:
                     cph_f.summary.to_csv(
@@ -821,7 +859,9 @@ def run_heldout_training_and_evaluation(
             )
 
             # Evaluate on test
-            _progress(f"[Heldout] {featset_name}: Evaluating sex-specific on test and exporting plots...")
+            _progress(
+                f"[Heldout] {featset_name}: Evaluating sex-specific on test and exporting plots..."
+            )
             te_out = te.copy()
             # Ensure metric columns exist even if one sex has no model
             if "pred_prob" not in te_out.columns:
@@ -846,7 +886,9 @@ def run_heldout_training_and_evaluation(
                 ).astype(int)
 
             merged = (
-                te_out[["MRN", "Female", "pred_label", "pred_prob", time_col, event_col]]
+                te_out[
+                    ["MRN", "Female", "pred_label", "pred_prob", time_col, event_col]
+                ]
                 .dropna(subset=[time_col, event_col])
                 .drop_duplicates(subset=["MRN"])
                 .rename(columns={event_col: "PE"})
@@ -867,7 +909,9 @@ def run_heldout_training_and_evaluation(
             mask_m = merged["Female"].values == 0
             mask_f = merged["Female"].values == 1
             c_all = _safe_cindex(
-                merged["PE_Time"].values, merged["PE"].values, merged["pred_prob"].values
+                merged["PE_Time"].values,
+                merged["PE"].values,
+                merged["pred_prob"].values,
             )
             c_m = _safe_cindex(
                 merged.loc[mask_m, "PE_Time"].values,
@@ -1221,7 +1265,9 @@ def _sanitize_cox_features_matrix(
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
     to_drop = [col for col in upper.columns if (upper[col] >= corr_threshold).any()]
     if to_drop and verbose:
-        print(f"[Cox] Dropping highly correlated columns (|r|>={corr_threshold}): {to_drop}")
+        print(
+            f"[Cox] Dropping highly correlated columns (|r|>={corr_threshold}): {to_drop}"
+        )
     X = X.drop(columns=to_drop, errors="ignore")
 
     kept = list(X.columns)
@@ -1271,9 +1317,7 @@ def fit_cox_model(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
-            cph.fit(
-                df_fit, duration_col=time_col, event_col=event_col, robust=robust
-            )
+            cph.fit(df_fit, duration_col=time_col, event_col=event_col, robust=robust)
         except ConvergenceError:
             # Fallback: stronger regularization and stricter collinearity removal
             X_sanitized2, _ = _sanitize_cox_features_matrix(
@@ -1287,9 +1331,7 @@ def fit_cox_model(
                 axis=1,
             )
             cph = CoxPHFitter(penalizer=1.0, l1_ratio=0.0)
-            cph.fit(
-                df_fit2, duration_col=time_col, event_col=event_col, robust=robust
-            )
+            cph.fit(df_fit2, duration_col=time_col, event_col=event_col, robust=robust)
     return cph
 
 
@@ -1577,9 +1619,9 @@ def sex_specific_inference(
     base_candidates = [f for f in features if f != "Female"]
     try:
         # Unify features for Proposed/Advanced using stability selection once
-        if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(features) == set(
-            FEATURE_SETS.get("Advanced", [])
-        ):
+        if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(
+            features
+        ) == set(FEATURE_SETS.get("Advanced", [])):
             is_proposed = set(features) == set(FEATURE_SETS.get("Proposed", []))
             shared_features = compute_shared_features(
                 df=train_df,
@@ -1591,7 +1633,9 @@ def sex_specific_inference(
                 verbose=True,
             )
             # Cache into store for traceability/consistency
-            store_key = "proposed_sex_specific" if is_proposed else "advanced_sex_specific"
+            store_key = (
+                "proposed_sex_specific" if is_proposed else "advanced_sex_specific"
+            )
             try:
                 SELECTED_FEATURES_STORE[store_key]["male"] = list(shared_features)
                 SELECTED_FEATURES_STORE[store_key]["female"] = list(shared_features)
@@ -1677,13 +1721,15 @@ def sex_specific_full_inference(
     - Excludes Female from submodel features
     - Dichotomizes by sex-specific median risks
     """
-    _progress("[Full] Sex-specific: Preparing shared features and running stability selection (if enabled)...")
+    _progress(
+        "[Full] Sex-specific: Preparing shared features and running stability selection (if enabled)..."
+    )
     # Build one shared feature set for both sexes (exclude Female)
     base_candidates = [f for f in features if f != "Female"]
     try:
-        if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(features) == set(
-            FEATURE_SETS.get("Advanced", [])
-        ):
+        if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(
+            features
+        ) == set(FEATURE_SETS.get("Advanced", [])):
             is_proposed = set(features) == set(FEATURE_SETS.get("Proposed", []))
             shared_features = compute_shared_features(
                 df=df,
@@ -1694,7 +1740,9 @@ def sex_specific_full_inference(
                 threshold=0.4,
                 verbose=True,
             )
-            store_key = "proposed_sex_specific" if is_proposed else "advanced_sex_specific"
+            store_key = (
+                "proposed_sex_specific" if is_proposed else "advanced_sex_specific"
+            )
             try:
                 SELECTED_FEATURES_STORE[store_key]["male"] = list(shared_features)
                 SELECTED_FEATURES_STORE[store_key]["female"] = list(shared_features)
@@ -1836,16 +1884,22 @@ def sex_agnostic_full_inference(
     - Includes Female in features
     - Dichotomizes risk by overall median
     """
-    _progress("[Full] Sex-agnostic: Starting data prep and feature stability selection...")
+    _progress(
+        "[Full] Sex-agnostic: Starting data prep and feature stability selection..."
+    )
     df_base = (
         create_undersampled_dataset(df, label_col, 42) if use_undersampling else df
     )
     used_features = features
     # If features correspond to Proposed/Advanced, perform stability selection ONCE and freeze
     try:
-        if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(features) == set(FEATURE_SETS.get("Advanced", [])):
+        if set(features) == set(FEATURE_SETS.get("Proposed", [])) or set(
+            features
+        ) == set(FEATURE_SETS.get("Advanced", [])):
             is_proposed = set(features) == set(FEATURE_SETS.get("Proposed", []))
-            store_key = "proposed_sex_agnostic" if is_proposed else "advanced_sex_agnostic"
+            store_key = (
+                "proposed_sex_agnostic" if is_proposed else "advanced_sex_agnostic"
+            )
             selected = SELECTED_FEATURES_STORE.get(store_key)
             if not selected:
                 seeds_for_stability = list(range(20))
@@ -1933,7 +1987,9 @@ def evaluate_split(
         # Feature selection only for Proposed/Advanced set
         if not disable_within_split_feature_selection:
             try:
-                if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])) or set(feature_cols) == set(FEATURE_SETS.get("Advanced", [])):
+                if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])) or set(
+                    feature_cols
+                ) == set(FEATURE_SETS.get("Advanced", [])):
                     selected = select_features_max_cindex_forward(
                         tr, list(feature_cols), time_col, event_col, random_state=seed
                     )
@@ -1941,7 +1997,8 @@ def evaluate_split(
                         used_features = selected
                         model_name = (
                             "Proposed"
-                            if set(feature_cols) == set(FEATURE_SETS.get("Proposed", []))
+                            if set(feature_cols)
+                            == set(FEATURE_SETS.get("Proposed", []))
                             else "Advanced"
                         )
                         print(
@@ -2030,7 +2087,9 @@ def evaluate_split(
                 if not disable_within_split_feature_selection:
                     # Feature selection for Proposed/Advanced per sex (male)
                     try:
-                        if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])) or set(feature_cols) == set(FEATURE_SETS.get("Advanced", [])):
+                        if set(feature_cols) == set(
+                            FEATURE_SETS.get("Proposed", [])
+                        ) or set(feature_cols) == set(FEATURE_SETS.get("Advanced", [])):
                             selected_m = select_features_max_cindex_forward(
                                 tr_m,
                                 list(used_features),
@@ -2042,7 +2101,8 @@ def evaluate_split(
                                 used_features_m = selected_m
                                 model_name = (
                                     "Proposed"
-                                    if set(feature_cols) == set(FEATURE_SETS.get("Proposed", []))
+                                    if set(feature_cols)
+                                    == set(FEATURE_SETS.get("Proposed", []))
                                     else "Advanced"
                                 )
                                 print(
@@ -2075,7 +2135,9 @@ def evaluate_split(
                 if not disable_within_split_feature_selection:
                     # Feature selection for Proposed/Advanced per sex (female)
                     try:
-                        if set(feature_cols) == set(FEATURE_SETS.get("Proposed", [])) or set(feature_cols) == set(FEATURE_SETS.get("Advanced", [])):
+                        if set(feature_cols) == set(
+                            FEATURE_SETS.get("Proposed", [])
+                        ) or set(feature_cols) == set(FEATURE_SETS.get("Advanced", [])):
                             selected_f = select_features_max_cindex_forward(
                                 tr_f,
                                 list(used_features),
@@ -2087,7 +2149,8 @@ def evaluate_split(
                                 used_features_f = selected_f
                                 model_name = (
                                     "Proposed"
-                                    if set(feature_cols) == set(FEATURE_SETS.get("Proposed", []))
+                                    if set(feature_cols)
+                                    == set(FEATURE_SETS.get("Proposed", []))
                                     else "Advanced"
                                 )
                                 print(
@@ -2225,7 +2288,9 @@ def conversion_and_imputation(
             df[c] = df[c].replace(yes_no_map)
             # Extract numerics from strings like "1 superior" -> 1
             try:
-                df[c] = df[c].astype(str).str.extract(r"(-?\d+(?:\.\d+)?)").astype(float)
+                df[c] = (
+                    df[c].astype(str).str.extract(r"(-?\d+(?:\.\d+)?)").astype(float)
+                )
             except Exception:
                 pass
         if c in df.columns:
@@ -2235,7 +2300,7 @@ def conversion_and_imputation(
     X = df[features].copy()
     # Optional: downcast float64 to float32 before MissForest to speed up
     try:
-        X = X.apply(lambda s: s.astype(np.float32) if s.dtype.kind == 'f' else s)
+        X = X.apply(lambda s: s.astype(np.float32) if s.dtype.kind == "f" else s)
     except Exception:
         pass
     missing_cols = X.columns[X.isnull().any()].tolist()
@@ -2261,7 +2326,9 @@ def conversion_and_imputation(
     # Round NYHA Class
     if "NYHA Class" in imputed_X.columns:
         # Re-encode robustly in case imputation produced non-integer NYHA values
-        imputed_X["NYHA Class"] = _encode_nyha_ordinal(imputed_X["NYHA Class"]).astype("Int64")
+        imputed_X["NYHA Class"] = _encode_nyha_ordinal(imputed_X["NYHA Class"]).astype(
+            "Int64"
+        )
 
     return imputed_X
 
@@ -2306,7 +2373,9 @@ def load_dataframes() -> pd.DataFrame:
             return np.nan
 
     icd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = icd.apply(_fill_cg, axis=1)
-    noicd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = noicd.apply(_fill_cg, axis=1)
+    noicd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = noicd.apply(
+        _fill_cg, axis=1
+    )
 
     # Align to the UNION of columns to retain variables unique to either sheet
     all_cols = sorted(set(icd.columns).union(set(noicd.columns)))
@@ -2374,12 +2443,16 @@ def load_dataframes() -> pd.DataFrame:
         clean_df["Age by decade"] = (clean_df["Age at CMR"] // 10).values
     if "Cockcroft-Gault Creatinine Clearance (mL/min)" in clean_df.columns:
         clean_df["CrCl>45"] = (
-            clean_df["Cockcroft-Gault Creatinine Clearance (mL/min)"] > 45
-        ).fillna(False).astype(int)
+            (clean_df["Cockcroft-Gault Creatinine Clearance (mL/min)"] > 45)
+            .fillna(False)
+            .astype(int)
+        )
     if "NYHA Class" in clean_df.columns:
         clean_df["NYHA>2"] = (clean_df["NYHA Class"] > 2).fillna(False).astype(int)
     if "LGE Burden 5SD" in clean_df.columns:
-        clean_df["Significant LGE"] = (clean_df["LGE Burden 5SD"] > 2).fillna(False).astype(int)
+        clean_df["Significant LGE"] = (
+            (clean_df["LGE Burden 5SD"] > 2).fillna(False).astype(int)
+        )
 
     return clean_df
 
@@ -2426,7 +2499,9 @@ def run_cox_experiments(
         ss_count = min(N, 20)
     seeds_for_stability = list(range(ss_count))
 
-    _progress(f"Starting multi-split experiments: N={N}, feature_sets={list(feature_sets.keys())}")
+    _progress(
+        f"Starting multi-split experiments: N={N}, feature_sets={list(feature_sets.keys())}"
+    )
     for seed in range(N):
         if seed % max(1, N // 10) == 0:
             _progress(f"Progress {seed}/{N} splits...")
@@ -2441,7 +2516,10 @@ def run_cox_experiments(
                 name = f"{featset_name} - {cfg['name']}"
                 use_undersampling = cfg["mode"] == "sex_agnostic"
                 # Only Proposed/Advanced run sex-specific; others skip
-                if cfg["mode"] == "sex_specific" and featset_name not in {"Proposed", "Advanced"}:
+                if cfg["mode"] == "sex_specific" and featset_name not in {
+                    "Proposed",
+                    "Advanced",
+                }:
                     continue
                 # Per-split stability selection on train only for Proposed/Advanced
                 if featset_name in {"Proposed", "Advanced"}:
@@ -2479,9 +2557,7 @@ def run_cox_experiments(
 
                 # Use stabilized features and disable per-split selection
                 if cfg["mode"] == "sex_agnostic":
-                    _progress(
-                        f"seed={seed}: Train/Eval {name} (sex-agnostic)"
-                    )
+                    _progress(f"seed={seed}: Train/Eval {name} (sex-agnostic)")
                     pred, risk, met = evaluate_split(
                         tr,
                         te,
@@ -2495,9 +2571,7 @@ def run_cox_experiments(
                     )
                 else:
                     overrides = {"male": list(sel_shared), "female": list(sel_shared)}
-                    _progress(
-                        f"seed={seed}: Train/Eval {name} (sex-specific)"
-                    )
+                    _progress(f"seed={seed}: Train/Eval {name} (sex-specific)")
                     pred, risk, met = evaluate_split(
                         tr,
                         te,
@@ -2668,14 +2742,18 @@ if __name__ == "__main__":
         raise
 
     # Output directory override
-    results_dir = os.environ.get("SCMR_RESULTS_DIR") or os.path.join(os.getcwd(), "results")
+    results_dir = os.environ.get("SCMR_RESULTS_DIR") or os.path.join(
+        os.getcwd(), "results"
+    )
     os.makedirs(results_dir, exist_ok=True)
 
     # Generate TableOne grouped by Sex x ICD (four groups)
     try:
         generate_tableone_by_sex_icd(
             df,
-            output_excel_path=os.path.join(results_dir, "results_tableone_sex_icd.xlsx"),
+            output_excel_path=os.path.join(
+                results_dir, "results_tableone_sex_icd.xlsx"
+            ),
         )
     except Exception as e:
         warnings.warn(f"[Main] TableOne generation skipped due to error: {e}")
@@ -2684,9 +2762,9 @@ if __name__ == "__main__":
     enable_legacy = os.environ.get("SCMR_ENABLE_LEGACY_EXPERIMENTS", "1") == "1"
     if enable_legacy:
         try:
-            n_splits_env = int(os.environ.get("SCMR_N_SPLITS", "10"))
+            n_splits_env = int(os.environ.get("SCMR_N_SPLITS", "5"))
         except Exception:
-            n_splits_env = 10
+            n_splits_env = 5
         export_path = os.path.join(results_dir, "results_cox.xlsx")
         _, summary = run_cox_experiments(
             df=df,
@@ -2746,14 +2824,18 @@ if __name__ == "__main__":
         features = FEATURE_SETS["Proposed"]
         print("Running sex-agnostic full-data inference (includes Female)...")
         _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-        print("Running sex-specific full-data inference (excludes Female in submodels)...")
+        print(
+            "Running sex-specific full-data inference (excludes Female in submodels)..."
+        )
         _ = sex_specific_full_inference(df, features)
 
         # Full-data inference and analysis - Advanced
         features = FEATURE_SETS["Advanced"]
         print("Running sex-agnostic full-data inference (includes Female)...")
         _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-        print("Running sex-specific full-data inference (excludes Female in submodels)...")
+        print(
+            "Running sex-specific full-data inference (excludes Female in submodels)..."
+        )
         _ = sex_specific_full_inference(df, features)
 
     # =============================
