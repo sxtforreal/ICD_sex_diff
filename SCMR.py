@@ -82,6 +82,48 @@ def _simplify_name(name: str) -> str:
     return simplified
 
 
+def _encode_nyha_ordinal(series: pd.Series) -> pd.Series:
+    """Map NYHA Class to ordered integers {1,2,3,4} robustly.
+
+    Handles numeric strings ("1".."4"), integers, and Roman numerals (I..IV),
+    and returns pandas nullable integer dtype (Int64). Unrecognized values become NaN.
+    """
+    roman_map = {"I": 1, "II": 2, "III": 3, "IV": 4}
+
+    def _map_value(v: Any) -> Any:
+        if pd.isna(v):
+            return np.nan
+        s = str(v).strip().upper()
+        # Direct Roman numerals
+        if s in roman_map:
+            return roman_map[s]
+        # Embedded Roman numerals like "NYHA II"
+        m_rom = re.search(r"\b(IV|III|II|I)\b", s)
+        if m_rom:
+            return roman_map.get(m_rom.group(1), np.nan)
+        # Digits 1-4 (possibly embedded)
+        m_dig = re.search(r"\b([1-4])\b", s)
+        if m_dig:
+            try:
+                return int(m_dig.group(1))
+            except Exception:
+                return np.nan
+        # Fallback to numeric coercion
+        try:
+            x = float(s)
+            if x in (1.0, 2.0, 3.0, 4.0):
+                return int(x)
+        except Exception:
+            pass
+        return np.nan
+
+    mapped = series.apply(_map_value)
+    try:
+        return mapped.astype("Int64")
+    except Exception:
+        return mapped
+
+
 def _build_alias_map(columns: List[str]) -> Dict[str, str]:
     """Map simplified column names to their original labels.
 
@@ -639,7 +681,7 @@ def run_heldout_training_and_evaluation(
                 te_eval["pred_prob"] = risk
                 te_eval["pred_label"] = (risk >= thr).astype(int)
                 merged = (
-                    te_eval[["MRN", "Female", "pred_label", time_col, event_col]]
+                    te_eval[["MRN", "Female", "pred_label", "pred_prob", time_col, event_col]]
                     .dropna(subset=[time_col, event_col])
                     .drop_duplicates(subset=["MRN"])  # one row per MRN
                     .rename(columns={event_col: "PE"})
@@ -674,25 +716,25 @@ def run_heldout_training_and_evaluation(
                     merged.loc[mask_f, "PE"].values,
                     merged.loc[mask_f, "pred_prob"].values,
                 )
-            pvals = _compute_logrank_pvalues_by_gender(merged)
-            hrs = _compute_hr_by_gender(merged)
-            rows.append(
-                    {
-                        "feature_set": featset_name,
-                        "mode": "sex_agnostic",
-                        "c_index_all": c_all,
-                        "c_index_male": c_m,
-                        "c_index_female": c_f,
-                        "logrank_p_male": pvals.get("male"),
-                        "logrank_p_female": pvals.get("female"),
-                    "hr_male": hrs.get("male", (np.nan, np.nan, np.nan))[0],
-                    "hr_male_ci_low": hrs.get("male", (np.nan, np.nan, np.nan))[1],
-                    "hr_male_ci_high": hrs.get("male", (np.nan, np.nan, np.nan))[2],
-                    "hr_female": hrs.get("female", (np.nan, np.nan, np.nan))[0],
-                    "hr_female_ci_low": hrs.get("female", (np.nan, np.nan, np.nan))[1],
-                    "hr_female_ci_high": hrs.get("female", (np.nan, np.nan, np.nan))[2],
-                    }
-                )
+                pvals = _compute_logrank_pvalues_by_gender(merged)
+                hrs = _compute_hr_by_gender(merged)
+                rows.append(
+                        {
+                            "feature_set": featset_name,
+                            "mode": "sex_agnostic",
+                            "c_index_all": c_all,
+                            "c_index_male": c_m,
+                            "c_index_female": c_f,
+                            "logrank_p_male": pvals.get("male"),
+                            "logrank_p_female": pvals.get("female"),
+                        "hr_male": hrs.get("male", (np.nan, np.nan, np.nan))[0],
+                        "hr_male_ci_low": hrs.get("male", (np.nan, np.nan, np.nan))[1],
+                        "hr_male_ci_high": hrs.get("male", (np.nan, np.nan, np.nan))[2],
+                        "hr_female": hrs.get("female", (np.nan, np.nan, np.nan))[0],
+                        "hr_female_ci_low": hrs.get("female", (np.nan, np.nan, np.nan))[1],
+                        "hr_female_ci_high": hrs.get("female", (np.nan, np.nan, np.nan))[2],
+                        }
+                    )
         except Exception as e:
             warnings.warn(f"[Heldout][{featset_name}] sex-agnostic failed: {e}")
 
@@ -781,6 +823,11 @@ def run_heldout_training_and_evaluation(
             # Evaluate on test
             _progress(f"[Heldout] {featset_name}: Evaluating sex-specific on test and exporting plots...")
             te_out = te.copy()
+            # Ensure metric columns exist even if one sex has no model
+            if "pred_prob" not in te_out.columns:
+                te_out["pred_prob"] = np.nan
+            if "pred_label" not in te_out.columns:
+                te_out["pred_label"] = np.nan
             if "male" in models_specific and not te_m.empty:
                 r_m = predict_risk(
                     models_specific["male"], te_m, used_shared_specific_feats
@@ -799,7 +846,7 @@ def run_heldout_training_and_evaluation(
                 ).astype(int)
 
             merged = (
-                te_out[["MRN", "Female", "pred_label", time_col, event_col]]
+                te_out[["MRN", "Female", "pred_label", "pred_prob", time_col, event_col]]
                 .dropna(subset=[time_col, event_col])
                 .drop_duplicates(subset=["MRN"])
                 .rename(columns={event_col: "PE"})
@@ -1252,9 +1299,21 @@ def predict_risk(
     # Use the model's trained features to avoid mismatch/singularity issues
     model_features = list(model.params_.index)
     X = df.copy()
+    # Prefer mean-imputation (from df) over zeros for missing columns
     missing = [c for c in model_features if c not in X.columns]
     for c in missing:
-        X[c] = 0.0
+        # fall back to 0.0 if mean cannot be computed later
+        X[c] = np.nan
+    # Ensure numeric types
+    for c in model_features:
+        if c in X.columns:
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+    # Compute column means on available rows to fill NaNs
+    try:
+        col_means = X[model_features].mean(numeric_only=True)
+        X[model_features] = X[model_features].fillna(col_means).fillna(0.0)
+    except Exception:
+        X[model_features] = X[model_features].fillna(0.0)
     X = X[model_features]
     risk = model.predict_partial_hazard(X).values.reshape(-1)
     return risk
@@ -1861,7 +1920,7 @@ def evaluate_split(
     """Train CoxPH and return (pred_label, risk_scores, metrics dict).
 
     mode in {"sex_agnostic", "male_only", "female_only", "sex_specific"}.
-    Sex-agnostic removes Female from features if present.
+    Sex-agnostic includes Female in features; single-sex models exclude Female.
     """
     if mode == "sex_agnostic":
         # In agnostic model, Female is included
@@ -2129,8 +2188,8 @@ def conversion_and_imputation(
     # Encode ordinal NYHA Class if present
     ordinal = "NYHA Class"
     if ordinal in df.columns:
-        le = LabelEncoder()
-        df[ordinal] = le.fit_transform(df[ordinal].astype(str))
+        # Use robust ordinal encoding instead of LabelEncoder to preserve order
+        df[ordinal] = _encode_nyha_ordinal(df[ordinal])
 
     # Convert binary columns to numeric
     binary_cols = [
@@ -2201,7 +2260,8 @@ def conversion_and_imputation(
 
     # Round NYHA Class
     if "NYHA Class" in imputed_X.columns:
-        imputed_X["NYHA Class"] = imputed_X["NYHA Class"].round().astype("Int64")
+        # Re-encode robustly in case imputation produced non-integer NYHA values
+        imputed_X["NYHA Class"] = _encode_nyha_ordinal(imputed_X["NYHA Class"]).astype("Int64")
 
     return imputed_X
 
@@ -2227,20 +2287,26 @@ def load_dataframes() -> pd.DataFrame:
     icd.columns = [_normalize_column_name(c) for c in icd.columns]
     noicd.columns = [_normalize_column_name(c) for c in noicd.columns]
 
-    # Cockcroft-Gault
-    noicd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = noicd.apply(
-        lambda row: (
-            row["Cockcroft-Gault Creatinine Clearance (mL/min)"]
-            if pd.notna(row["Cockcroft-Gault Creatinine Clearance (mL/min)"])
-            else CG_equation(
+    # Cockcroft-Gault (apply to both sheets to avoid systematic differences)
+    def _fill_cg(row: pd.Series) -> Any:
+        try:
+            val = row["Cockcroft-Gault Creatinine Clearance (mL/min)"]
+        except Exception:
+            val = np.nan
+        if pd.notna(val):
+            return val
+        try:
+            return CG_equation(
                 row["Age at CMR"],
                 row["Weight (Kg)"],
                 row["Female"],
                 row["Serum creatinine (within 3 months of MRI)"],
             )
-        ),
-        axis=1,
-    )
+        except Exception:
+            return np.nan
+
+    icd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = icd.apply(_fill_cg, axis=1)
+    noicd["Cockcroft-Gault Creatinine Clearance (mL/min)"] = noicd.apply(_fill_cg, axis=1)
 
     # Align to the UNION of columns to retain variables unique to either sheet
     all_cols = sorted(set(icd.columns).union(set(noicd.columns)))
@@ -2263,7 +2329,7 @@ def load_dataframes() -> pd.DataFrame:
             else (
                 (row["End follow-up date"] - row["MRI Date"]).days
                 if pd.notna(row["End follow-up date"]) and pd.notna(row["MRI Date"])
-                else None
+                else np.nan
             )
         ),
         axis=1,
@@ -2309,11 +2375,11 @@ def load_dataframes() -> pd.DataFrame:
     if "Cockcroft-Gault Creatinine Clearance (mL/min)" in clean_df.columns:
         clean_df["CrCl>45"] = (
             clean_df["Cockcroft-Gault Creatinine Clearance (mL/min)"] > 45
-        ).astype(int)
+        ).fillna(False).astype(int)
     if "NYHA Class" in clean_df.columns:
-        clean_df["NYHA>2"] = (clean_df["NYHA Class"] > 2).astype(int)
+        clean_df["NYHA>2"] = (clean_df["NYHA Class"] > 2).fillna(False).astype(int)
     if "LGE Burden 5SD" in clean_df.columns:
-        clean_df["Significant LGE"] = (clean_df["LGE Burden 5SD"] > 2).astype(int)
+        clean_df["Significant LGE"] = (clean_df["LGE Burden 5SD"] > 2).fillna(False).astype(int)
 
     return clean_df
 
