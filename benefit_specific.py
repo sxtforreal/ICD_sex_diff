@@ -483,10 +483,11 @@ def _brier_ipcw_at_t(
 
 def make_best_per_sample_labels(event: np.ndarray, p_base: np.ndarray, p_plus: np.ndarray) -> np.ndarray:
     """
-    根据 true label 与 base/plus 风险，生成是否从 plus 受益的二分类标签：
-      - 若 event=1（发生事件），选择预测风险更高的模型
-      - 若 event=0（未发生事件），选择预测风险更低的模型
-    返回 1 表示应选择 plus，0 表示应选择 base。
+    Generate a binary label indicating whether the patient benefits from the
+    "plus" route based on true label and base/plus risks:
+      - If event=1, choose the model with the higher predicted risk.
+      - If event=0, choose the model with the lower predicted risk.
+    Return 1 if "plus" should be chosen, else 0.
     """
     try:
         e = np.asarray(event).astype(int)
@@ -511,7 +512,7 @@ def fit_triage_best_per_sample(
     fs_cv: int = 5,
 ):
     """
-    用 best-per-sample 标签训练分诊分类器。
+    Train the triage classifier using best-per-sample labels.
     """
     try:
         labels = make_best_per_sample_labels(
@@ -545,9 +546,9 @@ def route_with_triage(
     p_plus: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    使用分诊分类器的类别预测进行路由，返回：
-      - 路由后的风险数组
-      - 布尔掩码（True 表示走 plus，False 表示走 base）
+    Route using the triage classifier's predicted class and return:
+      - Routed risk array
+      - Boolean mask (True means route to plus, False to base)
     """
     try:
         if triage_clf is None:
