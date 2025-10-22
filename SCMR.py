@@ -2535,7 +2535,8 @@ def run_cox_experiments(
     """
     model_configs = [
         {"name": "Sex-agnostic (Cox, undersampled)", "mode": "sex_agnostic"},
-        {"name": "Sex-specific (Cox)", "mode": "sex_specific"},
+        {"name": "Sex-specific Shared (Cox)", "mode": "sex_specific", "variant": "shared"},
+        {"name": "Sex-specific Distinct (Cox)", "mode": "sex_specific", "variant": "distinct"},
     ]
     metrics = ["c_index_all", "c_index_male", "c_index_female"]
 
@@ -2608,9 +2609,36 @@ def run_cox_experiments(
                         min_features=None,
                         verbose=False,
                     ) or list(base_feats)
+                    # per-sex distinct feature selection on respective subsets
+                    tr_m_local = tr[tr["Female"] == 0].dropna(subset=[time_col, event_col]).copy()
+                    tr_f_local = tr[tr["Female"] == 1].dropna(subset=[time_col, event_col]).copy()
+                    sel_m = stability_select_features(
+                        df=tr_m_local if not tr_m_local.empty else tr,
+                        candidate_features=list(base_feats),
+                        time_col=time_col,
+                        event_col=event_col,
+                        seeds=seeds_for_stability,
+                        max_features=None,
+                        threshold=0.3,
+                        min_features=None,
+                        verbose=False,
+                    ) or list(base_feats)
+                    sel_f = stability_select_features(
+                        df=tr_f_local if not tr_f_local.empty else tr,
+                        candidate_features=list(base_feats),
+                        time_col=time_col,
+                        event_col=event_col,
+                        seeds=seeds_for_stability,
+                        max_features=None,
+                        threshold=0.3,
+                        min_features=None,
+                        verbose=False,
+                    ) or list(base_feats)
                 else:
                     sel_agn = list(feature_cols)
                     sel_shared = [f for f in feature_cols if f != "Female"]
+                    sel_m = list(sel_shared)
+                    sel_f = list(sel_shared)
 
                 # Use stabilized features and disable per-split selection
                 if cfg["mode"] == "sex_agnostic":
@@ -2627,7 +2655,10 @@ def run_cox_experiments(
                         disable_within_split_feature_selection=True,
                     )
                 else:
-                    overrides = {"male": list(sel_shared), "female": list(sel_shared)}
+                    if cfg.get("variant") == "distinct":
+                        overrides = {"male": list(sel_m), "female": list(sel_f)}
+                    else:
+                        overrides = {"male": list(sel_shared), "female": list(sel_shared)}
                     _progress(f"seed={seed}: Train/Eval {name} (sex-specific)")
                     pred, risk, met = evaluate_split(
                         tr,
