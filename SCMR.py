@@ -629,7 +629,7 @@ def run_heldout_training_and_evaluation(
                     event_col=event_col,
                     seeds=seeds_for_stability,
                     max_features=None,
-                    threshold=0.4,
+                    threshold=0.3,
                     min_features=None,
                     verbose=True,
                 )
@@ -647,7 +647,7 @@ def run_heldout_training_and_evaluation(
                     event_col=event_col,
                     seeds=seeds_for_stability,
                     max_features=None,
-                    threshold=0.4,
+                    threshold=0.3,
                     min_features=None,
                     verbose=True,
                 )
@@ -1261,12 +1261,27 @@ def _sanitize_cox_features_matrix(
         return X, kept
 
     # Remove highly correlated columns (keep the first in order)
+    # Allow environment override; default tighter threshold (0.95)
+    try:
+        env_corr = os.environ.get("SCMR_COX_CORR_THRESHOLD")
+        eff_threshold = (
+            float(env_corr) if env_corr is not None and env_corr.strip() != "" else 0.95
+        )
+    except Exception:
+        eff_threshold = 0.95
+    # If a caller passed an explicit threshold, respect the stricter of the two
+    try:
+        if corr_threshold is not None:
+            eff_threshold = float(min(eff_threshold, float(corr_threshold)))
+    except Exception:
+        pass
+
     corr = X.fillna(0.0).corr().abs()
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-    to_drop = [col for col in upper.columns if (upper[col] >= corr_threshold).any()]
+    to_drop = [col for col in upper.columns if (upper[col] >= eff_threshold).any()]
     if to_drop and verbose:
         print(
-            f"[Cox] Dropping highly correlated columns (|r|>={corr_threshold}): {to_drop}"
+            f"[Cox] Dropping highly correlated columns (|r|>={eff_threshold}): {to_drop}"
         )
     X = X.drop(columns=to_drop, errors="ignore")
 
@@ -1313,7 +1328,19 @@ def fit_cox_model(
         axis=1,
     )
 
-    cph = CoxPHFitter(penalizer=0.1, l1_ratio=0.0)
+    # Allow environment overrides; default with light L1
+    try:
+        pen = os.environ.get("SCMR_COX_PEN")
+        pen_val = float(pen) if pen is not None and pen.strip() != "" else 0.1
+    except Exception:
+        pen_val = 0.1
+    try:
+        l1 = os.environ.get("SCMR_COX_L1_RATIO")
+        l1_val = float(l1) if l1 is not None and l1.strip() != "" else 0.2
+    except Exception:
+        l1_val = 0.2
+
+    cph = CoxPHFitter(penalizer=pen_val, l1_ratio=l1_val)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
@@ -1330,7 +1357,22 @@ def fit_cox_model(
                 ],
                 axis=1,
             )
-            cph = CoxPHFitter(penalizer=1.0, l1_ratio=0.0)
+            # Keep some L1 in fallback as well
+            try:
+                pen_fb = os.environ.get("SCMR_COX_PEN_FALLBACK")
+                pen_fb_val = (
+                    float(pen_fb) if pen_fb is not None and pen_fb.strip() != "" else 1.0
+                )
+            except Exception:
+                pen_fb_val = 1.0
+            try:
+                l1_fb = os.environ.get("SCMR_COX_L1_RATIO_FALLBACK")
+                l1_fb_val = (
+                    float(l1_fb) if l1_fb is not None and l1_fb.strip() != "" else l1_val
+                )
+            except Exception:
+                l1_fb_val = l1_val
+            cph = CoxPHFitter(penalizer=pen_fb_val, l1_ratio=l1_fb_val)
             cph.fit(df_fit2, duration_col=time_col, event_col=event_col, robust=robust)
     return cph
 
@@ -1539,12 +1581,23 @@ def stability_select_features(
     if total_runs == 0 or not counter:
         return list(pool)
 
+    # Allow environment override for stability threshold; default slightly lower (0.3)
+    try:
+        env_thr = os.environ.get("SCMR_FS_THRESHOLD")
+        eff_thr = float(env_thr) if env_thr is not None and env_thr.strip() != "" else 0.3
+    except Exception:
+        eff_thr = 0.3
     # Keep features meeting frequency threshold
     ranked = list(counter.most_common())
     kept: List[str] = []
     for feat, count in ranked:
         freq = count / total_runs
-        if freq >= threshold:
+        # Use the more lenient of configured (threshold arg) and env default eff_thr
+        try:
+            thresh_use = float(min(eff_thr, float(threshold)))
+        except Exception:
+            thresh_use = eff_thr
+        if freq >= thresh_use:
             kept.append(feat)
 
     # No minimum backfilling when min_features is None (allow any size)
@@ -1560,7 +1613,7 @@ def stability_select_features(
     # Final sanitization to avoid collinearity
     if kept:
         X_final, kept_final = _sanitize_cox_features_matrix(
-            df, kept, corr_threshold=0.995, verbose=False
+            df, kept, corr_threshold=0.95, verbose=False
         )
         return list(kept_final)
     return []
@@ -1629,7 +1682,7 @@ def sex_specific_inference(
                 time_col="PE_Time",
                 event_col="VT/VF/SCD",
                 seeds=list(range(20)),
-                threshold=0.4,
+                threshold=0.3,
                 verbose=True,
             )
             # Cache into store for traceability/consistency
@@ -1737,7 +1790,7 @@ def sex_specific_full_inference(
                 time_col="PE_Time",
                 event_col="VT/VF/SCD",
                 seeds=list(range(20)),
-                threshold=0.4,
+                threshold=0.3,
                 verbose=True,
             )
             store_key = (
@@ -1910,7 +1963,7 @@ def sex_agnostic_full_inference(
                     event_col=label_col,
                     seeds=seeds_for_stability,
                     max_features=None,
-                    threshold=0.4,
+                    threshold=0.3,
                     min_features=None,
                     verbose=True,
                 )
@@ -2318,10 +2371,14 @@ def conversion_and_imputation(
         if col in df.columns:
             imputed_X[col] = df[col].values
 
-    # Map to 0/1 by 0.5 threshold for binary cols
-    for c in exist_bin:
+    # Map to 0/1 by 0.5 threshold for binary cols, including all Advanced LGE nominal/binary
+    try:
+        adv_bin_cols = [c for c in ADV_LGE_NOMINAL if c in imputed_X.columns]
+    except Exception:
+        adv_bin_cols = []
+    for c in list(dict.fromkeys(exist_bin + adv_bin_cols)):
         if c in imputed_X.columns:
-            imputed_X[c] = (imputed_X[c] >= 0.5).astype(float)
+            imputed_X[c] = (pd.to_numeric(imputed_X[c], errors="coerce") >= 0.5).astype(float)
 
     # Round NYHA Class
     if "NYHA Class" in imputed_X.columns:
@@ -2534,7 +2591,7 @@ def run_cox_experiments(
                         event_col=event_col,
                         seeds=seeds_for_stability,
                         max_features=None,
-                        threshold=0.4,
+                        threshold=0.3,
                         min_features=None,
                         verbose=False,
                     ) or list(feature_cols)
@@ -2547,7 +2604,7 @@ def run_cox_experiments(
                         event_col=event_col,
                         seeds=seeds_for_stability,
                         max_features=None,
-                        threshold=0.4,
+                        threshold=0.3,
                         min_features=None,
                         verbose=False,
                     ) or list(base_feats)
@@ -2727,6 +2784,8 @@ FEATURE_SETS = {
         "QRS",
         "QTc",
         "CrCl>45",
+        # Include composite LGE score if present; downstream aliasing will drop if missing
+        "LGE_Score",
         # Advanced LGE nominal/binary (use normalized list to avoid whitespace variants)
         *ADV_LGE_NOMINAL,
     ],
