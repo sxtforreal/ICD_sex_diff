@@ -3,8 +3,15 @@ import warnings
 import re
 import json
 import pickle
+import argparse
 import numpy as np
 import pandas as pd
+import matplotlib
+# Use non-interactive backend for HPC/SLURM
+try:
+    matplotlib.use("Agg", force=True)
+except Exception:
+    pass
 import matplotlib.pyplot as plt
 
 plt.switch_backend("Agg")
@@ -629,7 +636,7 @@ def run_heldout_training_and_evaluation(
                     event_col=event_col,
                     seeds=seeds_for_stability,
                     max_features=None,
-                    threshold=0.4,
+                    threshold=0.3,
                     min_features=None,
                     verbose=True,
                 )
@@ -647,7 +654,7 @@ def run_heldout_training_and_evaluation(
                     event_col=event_col,
                     seeds=seeds_for_stability,
                     max_features=None,
-                    threshold=0.4,
+                    threshold=0.3,
                     min_features=None,
                     verbose=True,
                 )
@@ -1261,12 +1268,27 @@ def _sanitize_cox_features_matrix(
         return X, kept
 
     # Remove highly correlated columns (keep the first in order)
+    # Allow environment override; default tighter threshold (0.95)
+    try:
+        env_corr = os.environ.get("SCMR_COX_CORR_THRESHOLD")
+        eff_threshold = (
+            float(env_corr) if env_corr is not None and env_corr.strip() != "" else 0.95
+        )
+    except Exception:
+        eff_threshold = 0.95
+    # If a caller passed an explicit threshold, respect the stricter of the two
+    try:
+        if corr_threshold is not None:
+            eff_threshold = float(min(eff_threshold, float(corr_threshold)))
+    except Exception:
+        pass
+
     corr = X.fillna(0.0).corr().abs()
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-    to_drop = [col for col in upper.columns if (upper[col] >= corr_threshold).any()]
+    to_drop = [col for col in upper.columns if (upper[col] >= eff_threshold).any()]
     if to_drop and verbose:
         print(
-            f"[Cox] Dropping highly correlated columns (|r|>={corr_threshold}): {to_drop}"
+            f"[Cox] Dropping highly correlated columns (|r|>={eff_threshold}): {to_drop}"
         )
     X = X.drop(columns=to_drop, errors="ignore")
 
@@ -1313,7 +1335,19 @@ def fit_cox_model(
         axis=1,
     )
 
-    cph = CoxPHFitter(penalizer=0.1, l1_ratio=0.0)
+    # Allow environment overrides; default with light L1
+    try:
+        pen = os.environ.get("SCMR_COX_PEN")
+        pen_val = float(pen) if pen is not None and pen.strip() != "" else 0.1
+    except Exception:
+        pen_val = 0.1
+    try:
+        l1 = os.environ.get("SCMR_COX_L1_RATIO")
+        l1_val = float(l1) if l1 is not None and l1.strip() != "" else 0.2
+    except Exception:
+        l1_val = 0.2
+
+    cph = CoxPHFitter(penalizer=pen_val, l1_ratio=l1_val)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
@@ -1330,7 +1364,22 @@ def fit_cox_model(
                 ],
                 axis=1,
             )
-            cph = CoxPHFitter(penalizer=1.0, l1_ratio=0.0)
+            # Keep some L1 in fallback as well
+            try:
+                pen_fb = os.environ.get("SCMR_COX_PEN_FALLBACK")
+                pen_fb_val = (
+                    float(pen_fb) if pen_fb is not None and pen_fb.strip() != "" else 1.0
+                )
+            except Exception:
+                pen_fb_val = 1.0
+            try:
+                l1_fb = os.environ.get("SCMR_COX_L1_RATIO_FALLBACK")
+                l1_fb_val = (
+                    float(l1_fb) if l1_fb is not None and l1_fb.strip() != "" else l1_val
+                )
+            except Exception:
+                l1_fb_val = l1_val
+            cph = CoxPHFitter(penalizer=pen_fb_val, l1_ratio=l1_fb_val)
             cph.fit(df_fit2, duration_col=time_col, event_col=event_col, robust=robust)
     return cph
 
@@ -1539,12 +1588,23 @@ def stability_select_features(
     if total_runs == 0 or not counter:
         return list(pool)
 
+    # Allow environment override for stability threshold; default slightly lower (0.3)
+    try:
+        env_thr = os.environ.get("SCMR_FS_THRESHOLD")
+        eff_thr = float(env_thr) if env_thr is not None and env_thr.strip() != "" else 0.3
+    except Exception:
+        eff_thr = 0.3
     # Keep features meeting frequency threshold
     ranked = list(counter.most_common())
     kept: List[str] = []
     for feat, count in ranked:
         freq = count / total_runs
-        if freq >= threshold:
+        # Use the more lenient of configured (threshold arg) and env default eff_thr
+        try:
+            thresh_use = float(min(eff_thr, float(threshold)))
+        except Exception:
+            thresh_use = eff_thr
+        if freq >= thresh_use:
             kept.append(feat)
 
     # No minimum backfilling when min_features is None (allow any size)
@@ -1560,7 +1620,7 @@ def stability_select_features(
     # Final sanitization to avoid collinearity
     if kept:
         X_final, kept_final = _sanitize_cox_features_matrix(
-            df, kept, corr_threshold=0.995, verbose=False
+            df, kept, corr_threshold=0.95, verbose=False
         )
         return list(kept_final)
     return []
@@ -1629,7 +1689,7 @@ def sex_specific_inference(
                 time_col="PE_Time",
                 event_col="VT/VF/SCD",
                 seeds=list(range(20)),
-                threshold=0.4,
+                threshold=0.3,
                 verbose=True,
             )
             # Cache into store for traceability/consistency
@@ -1737,7 +1797,7 @@ def sex_specific_full_inference(
                 time_col="PE_Time",
                 event_col="VT/VF/SCD",
                 seeds=list(range(20)),
-                threshold=0.4,
+                threshold=0.3,
                 verbose=True,
             )
             store_key = (
@@ -1910,7 +1970,7 @@ def sex_agnostic_full_inference(
                     event_col=label_col,
                     seeds=seeds_for_stability,
                     max_features=None,
-                    threshold=0.4,
+                    threshold=0.3,
                     min_features=None,
                     verbose=True,
                 )
@@ -2318,10 +2378,14 @@ def conversion_and_imputation(
         if col in df.columns:
             imputed_X[col] = df[col].values
 
-    # Map to 0/1 by 0.5 threshold for binary cols
-    for c in exist_bin:
+    # Map to 0/1 by 0.5 threshold for binary cols, including all Advanced LGE nominal/binary
+    try:
+        adv_bin_cols = [c for c in ADV_LGE_NOMINAL if c in imputed_X.columns]
+    except Exception:
+        adv_bin_cols = []
+    for c in list(dict.fromkeys(exist_bin + adv_bin_cols)):
         if c in imputed_X.columns:
-            imputed_X[c] = (imputed_X[c] >= 0.5).astype(float)
+            imputed_X[c] = (pd.to_numeric(imputed_X[c], errors="coerce") >= 0.5).astype(float)
 
     # Round NYHA Class
     if "NYHA Class" in imputed_X.columns:
@@ -2478,7 +2542,8 @@ def run_cox_experiments(
     """
     model_configs = [
         {"name": "Sex-agnostic (Cox, undersampled)", "mode": "sex_agnostic"},
-        {"name": "Sex-specific (Cox)", "mode": "sex_specific"},
+        {"name": "Sex-specific Shared (Cox)", "mode": "sex_specific", "variant": "shared"},
+        {"name": "Sex-specific Distinct (Cox)", "mode": "sex_specific", "variant": "distinct"},
     ]
     metrics = ["c_index_all", "c_index_male", "c_index_female"]
 
@@ -2534,7 +2599,7 @@ def run_cox_experiments(
                         event_col=event_col,
                         seeds=seeds_for_stability,
                         max_features=None,
-                        threshold=0.4,
+                        threshold=0.3,
                         min_features=None,
                         verbose=False,
                     ) or list(feature_cols)
@@ -2547,13 +2612,40 @@ def run_cox_experiments(
                         event_col=event_col,
                         seeds=seeds_for_stability,
                         max_features=None,
-                        threshold=0.4,
+                        threshold=0.3,
+                        min_features=None,
+                        verbose=False,
+                    ) or list(base_feats)
+                    # per-sex distinct feature selection on respective subsets
+                    tr_m_local = tr[tr["Female"] == 0].dropna(subset=[time_col, event_col]).copy()
+                    tr_f_local = tr[tr["Female"] == 1].dropna(subset=[time_col, event_col]).copy()
+                    sel_m = stability_select_features(
+                        df=tr_m_local if not tr_m_local.empty else tr,
+                        candidate_features=list(base_feats),
+                        time_col=time_col,
+                        event_col=event_col,
+                        seeds=seeds_for_stability,
+                        max_features=None,
+                        threshold=0.3,
+                        min_features=None,
+                        verbose=False,
+                    ) or list(base_feats)
+                    sel_f = stability_select_features(
+                        df=tr_f_local if not tr_f_local.empty else tr,
+                        candidate_features=list(base_feats),
+                        time_col=time_col,
+                        event_col=event_col,
+                        seeds=seeds_for_stability,
+                        max_features=None,
+                        threshold=0.3,
                         min_features=None,
                         verbose=False,
                     ) or list(base_feats)
                 else:
                     sel_agn = list(feature_cols)
                     sel_shared = [f for f in feature_cols if f != "Female"]
+                    sel_m = list(sel_shared)
+                    sel_f = list(sel_shared)
 
                 # Use stabilized features and disable per-split selection
                 if cfg["mode"] == "sex_agnostic":
@@ -2570,7 +2662,10 @@ def run_cox_experiments(
                         disable_within_split_feature_selection=True,
                     )
                 else:
-                    overrides = {"male": list(sel_shared), "female": list(sel_shared)}
+                    if cfg.get("variant") == "distinct":
+                        overrides = {"male": list(sel_m), "female": list(sel_f)}
+                    else:
+                        overrides = {"male": list(sel_shared), "female": list(sel_shared)}
                     _progress(f"seed={seed}: Train/Eval {name} (sex-specific)")
                     pred, risk, met = evaluate_split(
                         tr,
@@ -2727,6 +2822,8 @@ FEATURE_SETS = {
         "QRS",
         "QTc",
         "CrCl>45",
+        # Include composite LGE score if present; downstream aliasing will drop if missing
+        "LGE_Score",
         # Advanced LGE nominal/binary (use normalized list to avoid whitespace variants)
         *ADV_LGE_NOMINAL,
     ],
@@ -2734,6 +2831,14 @@ FEATURE_SETS = {
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run SCMR experiments (SLURM-ready)")
+    parser.add_argument("--mode", choices=["legacy", "heldout", "full"], default=os.environ.get("SCMR_MODE", "heldout"), help="Which pipeline to run")
+    parser.add_argument("--results_dir", default=os.environ.get("SCMR_RESULTS_DIR", os.path.join(os.getcwd(), "results")))
+    parser.add_argument("--n_splits", type=int, default=int(os.environ.get("SCMR_N_SPLITS", "5")))
+    parser.add_argument("--heldout_test_size", type=float, default=float(os.environ.get("SCMR_HELDOUT_TEST_SIZE", "0.3")))
+    parser.add_argument("--heldout_seed", type=int, default=int(os.environ.get("SCMR_HELDOUT_SEED", "42")))
+    args = parser.parse_args()
+
     # Load and prepare data
     try:
         df = load_dataframes()
@@ -2741,13 +2846,10 @@ if __name__ == "__main__":
         warnings.warn(f"[Main] Data loading failed: {e}")
         raise
 
-    # Output directory override
-    results_dir = os.environ.get("SCMR_RESULTS_DIR") or os.path.join(
-        os.getcwd(), "results"
-    )
+    results_dir = args.results_dir
     os.makedirs(results_dir, exist_ok=True)
 
-    # Generate TableOne grouped by Sex x ICD (four groups)
+    # Lightweight table (optional)
     try:
         generate_tableone_by_sex_icd(
             df,
@@ -2756,94 +2858,44 @@ if __name__ == "__main__":
             ),
         )
     except Exception as e:
-        warnings.warn(f"[Main] TableOne generation skipped due to error: {e}")
+        warnings.warn(f"[Main] TableOne generation skipped: {e}")
 
-    # Toggle legacy multi-split experiments
-    enable_legacy = os.environ.get("SCMR_ENABLE_LEGACY_EXPERIMENTS", "1") == "1"
-    if enable_legacy:
-        try:
-            n_splits_env = int(os.environ.get("SCMR_N_SPLITS", "5"))
-        except Exception:
-            n_splits_env = 5
+    if args.mode == "legacy":
         export_path = os.path.join(results_dir, "results_cox.xlsx")
-        _, summary = run_cox_experiments(
+        _ = run_cox_experiments(
             df=df,
             feature_sets=FEATURE_SETS,
-            N=n_splits_env,
+            N=args.n_splits,
             time_col="PE_Time",
             event_col="VT/VF/SCD",
             export_excel_path=export_path,
         )
         print("Saved Excel:", export_path)
-
-    # Held-out single split training + evaluation across all feature sets
-    enable_heldout = os.environ.get("SCMR_ENABLE_HELDOUT", "1") == "1"
-    if enable_heldout:
-        try:
-            heldout_test_size = float(os.environ.get("SCMR_HELDOUT_TEST_SIZE", "0.3"))
-        except Exception:
-            heldout_test_size = 0.3
-        try:
-            heldout_seed = int(os.environ.get("SCMR_HELDOUT_SEED", "42"))
-        except Exception:
-            heldout_seed = 42
+    elif args.mode == "heldout":
         print("Running held-out training and evaluation...")
-        heldout_summary = run_heldout_training_and_evaluation(
+        _ = run_heldout_training_and_evaluation(
             df=df,
             feature_sets=FEATURE_SETS,
             time_col="PE_Time",
             event_col="VT/VF/SCD",
             results_dir=results_dir,
-            test_size=heldout_test_size,
-            random_state=heldout_seed,
+            test_size=args.heldout_test_size,
+            random_state=args.heldout_seed,
         )
         print("Held-out summary saved to results/heldout/")
+    elif args.mode == "full":
+        # Run all full-data inference blocks
+        for name in ["Guideline", "Benchmark", "DERIVATIVE", "Proposed", "Advanced"]:
+            features = FEATURE_SETS[name]
+            print(f"[Full] {name}: sex-agnostic inference...")
+            _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+            if name in {"Proposed", "Advanced"}:
+                print(f"[Full] {name}: sex-specific inference...")
+                _ = sex_specific_full_inference(df, features)
 
-    # Toggle legacy full-data inference blocks (for visualizations not saved by default)
-    enable_full_data_blocks = os.environ.get("SCMR_ENABLE_FULLDATA_BLOCKS", "0") == "1"
-    if enable_full_data_blocks:
-        # Full-data inference and analysis - Guideline
-        features = FEATURE_SETS["Guideline"]
-        print("Running sex-agnostic full-data inference (includes Female)...")
-        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-        # Guideline: skip sex-specific per requirement
-
-        # Full-data inference and analysis - Benchmark
-        features = FEATURE_SETS["Benchmark"]
-        print("Running sex-agnostic full-data inference (includes Female)...")
-        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-        # Benchmark: skip sex-specific per requirement
-
-        # Full-data inference and analysis - DERIVATIVE
-        features = FEATURE_SETS["DERIVATIVE"]
-        print("Running sex-agnostic full-data inference (includes Female)...")
-        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-        # DERIVATIVE: skip sex-specific per requirement
-
-        # Full-data inference and analysis - Proposed
-        features = FEATURE_SETS["Proposed"]
-        print("Running sex-agnostic full-data inference (includes Female)...")
-        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-        print(
-            "Running sex-specific full-data inference (excludes Female in submodels)..."
-        )
-        _ = sex_specific_full_inference(df, features)
-
-        # Full-data inference and analysis - Advanced
-        features = FEATURE_SETS["Advanced"]
-        print("Running sex-agnostic full-data inference (includes Female)...")
-        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-        print(
-            "Running sex-specific full-data inference (excludes Female in submodels)..."
-        )
-        _ = sex_specific_full_inference(df, features)
-
-    # =============================
-    # Print features used by models
-    # =============================
+    # Print selected feature summaries at the end (safe)
     try:
         print("\n==== Features used by each model ====")
-        # Guideline/Benchmark/DERIVATIVE: no feature selection
         gl_feats = FEATURE_SETS.get("Guideline", [])
         bm_feats = FEATURE_SETS.get("Benchmark", [])
         dv_feats = FEATURE_SETS.get("DERIVATIVE", [])
@@ -2851,7 +2903,6 @@ if __name__ == "__main__":
         print(f"Benchmark (sex-agnostic): {bm_feats}")
         print(f"DERIVATIVE (sex-agnostic): {dv_feats}")
 
-        # Proposed: sex-agnostic + sex-specific if available
         prop_agn = SELECTED_FEATURES_STORE.get("proposed_sex_agnostic")
         prop_agn = prop_agn if prop_agn else FEATURE_SETS.get("Proposed", [])
         prop_m = SELECTED_FEATURES_STORE.get("proposed_sex_specific", {}).get("male")
@@ -2864,7 +2915,6 @@ if __name__ == "__main__":
         print(f"Proposed (male-specific): {prop_m}")
         print(f"Proposed (female-specific): {prop_f}")
 
-        # Advanced: sex-agnostic + sex-specific if available
         adv_agn = SELECTED_FEATURES_STORE.get("advanced_sex_agnostic")
         adv_agn = adv_agn if adv_agn else FEATURE_SETS.get("Advanced", [])
         adv_m = SELECTED_FEATURES_STORE.get("advanced_sex_specific", {}).get("male")
