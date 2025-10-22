@@ -1051,7 +1051,6 @@ def generate_tableone_by_sex_icd(
                 columns=variables,
                 categorical=categorical_cols,
                 groupby="Group",
-                groupby_order=group_order,
                 pval=True,
                 overall=True,
                 missing=True,
@@ -2337,7 +2336,7 @@ def conversion_and_imputation(
         if df[c].dtype == "object":
             df[c] = df[c].replace(
                 {"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0}
-            )
+            ).infer_objects(copy=False)
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # Broadly coerce all requested feature columns to numeric when possible
@@ -2345,7 +2344,7 @@ def conversion_and_imputation(
     yes_no_map = {"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0}
     for c in features:
         if c in df.columns and df[c].dtype == "object":
-            df[c] = df[c].replace(yes_no_map)
+            df[c] = df[c].replace(yes_no_map).infer_objects(copy=False)
             # Extract numerics from strings like "1 superior" -> 1
             try:
                 df[c] = (
