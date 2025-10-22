@@ -3,8 +3,15 @@ import warnings
 import re
 import json
 import pickle
+import argparse
 import numpy as np
 import pandas as pd
+import matplotlib
+# Use non-interactive backend for HPC/SLURM
+try:
+    matplotlib.use("Agg", force=True)
+except Exception:
+    pass
 import matplotlib.pyplot as plt
 
 plt.switch_backend("Agg")
@@ -2824,6 +2831,14 @@ FEATURE_SETS = {
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run SCMR experiments (SLURM-ready)")
+    parser.add_argument("--mode", choices=["legacy", "heldout", "full"], default=os.environ.get("SCMR_MODE", "heldout"), help="Which pipeline to run")
+    parser.add_argument("--results_dir", default=os.environ.get("SCMR_RESULTS_DIR", os.path.join(os.getcwd(), "results")))
+    parser.add_argument("--n_splits", type=int, default=int(os.environ.get("SCMR_N_SPLITS", "5")))
+    parser.add_argument("--heldout_test_size", type=float, default=float(os.environ.get("SCMR_HELDOUT_TEST_SIZE", "0.3")))
+    parser.add_argument("--heldout_seed", type=int, default=int(os.environ.get("SCMR_HELDOUT_SEED", "42")))
+    args = parser.parse_args()
+
     # Load and prepare data
     try:
         df = load_dataframes()
@@ -2831,13 +2846,10 @@ if __name__ == "__main__":
         warnings.warn(f"[Main] Data loading failed: {e}")
         raise
 
-    # Output directory override
-    results_dir = os.environ.get("SCMR_RESULTS_DIR") or os.path.join(
-        os.getcwd(), "results"
-    )
+    results_dir = args.results_dir
     os.makedirs(results_dir, exist_ok=True)
 
-    # Generate TableOne grouped by Sex x ICD (four groups)
+    # Lightweight table (optional)
     try:
         generate_tableone_by_sex_icd(
             df,
@@ -2846,94 +2858,44 @@ if __name__ == "__main__":
             ),
         )
     except Exception as e:
-        warnings.warn(f"[Main] TableOne generation skipped due to error: {e}")
+        warnings.warn(f"[Main] TableOne generation skipped: {e}")
 
-    # Toggle legacy multi-split experiments
-    enable_legacy = os.environ.get("SCMR_ENABLE_LEGACY_EXPERIMENTS", "1") == "1"
-    if enable_legacy:
-        try:
-            n_splits_env = int(os.environ.get("SCMR_N_SPLITS", "5"))
-        except Exception:
-            n_splits_env = 5
+    if args.mode == "legacy":
         export_path = os.path.join(results_dir, "results_cox.xlsx")
-        _, summary = run_cox_experiments(
+        _ = run_cox_experiments(
             df=df,
             feature_sets=FEATURE_SETS,
-            N=n_splits_env,
+            N=args.n_splits,
             time_col="PE_Time",
             event_col="VT/VF/SCD",
             export_excel_path=export_path,
         )
         print("Saved Excel:", export_path)
-
-    # Held-out single split training + evaluation across all feature sets
-    enable_heldout = os.environ.get("SCMR_ENABLE_HELDOUT", "1") == "1"
-    if enable_heldout:
-        try:
-            heldout_test_size = float(os.environ.get("SCMR_HELDOUT_TEST_SIZE", "0.3"))
-        except Exception:
-            heldout_test_size = 0.3
-        try:
-            heldout_seed = int(os.environ.get("SCMR_HELDOUT_SEED", "42"))
-        except Exception:
-            heldout_seed = 42
+    elif args.mode == "heldout":
         print("Running held-out training and evaluation...")
-        heldout_summary = run_heldout_training_and_evaluation(
+        _ = run_heldout_training_and_evaluation(
             df=df,
             feature_sets=FEATURE_SETS,
             time_col="PE_Time",
             event_col="VT/VF/SCD",
             results_dir=results_dir,
-            test_size=heldout_test_size,
-            random_state=heldout_seed,
+            test_size=args.heldout_test_size,
+            random_state=args.heldout_seed,
         )
         print("Held-out summary saved to results/heldout/")
+    elif args.mode == "full":
+        # Run all full-data inference blocks
+        for name in ["Guideline", "Benchmark", "DERIVATIVE", "Proposed", "Advanced"]:
+            features = FEATURE_SETS[name]
+            print(f"[Full] {name}: sex-agnostic inference...")
+            _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
+            if name in {"Proposed", "Advanced"}:
+                print(f"[Full] {name}: sex-specific inference...")
+                _ = sex_specific_full_inference(df, features)
 
-    # Toggle legacy full-data inference blocks (for visualizations not saved by default)
-    enable_full_data_blocks = os.environ.get("SCMR_ENABLE_FULLDATA_BLOCKS", "0") == "1"
-    if enable_full_data_blocks:
-        # Full-data inference and analysis - Guideline
-        features = FEATURE_SETS["Guideline"]
-        print("Running sex-agnostic full-data inference (includes Female)...")
-        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-        # Guideline: skip sex-specific per requirement
-
-        # Full-data inference and analysis - Benchmark
-        features = FEATURE_SETS["Benchmark"]
-        print("Running sex-agnostic full-data inference (includes Female)...")
-        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-        # Benchmark: skip sex-specific per requirement
-
-        # Full-data inference and analysis - DERIVATIVE
-        features = FEATURE_SETS["DERIVATIVE"]
-        print("Running sex-agnostic full-data inference (includes Female)...")
-        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-        # DERIVATIVE: skip sex-specific per requirement
-
-        # Full-data inference and analysis - Proposed
-        features = FEATURE_SETS["Proposed"]
-        print("Running sex-agnostic full-data inference (includes Female)...")
-        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-        print(
-            "Running sex-specific full-data inference (excludes Female in submodels)..."
-        )
-        _ = sex_specific_full_inference(df, features)
-
-        # Full-data inference and analysis - Advanced
-        features = FEATURE_SETS["Advanced"]
-        print("Running sex-agnostic full-data inference (includes Female)...")
-        _ = sex_agnostic_full_inference(df, features, use_undersampling=False)
-        print(
-            "Running sex-specific full-data inference (excludes Female in submodels)..."
-        )
-        _ = sex_specific_full_inference(df, features)
-
-    # =============================
-    # Print features used by models
-    # =============================
+    # Print selected feature summaries at the end (safe)
     try:
         print("\n==== Features used by each model ====")
-        # Guideline/Benchmark/DERIVATIVE: no feature selection
         gl_feats = FEATURE_SETS.get("Guideline", [])
         bm_feats = FEATURE_SETS.get("Benchmark", [])
         dv_feats = FEATURE_SETS.get("DERIVATIVE", [])
@@ -2941,7 +2903,6 @@ if __name__ == "__main__":
         print(f"Benchmark (sex-agnostic): {bm_feats}")
         print(f"DERIVATIVE (sex-agnostic): {dv_feats}")
 
-        # Proposed: sex-agnostic + sex-specific if available
         prop_agn = SELECTED_FEATURES_STORE.get("proposed_sex_agnostic")
         prop_agn = prop_agn if prop_agn else FEATURE_SETS.get("Proposed", [])
         prop_m = SELECTED_FEATURES_STORE.get("proposed_sex_specific", {}).get("male")
@@ -2954,7 +2915,6 @@ if __name__ == "__main__":
         print(f"Proposed (male-specific): {prop_m}")
         print(f"Proposed (female-specific): {prop_f}")
 
-        # Advanced: sex-agnostic + sex-specific if available
         adv_agn = SELECTED_FEATURES_STORE.get("advanced_sex_agnostic")
         adv_agn = adv_agn if adv_agn else FEATURE_SETS.get("Advanced", [])
         adv_m = SELECTED_FEATURES_STORE.get("advanced_sex_specific", {}).get("male")
