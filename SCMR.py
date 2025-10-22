@@ -676,7 +676,7 @@ def run_heldout_training_and_evaluation(
                 )
             pvals = _compute_logrank_pvalues_by_gender(merged)
             hrs = _compute_hr_by_gender(merged)
-                rows.append(
+            rows.append(
                     {
                         "feature_set": featset_name,
                         "mode": "sex_agnostic",
