@@ -58,7 +58,7 @@ except Exception:
 def _progress(message: str) -> None:
     """Lightweight progress printer that always flushes."""
     try:
-        print(f"[进度] {message}", flush=True)
+        print(f"[Progress] {message}", flush=True)
     except Exception:
         pass
 
@@ -526,7 +526,7 @@ def run_heldout_training_and_evaluation(
     for d in [models_dir, figs_dir, preds_dir, meta_dir]:
         _ensure_dir(d)
 
-    _progress("[Heldout] 开始划分训练/测试集并创建输出目录...")
+    _progress("[Heldout] Splitting train/test and creating output directories...")
     # Split
     tr, te = stratified_train_test_split_by_columns(
         df.dropna(subset=[time_col, event_col]).copy(),
@@ -563,7 +563,7 @@ def run_heldout_training_and_evaluation(
     seeds_for_stability = list(range(20))
 
     for featset_name, feature_cols in feature_sets.items():
-        _progress(f"[Heldout] 处理特征集: {featset_name}")
+        _progress(f"[Heldout] Processing feature set: {featset_name}")
         # Stabilize features on TRAIN ONLY for Proposed/Advanced
         used_agnostic_feats = list(feature_cols)
         used_shared_specific_feats: List[str] = [f for f in feature_cols if f != "Female"]
@@ -572,7 +572,7 @@ def run_heldout_training_and_evaluation(
         try:
             if is_proposed or is_advanced:
                 # sex-agnostic selection (includes Female)
-                _progress(f"[Heldout] {featset_name}: 正在进行sex-agnostic稳定性选择...")
+                _progress(f"[Heldout] {featset_name}: Running sex-agnostic stability selection...")
                 sel_agn = stability_select_features(
                     df=tr,
                     candidate_features=list(feature_cols),
@@ -588,7 +588,7 @@ def run_heldout_training_and_evaluation(
                     used_agnostic_feats = list(sel_agn)
                 # sex-specific shared selection (exclude Female)
                 base_feats = [f for f in feature_cols if f != "Female"]
-                _progress(f"[Heldout] {featset_name}: 正在进行sex-specific共享特征稳定性选择...")
+                _progress(f"[Heldout] {featset_name}: Running sex-specific shared stability selection...")
                 sel_shared = stability_select_features(
                     df=tr,
                     candidate_features=list(base_feats),
@@ -607,7 +607,7 @@ def run_heldout_training_and_evaluation(
 
         # ===== Train and persist: sex-agnostic =====
         try:
-            _progress(f"[Heldout] {featset_name}: 训练sex-agnostic模型并保存...")
+            _progress(f"[Heldout] {featset_name}: Training sex-agnostic model and saving artifacts...")
             tr_agn_base = create_undersampled_dataset(tr, event_col, random_state)
             tr_agn = tr_agn_base.dropna(subset=[time_col, event_col]).copy()
             if not tr_agn.empty:
@@ -633,7 +633,7 @@ def run_heldout_training_and_evaluation(
                 )
 
                 # Evaluate on heldout test
-                _progress(f"[Heldout] {featset_name}: 评估sex-agnostic在测试集表现并输出图表...")
+                _progress(f"[Heldout] {featset_name}: Evaluating sex-agnostic on test and exporting plots...")
                 te_eval = te.copy()
                 risk = predict_risk(cph, te_eval, used_agnostic_feats)
                 te_eval["pred_prob"] = risk
@@ -701,7 +701,7 @@ def run_heldout_training_and_evaluation(
             # Only Proposed/Advanced run sex-specific per requirement
             if featset_name not in {"Proposed", "Advanced"}:
                 raise RuntimeError("Skip sex-specific for non P/A feature sets")
-            _progress(f"[Heldout] {featset_name}: 训练sex-specific模型(男/女)并保存...")
+            _progress(f"[Heldout] {featset_name}: Training sex-specific models (male/female) and saving artifacts...")
             tr_m = tr[tr["Female"] == 0].dropna(subset=[time_col, event_col]).copy()
             tr_f = tr[tr["Female"] == 1].dropna(subset=[time_col, event_col]).copy()
             te_m = te[te["Female"] == 0].copy()
@@ -779,7 +779,7 @@ def run_heldout_training_and_evaluation(
             )
 
             # Evaluate on test
-            _progress(f"[Heldout] {featset_name}: 评估sex-specific在测试集表现并输出图表...")
+            _progress(f"[Heldout] {featset_name}: Evaluating sex-specific on test and exporting plots...")
             te_out = te.copy()
             if "male" in models_specific and not te_m.empty:
                 r_m = predict_risk(
@@ -854,7 +854,7 @@ def run_heldout_training_and_evaluation(
         except Exception as e:
             warnings.warn(f"[Heldout][{featset_name}] sex-specific skipped/failed: {e}")
 
-    _progress("[Heldout] 保存汇总指标到CSV/XLSX...")
+    _progress("[Heldout] Saving summary metrics to CSV/XLSX...")
     summary_df = pd.DataFrame(rows)
     try:
         summary_path_csv = os.path.join(results_dir, "heldout", "summary_metrics.csv")
@@ -1192,7 +1192,11 @@ def _sanitize_cox_features_matrix(
 
 
 def fit_cox_model(
-    train_df: pd.DataFrame, feature_cols: List[str], time_col: str, event_col: str
+    train_df: pd.DataFrame,
+    feature_cols: List[str],
+    time_col: str,
+    event_col: str,
+    robust: bool = True,
 ) -> CoxPHFitter:
     # Guard against missing columns in feature list
     present_features = [c for c in feature_cols if c in train_df.columns]
@@ -1220,7 +1224,9 @@ def fit_cox_model(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
-            cph.fit(df_fit, duration_col=time_col, event_col=event_col, robust=True)
+            cph.fit(
+                df_fit, duration_col=time_col, event_col=event_col, robust=robust
+            )
         except ConvergenceError:
             # Fallback: stronger regularization and stricter collinearity removal
             X_sanitized2, _ = _sanitize_cox_features_matrix(
@@ -1234,7 +1240,9 @@ def fit_cox_model(
                 axis=1,
             )
             cph = CoxPHFitter(penalizer=1.0, l1_ratio=0.0)
-            cph.fit(df_fit2, duration_col=time_col, event_col=event_col, robust=True)
+            cph.fit(
+                df_fit2, duration_col=time_col, event_col=event_col, robust=robust
+            )
     return cph
 
 
@@ -1324,7 +1332,10 @@ def select_features_max_cindex_forward(
         for feat in remaining:
             trial_feats = selected + [feat]
             try:
-                cph = fit_cox_model(inner_tr, trial_feats, time_col, event_col)
+                # Use non-robust fitting for speed during feature selection
+                cph = fit_cox_model(
+                    inner_tr, trial_feats, time_col, event_col, robust=False
+                )
                 risk_val = predict_risk(cph, inner_val, trial_feats)
                 cidx = concordance_index(
                     inner_val[time_col], -risk_val, inner_val[event_col]
@@ -1369,6 +1380,23 @@ def stability_select_features(
     if df is None or df.empty:
         return []
 
+    # Allow environment overrides for selection verbosity and max features
+    try:
+        if max_features is None:
+            _mf = os.environ.get("SCMR_FS_MAX_FEATURES")
+            if _mf is not None and _mf.strip() != "":
+                _mf_int = int(_mf)
+                max_features = None if _mf_int <= 0 else _mf_int
+    except Exception:
+        pass
+
+    env_verbose = str(os.environ.get("SCMR_FS_VERBOSE", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    _verbose = bool(verbose or env_verbose)
+
     # Initial sanitized pool
     try:
         _, pool = _sanitize_cox_features_matrix(
@@ -1387,7 +1415,7 @@ def stability_select_features(
     total_seeds = len(seeds)
     for idx, s in enumerate(seeds, start=1):
         try:
-            if verbose:
+            if _verbose:
                 try:
                     print(f"[FS][Stability] seed {idx}/{total_seeds} -> start")
                 except Exception:
@@ -1399,7 +1427,7 @@ def stability_select_features(
                 event_col=event_col,
                 random_state=s,
                 max_features=max_features,
-                verbose=verbose,
+                verbose=_verbose,
             )
             if sel:
                 counter.update(sel)
@@ -1420,7 +1448,7 @@ def stability_select_features(
 
     # No minimum backfilling when min_features is None (allow any size)
 
-    if verbose:
+    if _verbose:
         try:
             print(
                 f"[FS][Stability] kept {len(kept)} features (threshold={threshold}) out of pool {len(pool)}"
@@ -1590,7 +1618,7 @@ def sex_specific_full_inference(
     - Excludes Female from submodel features
     - Dichotomizes by sex-specific median risks
     """
-    _progress("[Full] Sex-specific: 准备共享特征并进行稳定性选择(若启用)...")
+    _progress("[Full] Sex-specific: Preparing shared features and running stability selection (if enabled)...")
     # Build one shared feature set for both sexes (exclude Female)
     base_candidates = [f for f in features if f != "Female"]
     try:
@@ -1625,7 +1653,7 @@ def sex_specific_full_inference(
     thresholds = {}
 
     if not data_m.empty:
-        _progress("[Full] Sex-specific: 训练男性模型并绘图...")
+        _progress("[Full] Sex-specific: Training male model and plotting...")
         used_features_m = list(shared_features)
         cph_m = fit_cox_model(data_m, used_features_m, "PE_Time", "VT/VF/SCD")
         r_m = predict_risk(cph_m, data_m, used_features_m)
@@ -1640,7 +1668,7 @@ def sex_specific_full_inference(
             effect_scale="per_sd",
         )
     if not data_f.empty:
-        _progress("[Full] Sex-specific: 训练女性模型并绘图...")
+        _progress("[Full] Sex-specific: Training female model and plotting...")
         used_features_f = list(shared_features)
         cph_f = fit_cox_model(data_f, used_features_f, "PE_Time", "VT/VF/SCD")
         r_f = predict_risk(cph_f, data_f, used_features_f)
@@ -1680,7 +1708,7 @@ def sex_specific_full_inference(
         .drop_duplicates(subset=["MRN"])
         .rename(columns={"VT/VF/SCD": "PE"})
     )
-    _progress("[Full] Sex-specific: 生成KM图并完成")
+    _progress("[Full] Sex-specific: Generated KM plots and finished")
     plot_km_two_subplots_by_gender(merged_df)
     return merged_df
 
@@ -1749,7 +1777,7 @@ def sex_agnostic_full_inference(
     - Includes Female in features
     - Dichotomizes risk by overall median
     """
-    _progress("[Full] Sex-agnostic: 开始数据准备与特征稳定性选择...")
+    _progress("[Full] Sex-agnostic: Starting data prep and feature stability selection...")
     df_base = (
         create_undersampled_dataset(df, label_col, 42) if use_undersampling else df
     )
@@ -1786,7 +1814,7 @@ def sex_agnostic_full_inference(
     if data.empty:
         return pd.DataFrame()
 
-    _progress("[Full] Sex-agnostic: 训练模型与绘制系数图...")
+    _progress("[Full] Sex-agnostic: Training model and plotting coefficients...")
     cph = fit_cox_model(data, used_features, "PE_Time", label_col)
     plot_cox_coefficients(
         cph,
@@ -1808,7 +1836,7 @@ def sex_agnostic_full_inference(
         .drop_duplicates(subset=["MRN"])
         .rename(columns={label_col: "PE"})
     )
-    _progress("[Full] Sex-agnostic: 生成KM图并完成")
+    _progress("[Full] Sex-agnostic: Generated KM plots and finished")
     plot_km_two_subplots_by_gender(merged_df)
     return merged_df
 
@@ -2146,6 +2174,11 @@ def conversion_and_imputation(
 
     # Imputation on feature matrix
     X = df[features].copy()
+    # Optional: downcast float64 to float32 before MissForest to speed up
+    try:
+        X = X.apply(lambda s: s.astype(np.float32) if s.dtype.kind == 'f' else s)
+    except Exception:
+        pass
     missing_cols = X.columns[X.isnull().any()].tolist()
     if missing_cols:
         imputed_part = impute_misforest(X[missing_cols], 0)
@@ -2316,12 +2349,21 @@ def run_cox_experiments(
             results[f"{featset_name} - {cfg['name']}"] = {m: [] for m in metrics}
 
     # Seeds for per-split stability selection (train-only)
-    seeds_for_stability = list(range(min(N, 20)))
+    # Allow override via environment variable SCMR_STABILITY_SEEDS
+    try:
+        _ss = os.environ.get("SCMR_STABILITY_SEEDS")
+        if _ss is not None and _ss.strip() != "":
+            ss_count = max(1, int(_ss))
+        else:
+            ss_count = min(N, 20)
+    except Exception:
+        ss_count = min(N, 20)
+    seeds_for_stability = list(range(ss_count))
 
-    _progress(f"开始多次随机划分实验: N={N}, 特征集={list(feature_sets.keys())}")
+    _progress(f"Starting multi-split experiments: N={N}, feature_sets={list(feature_sets.keys())}")
     for seed in range(N):
         if seed % max(1, N // 10) == 0:
-            _progress(f"进度 {seed}/{N} 个划分...")
+            _progress(f"Progress {seed}/{N} splits...")
         tr, te = train_test_split(
             df, test_size=0.3, random_state=seed, stratify=df[event_col]
         )
@@ -2338,7 +2380,7 @@ def run_cox_experiments(
                 # Per-split stability selection on train only for Proposed/Advanced
                 if featset_name in {"Proposed", "Advanced"}:
                     _progress(
-                        f"seed={seed}: 特征集[{featset_name}] 进行稳定性选择(sex-agnostic/shared)"
+                        f"seed={seed}: Feature set [{featset_name}] stability selection (sex-agnostic/shared)"
                     )
                     # sex-agnostic candidates include Female
                     sel_agn = stability_select_features(
@@ -2372,7 +2414,7 @@ def run_cox_experiments(
                 # Use stabilized features and disable per-split selection
                 if cfg["mode"] == "sex_agnostic":
                     _progress(
-                        f"seed={seed}: 训练/评估 {name} (sex-agnostic)"
+                        f"seed={seed}: Train/Eval {name} (sex-agnostic)"
                     )
                     pred, risk, met = evaluate_split(
                         tr,
@@ -2388,7 +2430,7 @@ def run_cox_experiments(
                 else:
                     overrides = {"male": list(sel_shared), "female": list(sel_shared)}
                     _progress(
-                        f"seed={seed}: 训练/评估 {name} (sex-specific)"
+                        f"seed={seed}: Train/Eval {name} (sex-specific)"
                     )
                     pred, risk, met = evaluate_split(
                         tr,
@@ -2436,7 +2478,7 @@ def run_cox_experiments(
                 results[name]["c_index_male"].append(cidx_m)
                 results[name]["c_index_female"].append(cidx_f)
 
-    _progress("完成所有划分，正在汇总结果...")
+    _progress("All splits finished, summarizing results...")
     # Summarize
     summary = {}
     for model, mvals in results.items():
