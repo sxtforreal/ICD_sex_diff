@@ -1192,7 +1192,11 @@ def _sanitize_cox_features_matrix(
 
 
 def fit_cox_model(
-    train_df: pd.DataFrame, feature_cols: List[str], time_col: str, event_col: str
+    train_df: pd.DataFrame,
+    feature_cols: List[str],
+    time_col: str,
+    event_col: str,
+    robust: bool = True,
 ) -> CoxPHFitter:
     # Guard against missing columns in feature list
     present_features = [c for c in feature_cols if c in train_df.columns]
@@ -1220,7 +1224,9 @@ def fit_cox_model(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
-            cph.fit(df_fit, duration_col=time_col, event_col=event_col, robust=True)
+            cph.fit(
+                df_fit, duration_col=time_col, event_col=event_col, robust=robust
+            )
         except ConvergenceError:
             # Fallback: stronger regularization and stricter collinearity removal
             X_sanitized2, _ = _sanitize_cox_features_matrix(
@@ -1234,7 +1240,9 @@ def fit_cox_model(
                 axis=1,
             )
             cph = CoxPHFitter(penalizer=1.0, l1_ratio=0.0)
-            cph.fit(df_fit2, duration_col=time_col, event_col=event_col, robust=True)
+            cph.fit(
+                df_fit2, duration_col=time_col, event_col=event_col, robust=robust
+            )
     return cph
 
 
@@ -1324,7 +1332,10 @@ def select_features_max_cindex_forward(
         for feat in remaining:
             trial_feats = selected + [feat]
             try:
-                cph = fit_cox_model(inner_tr, trial_feats, time_col, event_col)
+                # Use non-robust fitting for speed during feature selection
+                cph = fit_cox_model(
+                    inner_tr, trial_feats, time_col, event_col, robust=False
+                )
                 risk_val = predict_risk(cph, inner_val, trial_feats)
                 cidx = concordance_index(
                     inner_val[time_col], -risk_val, inner_val[event_col]
@@ -1369,6 +1380,23 @@ def stability_select_features(
     if df is None or df.empty:
         return []
 
+    # Allow environment overrides for selection verbosity and max features
+    try:
+        if max_features is None:
+            _mf = os.environ.get("SCMR_FS_MAX_FEATURES")
+            if _mf is not None and _mf.strip() != "":
+                _mf_int = int(_mf)
+                max_features = None if _mf_int <= 0 else _mf_int
+    except Exception:
+        pass
+
+    env_verbose = str(os.environ.get("SCMR_FS_VERBOSE", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    _verbose = bool(verbose or env_verbose)
+
     # Initial sanitized pool
     try:
         _, pool = _sanitize_cox_features_matrix(
@@ -1387,7 +1415,7 @@ def stability_select_features(
     total_seeds = len(seeds)
     for idx, s in enumerate(seeds, start=1):
         try:
-            if verbose:
+            if _verbose:
                 try:
                     print(f"[FS][Stability] seed {idx}/{total_seeds} -> start")
                 except Exception:
@@ -1399,7 +1427,7 @@ def stability_select_features(
                 event_col=event_col,
                 random_state=s,
                 max_features=max_features,
-                verbose=verbose,
+                verbose=_verbose,
             )
             if sel:
                 counter.update(sel)
@@ -1420,7 +1448,7 @@ def stability_select_features(
 
     # No minimum backfilling when min_features is None (allow any size)
 
-    if verbose:
+    if _verbose:
         try:
             print(
                 f"[FS][Stability] kept {len(kept)} features (threshold={threshold}) out of pool {len(pool)}"
@@ -2146,6 +2174,11 @@ def conversion_and_imputation(
 
     # Imputation on feature matrix
     X = df[features].copy()
+    # Optional: downcast float64 to float32 before MissForest to speed up
+    try:
+        X = X.apply(lambda s: s.astype(np.float32) if s.dtype.kind == 'f' else s)
+    except Exception:
+        pass
     missing_cols = X.columns[X.isnull().any()].tolist()
     if missing_cols:
         imputed_part = impute_misforest(X[missing_cols], 0)
@@ -2316,7 +2349,16 @@ def run_cox_experiments(
             results[f"{featset_name} - {cfg['name']}"] = {m: [] for m in metrics}
 
     # Seeds for per-split stability selection (train-only)
-    seeds_for_stability = list(range(min(N, 20)))
+    # Allow override via environment variable SCMR_STABILITY_SEEDS
+    try:
+        _ss = os.environ.get("SCMR_STABILITY_SEEDS")
+        if _ss is not None and _ss.strip() != "":
+            ss_count = max(1, int(_ss))
+        else:
+            ss_count = min(N, 20)
+    except Exception:
+        ss_count = min(N, 20)
+    seeds_for_stability = list(range(ss_count))
 
     _progress(f"开始多次随机划分实验: N={N}, 特征集={list(feature_sets.keys())}")
     for seed in range(N):
