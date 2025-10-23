@@ -146,7 +146,7 @@ def _build_alias_map(columns: List[str]) -> Dict[str, str]:
 
 
 # ==========================================
-# Advanced LGE nominal/binary feature names (normalized)
+# Advanced LGE nominal feature names (normalized)
 # ==========================================
 ADV_LGE_NOMINAL: List[str] = [
     _normalize_column_name(s)
@@ -172,6 +172,38 @@ ADV_LGE_NOMINAL: List[str] = [
         "LGE_Circumural",
         "LGE_Ring-Like",
     ]
+]
+
+# ================= Variable type declarations =================
+# Binary features (0/1)
+BINARY_FEATURES: List[str] = [
+    "Female",
+    "DM",
+    "HTN",
+    "HLP",
+    "AF",
+    "Beta Blocker",
+    "ACEi/ARB/ARNi",
+    "Aldosterone Antagonist",
+    "VT/VF/SCD",
+    "AAD",
+    "CRT",
+    # Not model features but treated as binary for cleaning
+    "ICD",
+]
+
+# Nominal (multi-level, not ordinal) categorical features
+NOMINAL_MULTICLASS_FEATURES: List[str] = [
+    _normalize_column_name(
+        "LGE_Extent (1; subendocardial, 2; mid mural, 3; epicardial, 4; transmural; 5 circumural)"
+    ),
+    *ADV_LGE_NOMINAL,
+]
+
+# Ordinal categorical features kept as numeric ordered
+ORDINAL_FEATURES: List[str] = [
+    "LGE_Score",
+    "NYHA Class",
 ]
 
 
@@ -1036,7 +1068,7 @@ def generate_tableone_by_sex_icd(
         "CrCl>45",
         "Significant LGE",
     ]
-    # Extend categorical set with Advanced LGE nominal/binary variables if present
+    # Extend categorical set with Advanced LGE nominal variables if present
     try:
         adv_lge_cats = [c for c in ADV_LGE_NOMINAL if c in variables]
     except Exception:
@@ -1235,7 +1267,13 @@ def _sanitize_cox_features_matrix(
     verbose: bool = True,
 ) -> Tuple[pd.DataFrame, List[str]]:
     original_features = list(feature_cols)
-    X = df[feature_cols].copy()
+    # Prioritize core features so they are kept when collinearity is high
+    # This protects DERIVATIVE core inside larger Advanced sets
+    COX_SANITIZE_PRIORITY: List[str] = ["LGE_Score", "LVEF", "Female"]
+    ordered_cols: List[str] = [
+        c for c in COX_SANITIZE_PRIORITY if c in feature_cols
+    ] + [c for c in feature_cols if c not in COX_SANITIZE_PRIORITY]
+    X = df[ordered_cols].copy()
     for c in X.columns:
         X[c] = pd.to_numeric(X[c], errors="coerce")
 
@@ -1427,6 +1465,9 @@ def select_features_max_cindex_forward(
 
     - Uses an inner 70/30 split of train_df for selection.
     - Applies the same sanitization as model fitting to avoid degenerate cols.
+    - Automatically anchors strong core predictors when available
+      ("LGE_Score", "LVEF", and "Female" if present) so richer sets
+      like Advanced cannot underperform DERIVATIVE by accidentally omitting them.
     - Returns a subset (possibly empty -> will be handled by callers).
     """
     df_local = train_df.dropna(subset=[time_col, event_col]).copy()
@@ -1457,7 +1498,9 @@ def select_features_max_cindex_forward(
             df_local, test_size=0.3, random_state=random_state
         )
 
-    selected: List[str] = []
+    # Initialize with anchors if present in the sanitized pool
+    anchor_candidates = ["LGE_Score", "LVEF", "Female"]
+    selected: List[str] = [f for f in anchor_candidates if f in pool]
     best_cidx: float = -np.inf
     remaining = list(pool)
 
@@ -1467,6 +1510,17 @@ def select_features_max_cindex_forward(
         if max_features is None
         else max(0, min(len(remaining), max_features))
     )
+
+    # If we start with anchors, compute their baseline C-index once
+    if len(selected) > 0:
+        try:
+            cph0 = fit_cox_model(inner_tr, selected, time_col, event_col, robust=False)
+            risk0 = predict_risk(cph0, inner_val, selected)
+            best_cidx = float(
+                concordance_index(inner_val[time_col], -risk0, inner_val[event_col])
+            )
+        except Exception:
+            best_cidx = -np.inf
 
     for step_idx in range(max_iters):
         best_feat = None
@@ -1585,7 +1639,9 @@ def stability_select_features(
             continue
 
     if total_runs == 0 or not counter:
-        return list(pool)
+        # Fall back to pool but ensure anchors are present if available
+        anchors = [f for f in ["LGE_Score", "LVEF", "Female"] if f in pool]
+        return list(dict.fromkeys(anchors + list(pool)))
 
     # Allow environment override for stability threshold; default slightly lower (0.3)
     try:
@@ -1593,9 +1649,10 @@ def stability_select_features(
         eff_thr = float(env_thr) if env_thr is not None and env_thr.strip() != "" else 0.3
     except Exception:
         eff_thr = 0.3
-    # Keep features meeting frequency threshold
+    # Keep features meeting frequency threshold, with anchor bias
     ranked = list(counter.most_common())
     kept: List[str] = []
+    anchors = [f for f in ["LGE_Score", "LVEF", "Female"] if f in pool]
     for feat, count in ranked:
         freq = count / total_runs
         # Use the more lenient of configured (threshold arg) and env default eff_thr
@@ -1603,7 +1660,8 @@ def stability_select_features(
             thresh_use = float(min(eff_thr, float(threshold)))
         except Exception:
             thresh_use = eff_thr
-        if freq >= thresh_use:
+        # Always keep anchors when available
+        if feat in anchors or freq >= thresh_use:
             kept.append(feat)
 
     # No minimum backfilling when min_features is None (allow any size)
@@ -2314,24 +2372,8 @@ def conversion_and_imputation(
         df[ordinal] = _encode_nyha_ordinal(df[ordinal])
 
     # Convert binary columns to numeric
-    binary_cols = [
-        "Female",
-        "DM",
-        "HTN",
-        "HLP",
-        "AF",
-        "Beta Blocker",
-        "ACEi/ARB/ARNi",
-        "Aldosterone Antagonist",
-        "VT/VF/SCD",
-        "AAD",
-        "CRT",
-        "ICD",
-        # Newly added binary variables
-        "LGE_Circumural",
-        "LGE_Ring-Like",
-    ]
-    exist_bin = [c for c in binary_cols if c in df.columns]
+    binary_cols = [c for c in BINARY_FEATURES if c in df.columns]
+    exist_bin = list(binary_cols)
     for c in exist_bin:
         if df[c].dtype == "object":
             df[c] = df[c].replace(
@@ -2339,20 +2381,27 @@ def conversion_and_imputation(
             ).infer_objects(copy=False)
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Broadly coerce all requested feature columns to numeric when possible
-    # This covers Advanced/DERIVATIVE columns that are binary-like but not in known list
+    # Prepare nominal multi-class: cast to string category without forcing numeric
+    for c in NOMINAL_MULTICLASS_FEATURES:
+        if c in df.columns:
+            df[c] = df[c].astype(str)
+
+    # Ordinal categorical: encode with robust ordinal mapping where needed
+    if "NYHA Class" in df.columns:
+        df["NYHA Class"] = _encode_nyha_ordinal(df["NYHA Class"])
+
+    # For all remaining features, coerce plausibly numeric strings to float; leave nominal as-is
     yes_no_map = {"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0}
     for c in features:
-        if c in df.columns and df[c].dtype == "object":
-            df[c] = df[c].replace(yes_no_map).infer_objects(copy=False)
-            # Extract numerics from strings like "1 superior" -> 1
-            try:
-                df[c] = (
-                    df[c].astype(str).str.extract(r"(-?\d+(?:\.\d+)?)").astype(float)
-                )
-            except Exception:
-                pass
-        if c in df.columns:
+        if c in df.columns and c not in NOMINAL_MULTICLASS_FEATURES:
+            if df[c].dtype == "object":
+                df[c] = df[c].replace(yes_no_map).infer_objects(copy=False)
+                try:
+                    df[c] = (
+                        df[c].astype(str).str.extract(r"(-?\d+(?:\.\d+)?)").astype(float)
+                    )
+                except Exception:
+                    pass
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # Imputation on feature matrix
@@ -2377,12 +2426,8 @@ def conversion_and_imputation(
         if col in df.columns:
             imputed_X[col] = df[col].values
 
-    # Map to 0/1 by 0.5 threshold for binary cols, including all Advanced LGE nominal/binary
-    try:
-        adv_bin_cols = [c for c in ADV_LGE_NOMINAL if c in imputed_X.columns]
-    except Exception:
-        adv_bin_cols = []
-    for c in list(dict.fromkeys(exist_bin + adv_bin_cols)):
+    # Map binary to 0/1 (only declared binary features)
+    for c in exist_bin:
         if c in imputed_X.columns:
             imputed_X[c] = (pd.to_numeric(imputed_X[c], errors="coerce") >= 0.5).astype(float)
 
@@ -2476,24 +2521,12 @@ def load_dataframes() -> pd.DataFrame:
     )
 
     # Variables
-    categorical = [
-        "Female",
-        "DM",
-        "HTN",
-        "HLP",
-        "AF",
-        "NYHA Class",
-        "Beta Blocker",
-        "ACEi/ARB/ARNi",
-        "Aldosterone Antagonist",
-        "VT/VF/SCD",
-        "AAD",
-        "CRT",
-        "ICD",
+    # Mark categorical columns for I/O consistency (binary + nominal)
+    categorical = [c for c in BINARY_FEATURES if c in nicm.columns] + [
+        c for c in NOMINAL_MULTICLASS_FEATURES if c in nicm.columns
     ]
-    # Extend with newly introduced nominal/binary LGE columns when present (normalized names)
-    categorical += [c for c in ADV_LGE_NOMINAL if c in nicm.columns]
-    nicm[categorical] = nicm[categorical].astype("object")
+    if categorical:
+        nicm[categorical] = nicm[categorical].astype("object")
     var = nicm.columns.tolist()
     labels = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
     features = [v for v in var if v not in labels]
@@ -2823,7 +2856,7 @@ FEATURE_SETS = {
         "CrCl>45",
         # Include composite LGE score if present; downstream aliasing will drop if missing
         "LGE_Score",
-        # Advanced LGE nominal/binary (use normalized list to avoid whitespace variants)
+        # Advanced LGE variables (treated as nominal multi-class; not binarized)
         *ADV_LGE_NOMINAL,
     ],
 }
