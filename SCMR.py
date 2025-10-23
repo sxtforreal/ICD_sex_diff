@@ -174,6 +174,13 @@ ADV_LGE_NOMINAL: List[str] = [
     ]
 ]
 
+# Split Advanced LGE variables into binary vs. ordinal to avoid
+# incorrectly binarizing non-binary variables like RV insertion site.
+ADV_LGE_ORDINAL: List[str] = [
+    _normalize_column_name("LGE_RV insertion site (1 superior, 2 inferior. 3 both)")
+]
+ADV_LGE_BINARY: List[str] = [c for c in ADV_LGE_NOMINAL if c not in ADV_LGE_ORDINAL]
+
 
 def create_undersampled_dataset(
     train_df: pd.DataFrame, label_col: str, random_state: int
@@ -1036,9 +1043,9 @@ def generate_tableone_by_sex_icd(
         "CrCl>45",
         "Significant LGE",
     ]
-    # Extend categorical set with Advanced LGE nominal/binary variables if present
+    # Extend categorical set with Advanced LGE binary variables if present
     try:
-        adv_lge_cats = [c for c in ADV_LGE_NOMINAL if c in variables]
+        adv_lge_cats = [c for c in ADV_LGE_BINARY if c in variables]
     except Exception:
         adv_lge_cats = []
     categorical_cols = [c for c in known_cats if c in variables] + adv_lge_cats
@@ -1235,7 +1242,13 @@ def _sanitize_cox_features_matrix(
     verbose: bool = True,
 ) -> Tuple[pd.DataFrame, List[str]]:
     original_features = list(feature_cols)
-    X = df[feature_cols].copy()
+    # Prioritize core features so they are kept when collinearity is high
+    # This protects DERIVATIVE core inside larger Advanced sets
+    COX_SANITIZE_PRIORITY: List[str] = ["LGE_Score", "LVEF", "Female"]
+    ordered_cols: List[str] = [
+        c for c in COX_SANITIZE_PRIORITY if c in feature_cols
+    ] + [c for c in feature_cols if c not in COX_SANITIZE_PRIORITY]
+    X = df[ordered_cols].copy()
     for c in X.columns:
         X[c] = pd.to_numeric(X[c], errors="coerce")
 
@@ -2377,14 +2390,16 @@ def conversion_and_imputation(
         if col in df.columns:
             imputed_X[col] = df[col].values
 
-    # Map to 0/1 by 0.5 threshold for binary cols, including all Advanced LGE nominal/binary
+    # Map to 0/1 only for confirmed binary cols (exclude ordinal LGE variables)
     try:
-        adv_bin_cols = [c for c in ADV_LGE_NOMINAL if c in imputed_X.columns]
+        adv_bin_cols = [c for c in ADV_LGE_BINARY if c in imputed_X.columns]
     except Exception:
         adv_bin_cols = []
     for c in list(dict.fromkeys(exist_bin + adv_bin_cols)):
         if c in imputed_X.columns:
-            imputed_X[c] = (pd.to_numeric(imputed_X[c], errors="coerce") >= 0.5).astype(float)
+            imputed_X[c] = (
+                pd.to_numeric(imputed_X[c], errors="coerce") >= 0.5
+            ).astype(float)
 
     # Round NYHA Class
     if "NYHA Class" in imputed_X.columns:
@@ -2491,8 +2506,8 @@ def load_dataframes() -> pd.DataFrame:
         "CRT",
         "ICD",
     ]
-    # Extend with newly introduced nominal/binary LGE columns when present (normalized names)
-    categorical += [c for c in ADV_LGE_NOMINAL if c in nicm.columns]
+    # Extend with newly introduced Advanced LGE binary columns (exclude ordinal)
+    categorical += [c for c in ADV_LGE_BINARY if c in nicm.columns]
     nicm[categorical] = nicm[categorical].astype("object")
     var = nicm.columns.tolist()
     labels = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
@@ -2823,8 +2838,8 @@ FEATURE_SETS = {
         "CrCl>45",
         # Include composite LGE score if present; downstream aliasing will drop if missing
         "LGE_Score",
-        # Advanced LGE nominal/binary (use normalized list to avoid whitespace variants)
-        *ADV_LGE_NOMINAL,
+        # Advanced LGE variables (binary subset only; ordinal handled numerically)
+        *ADV_LGE_BINARY,
     ],
 }
 
