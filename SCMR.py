@@ -1440,6 +1440,9 @@ def select_features_max_cindex_forward(
 
     - Uses an inner 70/30 split of train_df for selection.
     - Applies the same sanitization as model fitting to avoid degenerate cols.
+    - Automatically anchors strong core predictors when available
+      ("LGE_Score", "LVEF", and "Female" if present) so richer sets
+      like Advanced cannot underperform DERIVATIVE by accidentally omitting them.
     - Returns a subset (possibly empty -> will be handled by callers).
     """
     df_local = train_df.dropna(subset=[time_col, event_col]).copy()
@@ -1470,7 +1473,9 @@ def select_features_max_cindex_forward(
             df_local, test_size=0.3, random_state=random_state
         )
 
-    selected: List[str] = []
+    # Initialize with anchors if present in the sanitized pool
+    anchor_candidates = ["LGE_Score", "LVEF", "Female"]
+    selected: List[str] = [f for f in anchor_candidates if f in pool]
     best_cidx: float = -np.inf
     remaining = list(pool)
 
@@ -1480,6 +1485,17 @@ def select_features_max_cindex_forward(
         if max_features is None
         else max(0, min(len(remaining), max_features))
     )
+
+    # If we start with anchors, compute their baseline C-index once
+    if len(selected) > 0:
+        try:
+            cph0 = fit_cox_model(inner_tr, selected, time_col, event_col, robust=False)
+            risk0 = predict_risk(cph0, inner_val, selected)
+            best_cidx = float(
+                concordance_index(inner_val[time_col], -risk0, inner_val[event_col])
+            )
+        except Exception:
+            best_cidx = -np.inf
 
     for step_idx in range(max_iters):
         best_feat = None
@@ -1598,7 +1614,9 @@ def stability_select_features(
             continue
 
     if total_runs == 0 or not counter:
-        return list(pool)
+        # Fall back to pool but ensure anchors are present if available
+        anchors = [f for f in ["LGE_Score", "LVEF", "Female"] if f in pool]
+        return list(dict.fromkeys(anchors + list(pool)))
 
     # Allow environment override for stability threshold; default slightly lower (0.3)
     try:
@@ -1606,9 +1624,10 @@ def stability_select_features(
         eff_thr = float(env_thr) if env_thr is not None and env_thr.strip() != "" else 0.3
     except Exception:
         eff_thr = 0.3
-    # Keep features meeting frequency threshold
+    # Keep features meeting frequency threshold, with anchor bias
     ranked = list(counter.most_common())
     kept: List[str] = []
+    anchors = [f for f in ["LGE_Score", "LVEF", "Female"] if f in pool]
     for feat, count in ranked:
         freq = count / total_runs
         # Use the more lenient of configured (threshold arg) and env default eff_thr
@@ -1616,7 +1635,8 @@ def stability_select_features(
             thresh_use = float(min(eff_thr, float(threshold)))
         except Exception:
             thresh_use = eff_thr
-        if freq >= thresh_use:
+        # Always keep anchors when available
+        if feat in anchors or freq >= thresh_use:
             kept.append(feat)
 
     # No minimum backfilling when min_features is None (allow any size)
