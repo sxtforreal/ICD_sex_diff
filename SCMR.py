@@ -43,6 +43,12 @@ from lifelines.exceptions import ConvergenceError
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 
+# ==========================================
+# Global constants
+# ==========================================
+# Absolute risk horizon in days (3 years)
+HORIZON_DAYS: int = 3 * 365
+
 try:
     from missingpy import MissForest
 
@@ -704,8 +710,9 @@ def run_heldout_training_and_evaluation(
             tr_agn = tr_agn_base.dropna(subset=[time_col, event_col]).copy()
             if not tr_agn.empty:
                 cph = fit_cox_model(tr_agn, used_agnostic_feats, time_col, event_col)
-                tr_risk = predict_risk(cph, tr_agn, used_agnostic_feats)
-                thr = float(np.nanmedian(tr_risk))
+            # Use 3-year absolute risk for thresholding and predictions
+            tr_risk = predict_absolute_risk_at_horizon(cph, tr_agn, used_agnostic_feats, HORIZON_DAYS)
+            thr = float(np.nanmedian(tr_risk))
 
                 # Persist
                 base_path = os.path.join(models_dir, featset_name, "sex_agnostic")
@@ -731,7 +738,7 @@ def run_heldout_training_and_evaluation(
                     f"[Heldout] {featset_name}: Evaluating sex-agnostic on test and exporting plots..."
                 )
                 te_eval = te.copy()
-                risk = predict_risk(cph, te_eval, used_agnostic_feats)
+                risk = predict_absolute_risk_at_horizon(cph, te_eval, used_agnostic_feats, HORIZON_DAYS)
                 te_eval["pred_prob"] = risk
                 te_eval["pred_label"] = (risk >= thr).astype(int)
                 merged = (
@@ -830,7 +837,7 @@ def run_heldout_training_and_evaluation(
                 cph_m = fit_cox_model(
                     tr_m, used_shared_specific_feats, time_col, event_col
                 )
-                tr_risk_m = predict_risk(cph_m, tr_m, used_shared_specific_feats)
+                tr_risk_m = predict_absolute_risk_at_horizon(cph_m, tr_m, used_shared_specific_feats, HORIZON_DAYS)
                 thr_m = float(np.nanmedian(tr_risk_m))
                 models_specific["male"] = cph_m
                 thresholds_specific["male"] = thr_m
@@ -861,7 +868,7 @@ def run_heldout_training_and_evaluation(
                 cph_f = fit_cox_model(
                     tr_f, used_shared_specific_feats, time_col, event_col
                 )
-                tr_risk_f = predict_risk(cph_f, tr_f, used_shared_specific_feats)
+                tr_risk_f = predict_absolute_risk_at_horizon(cph_f, tr_f, used_shared_specific_feats, HORIZON_DAYS)
                 thr_f = float(np.nanmedian(tr_risk_f))
                 models_specific["female"] = cph_f
                 thresholds_specific["female"] = thr_f
@@ -908,7 +915,7 @@ def run_heldout_training_and_evaluation(
             if "pred_label" not in te_out.columns:
                 te_out["pred_label"] = np.nan
             if "male" in models_specific and not te_m.empty:
-                r_m = predict_risk(
+                r_m = predict_absolute_risk_at_horizon(
                     models_specific["male"], te_m, used_shared_specific_feats
                 )
                 te_out.loc[te_out["Female"] == 0, "pred_prob"] = r_m
@@ -916,7 +923,7 @@ def run_heldout_training_and_evaluation(
                     r_m >= thresholds_specific.get("male", float("nan"))
                 ).astype(int)
             if "female" in models_specific and not te_f.empty:
-                r_f = predict_risk(
+                r_f = predict_absolute_risk_at_horizon(
                     models_specific["female"], te_f, used_shared_specific_feats
                 )
                 te_out.loc[te_out["Female"] == 1, "pred_prob"] = r_f
@@ -1267,13 +1274,29 @@ def _sanitize_cox_features_matrix(
     verbose: bool = True,
 ) -> Tuple[pd.DataFrame, List[str]]:
     original_features = list(feature_cols)
-    # Prioritize core features so they are kept when collinearity is high
-    # This protects DERIVATIVE core inside larger Advanced sets
-    COX_SANITIZE_PRIORITY: List[str] = ["LGE_Score", "LVEF", "Female"]
+    # Prioritize anchors so they are kept when collinearity is high
+    # Per requirement, anchors are LGE Burden 5SD and LGE_Score only
+    COX_SANITIZE_PRIORITY: List[str] = ["LGE Burden 5SD", "LGE_Score"]
     ordered_cols: List[str] = [
         c for c in COX_SANITIZE_PRIORITY if c in feature_cols
     ] + [c for c in feature_cols if c not in COX_SANITIZE_PRIORITY]
     X = df[ordered_cols].copy()
+
+    # One-hot encode nominal multi-class features (e.g., Advanced LGE descriptors)
+    # Only affects feature sets that explicitly include such columns (Advanced)
+    try:
+        present_nominal = [c for c in NOMINAL_MULTICLASS_FEATURES if c in X.columns]
+        if present_nominal:
+            oh_parts: List[pd.DataFrame] = []
+            keep_cols: List[str] = [c for c in X.columns if c not in present_nominal]
+            for c in present_nominal:
+                s = X[c].astype(str)
+                dummies = pd.get_dummies(s, prefix=c, drop_first=True)
+                oh_parts.append(dummies)
+            X = pd.concat([X[keep_cols]] + oh_parts, axis=1)
+    except Exception:
+        # If encoding fails for any reason, fall back to numeric coercion below
+        pass
     for c in X.columns:
         X[c] = pd.to_numeric(X[c], errors="coerce")
 
@@ -1447,6 +1470,71 @@ def predict_risk(
     return risk
 
 
+def _baseline_survival_at_horizon(model: CoxPHFitter, horizon_days: int) -> float:
+    """Get baseline survival S0(t) at the specified horizon in days.
+
+    Uses step-wise interpolation: take the last available timepoint <= horizon.
+    If none available, returns 1.0; if horizon exceeds the last timepoint, returns last value.
+    """
+    try:
+        s0 = model.baseline_survival_
+        # lifelines returns DataFrame for baseline_survival_. Use the first column when unstratified
+        if isinstance(s0, pd.DataFrame):
+            if s0.shape[1] >= 1:
+                ser = s0.iloc[:, 0]
+            else:
+                return 1.0
+        else:
+            ser = s0
+        ser = ser.dropna()
+        if ser.empty:
+            return 1.0
+        # Index should be durations; ensure numeric
+        idx = pd.to_numeric(pd.Index(ser.index), errors="coerce")
+        # Align series with numeric index
+        ser.index = idx
+        ser = ser.sort_index()
+        # Find last timepoint <= horizon
+        valid = ser[ser.index <= float(horizon_days)]
+        if not valid.empty:
+            return float(valid.iloc[-1])
+        # All timepoints are after horizon -> approx survival ~ 1.0
+        # This can occur when no events before horizon
+        return 1.0
+    except Exception:
+        return 1.0
+
+
+def predict_absolute_risk_at_horizon(
+    model: CoxPHFitter,
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    horizon_days: int = None,
+) -> np.ndarray:
+    """Predict absolute risk = 1 - S(t) at the given horizon for each row.
+
+    Uses Cox relationship: S_i(t) = S0(t) ** exp(beta' x_i).
+    """
+    if horizon_days is None:
+        horizon_days = HORIZON_DAYS
+    # Compute partial hazard exp(beta' x)
+    # Reuse predict_risk to leverage consistent sanitization logic
+    # Note: predict_risk returns partial hazard; name kept for backward compat
+    partial_hazard = predict_risk(model, df, feature_cols)
+    # Baseline survival at horizon
+    s0 = _baseline_survival_at_horizon(model, horizon_days)
+    # Avoid numerical issues
+    s0 = float(min(max(s0, 1e-12), 1.0))
+    # absolute survival and risk
+    # S_i = s0 ** partial_hazard
+    # risk_i = 1 - S_i
+    surv = np.power(s0, partial_hazard)
+    risk = 1.0 - surv
+    # Clip to [0, 1]
+    risk = np.clip(risk, 0.0, 1.0)
+    return risk
+
+
 def threshold_by_top_quantile(risk_scores: np.ndarray, quantile: float = 0.5) -> float:
     q = np.nanquantile(risk_scores, quantile)
     return float(q)
@@ -1499,7 +1587,8 @@ def select_features_max_cindex_forward(
         )
 
     # Initialize with anchors if present in the sanitized pool
-    anchor_candidates = ["LGE_Score", "LVEF", "Female"]
+    # Per requirement, anchors are only LGE Burden 5SD and LGE_Score
+    anchor_candidates = ["LGE Burden 5SD", "LGE_Score"]
     selected: List[str] = [f for f in anchor_candidates if f in pool]
     best_cidx: float = -np.inf
     remaining = list(pool)
@@ -1640,7 +1729,7 @@ def stability_select_features(
 
     if total_runs == 0 or not counter:
         # Fall back to pool but ensure anchors are present if available
-        anchors = [f for f in ["LGE_Score", "LVEF", "Female"] if f in pool]
+        anchors = [f for f in ["LGE Burden 5SD", "LGE_Score"] if f in pool]
         return list(dict.fromkeys(anchors + list(pool)))
 
     # Allow environment override for stability threshold; default slightly lower (0.3)
@@ -1652,7 +1741,7 @@ def stability_select_features(
     # Keep features meeting frequency threshold, with anchor bias
     ranked = list(counter.most_common())
     kept: List[str] = []
-    anchors = [f for f in ["LGE_Score", "LVEF", "Female"] if f in pool]
+    anchors = [f for f in ["LGE Burden 5SD", "LGE_Score"] if f in pool]
     for feat, count in ranked:
         freq = count / total_runs
         # Use the more lenient of configured (threshold arg) and env default eff_thr
@@ -1880,7 +1969,7 @@ def sex_specific_full_inference(
         _progress("[Full] Sex-specific: Training male model and plotting...")
         used_features_m = list(shared_features)
         cph_m = fit_cox_model(data_m, used_features_m, "PE_Time", "VT/VF/SCD")
-        r_m = predict_risk(cph_m, data_m, used_features_m)
+        r_m = predict_absolute_risk_at_horizon(cph_m, data_m, used_features_m, HORIZON_DAYS)
         thresholds["male"] = float(np.nanmedian(r_m))
         models["male"] = cph_m
         plot_cox_coefficients(
@@ -1895,7 +1984,7 @@ def sex_specific_full_inference(
         _progress("[Full] Sex-specific: Training female model and plotting...")
         used_features_f = list(shared_features)
         cph_f = fit_cox_model(data_f, used_features_f, "PE_Time", "VT/VF/SCD")
-        r_f = predict_risk(cph_f, data_f, used_features_f)
+        r_f = predict_absolute_risk_at_horizon(cph_f, data_f, used_features_f, HORIZON_DAYS)
         thresholds["female"] = float(np.nanmedian(r_f))
         models["female"] = cph_f
         plot_cox_coefficients(
@@ -1911,16 +2000,14 @@ def sex_specific_full_inference(
     if "male" in models and not out[out["Female"] == 0].empty:
         te_m = out[out["Female"] == 0]
         # If selection happened, the model params capture the selected set, so we just pass any list
-        risk_m = predict_risk(models["male"], te_m, list(models["male"].params_.index))
+        risk_m = predict_absolute_risk_at_horizon(models["male"], te_m, list(models["male"].params_.index), HORIZON_DAYS)
         out.loc[out["Female"] == 0, "pred_prob"] = risk_m
         out.loc[out["Female"] == 0, "pred_label"] = (
             risk_m >= thresholds["male"]
         ).astype(int)
     if "female" in models and not out[out["Female"] == 1].empty:
         te_f = out[out["Female"] == 1]
-        risk_f = predict_risk(
-            models["female"], te_f, list(models["female"].params_.index)
-        )
+        risk_f = predict_absolute_risk_at_horizon(models["female"], te_f, list(models["female"].params_.index), HORIZON_DAYS)
         out.loc[out["Female"] == 1, "pred_prob"] = risk_f
         out.loc[out["Female"] == 1, "pred_label"] = (
             risk_f >= thresholds["female"]
@@ -1969,11 +2056,11 @@ def sex_agnostic_inference(
         reference_df=tr,
         effect_scale="per_sd",
     )
-    tr_risk = predict_risk(cph, tr, used_features)
+    tr_risk = predict_absolute_risk_at_horizon(cph, tr, used_features, HORIZON_DAYS)
     thr = float(np.nanmedian(tr_risk))
 
     te = test_df.copy()
-    te_risk = predict_risk(cph, te, used_features)
+    te_risk = predict_absolute_risk_at_horizon(cph, te, used_features, HORIZON_DAYS)
     te["pred_prob"] = te_risk
     te["pred_label"] = (te_risk >= thr).astype(int)
 
@@ -2054,7 +2141,7 @@ def sex_agnostic_full_inference(
         reference_df=data,
         effect_scale="per_sd",
     )
-    risk_all = predict_risk(cph, data, used_features)
+    risk_all = predict_absolute_risk_at_horizon(cph, data, used_features, HORIZON_DAYS)
     thr = float(np.nanmedian(risk_all))
 
     data["pred_prob"] = risk_all
@@ -2125,9 +2212,9 @@ def evaluate_split(
                 pass
         cph = fit_cox_model(tr, used_features, time_col, event_col)
         # Threshold must be derived from training risks (avoid test leakage)
-        tr_risk = predict_risk(cph, tr, used_features)
+        tr_risk = predict_absolute_risk_at_horizon(cph, tr, used_features, HORIZON_DAYS)
         thr = threshold_by_top_quantile(tr_risk, 0.5)
-        risk_scores = predict_risk(cph, test_df, used_features)
+        risk_scores = predict_absolute_risk_at_horizon(cph, test_df, used_features, HORIZON_DAYS)
         pred = (risk_scores >= thr).astype(int)
         cidx = concordance_index(test_df[time_col], -risk_scores, test_df[event_col])
         return pred, risk_scores, {"c_index": cidx}
@@ -2145,9 +2232,9 @@ def evaluate_split(
             )
         cph = fit_cox_model(tr_m, used_features, time_col, event_col)
         # Threshold from training male subset
-        tr_risk_m = predict_risk(cph, tr_m, used_features)
+        tr_risk_m = predict_absolute_risk_at_horizon(cph, tr_m, used_features, HORIZON_DAYS)
         thr = threshold_by_top_quantile(tr_risk_m, 0.5)
-        risk_m = predict_risk(cph, te_m, used_features)
+        risk_m = predict_absolute_risk_at_horizon(cph, te_m, used_features, HORIZON_DAYS)
         pred_m = (risk_m >= thr).astype(int)
         pred = np.zeros(len(test_df), dtype=int)
         risk_scores = np.zeros(len(test_df))
@@ -2170,9 +2257,9 @@ def evaluate_split(
             )
         cph = fit_cox_model(tr_f, used_features, time_col, event_col)
         # Threshold from training female subset
-        tr_risk_f = predict_risk(cph, tr_f, used_features)
+        tr_risk_f = predict_absolute_risk_at_horizon(cph, tr_f, used_features, HORIZON_DAYS)
         thr = threshold_by_top_quantile(tr_risk_f, 0.5)
-        risk_f = predict_risk(cph, te_f, used_features)
+        risk_f = predict_absolute_risk_at_horizon(cph, te_f, used_features, HORIZON_DAYS)
         pred_f = (risk_f >= thr).astype(int)
         pred = np.zeros(len(test_df), dtype=int)
         risk_scores = np.zeros(len(test_df))
@@ -2229,9 +2316,9 @@ def evaluate_split(
                         pass
             cph_m = fit_cox_model(tr_m, used_features_m, time_col, event_col)
             # Threshold from training male subset
-            tr_risk_m = predict_risk(cph_m, tr_m, used_features_m)
+            tr_risk_m = predict_absolute_risk_at_horizon(cph_m, tr_m, used_features_m, HORIZON_DAYS)
             thr_m = threshold_by_top_quantile(tr_risk_m, 0.5)
-            risk_m = predict_risk(cph_m, te_m, used_features_m)
+            risk_m = predict_absolute_risk_at_horizon(cph_m, te_m, used_features_m, HORIZON_DAYS)
             pred_m = (risk_m >= thr_m).astype(int)
             mask_m = test_df["Female"].values == 0
             pred[mask_m] = pred_m
@@ -2277,9 +2364,9 @@ def evaluate_split(
                         pass
             cph_f = fit_cox_model(tr_f, used_features_f, time_col, event_col)
             # Threshold from training female subset
-            tr_risk_f = predict_risk(cph_f, tr_f, used_features_f)
+            tr_risk_f = predict_absolute_risk_at_horizon(cph_f, tr_f, used_features_f, HORIZON_DAYS)
             thr_f = threshold_by_top_quantile(tr_risk_f, 0.5)
-            risk_f = predict_risk(cph_f, te_f, used_features_f)
+            risk_f = predict_absolute_risk_at_horizon(cph_f, te_f, used_features_f, HORIZON_DAYS)
             pred_f = (risk_f >= thr_f).astype(int)
             mask_f = test_df["Female"].values == 1
             pred[mask_f] = pred_f
@@ -2602,11 +2689,19 @@ def run_cox_experiments(
     for seed in range(N):
         if seed % max(1, N // 10) == 0:
             _progress(f"Progress {seed}/{N} splits...")
-        tr, te = train_test_split(
-            df, test_size=0.3, random_state=seed, stratify=df[event_col]
-        )
-        tr = tr.dropna(subset=[time_col, event_col])
-        te = te.dropna(subset=[time_col, event_col])
+        # Drop NaNs on key survival columns before splitting to preserve stratification
+        base_df = df.dropna(subset=[time_col, event_col]).copy()
+        try:
+            tr, te = stratified_train_test_split_by_columns(
+                base_df,
+                cols=["Female", event_col, "ICD"],
+                test_size=0.3,
+                random_state=seed,
+            )
+        except Exception:
+            tr, te = train_test_split(
+                base_df, test_size=0.3, random_state=seed, stratify=base_df[event_col]
+            )
 
         for featset_name, feature_cols in feature_sets.items():
             for cfg in model_configs:
