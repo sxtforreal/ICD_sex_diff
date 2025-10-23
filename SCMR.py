@@ -146,7 +146,7 @@ def _build_alias_map(columns: List[str]) -> Dict[str, str]:
 
 
 # ==========================================
-# Advanced LGE nominal/binary feature names (normalized)
+# Advanced LGE nominal feature names (normalized)
 # ==========================================
 ADV_LGE_NOMINAL: List[str] = [
     _normalize_column_name(s)
@@ -174,12 +174,37 @@ ADV_LGE_NOMINAL: List[str] = [
     ]
 ]
 
-# Split Advanced LGE variables into binary vs. ordinal to avoid
-# incorrectly binarizing non-binary variables like RV insertion site.
-ADV_LGE_ORDINAL: List[str] = [
-    _normalize_column_name("LGE_RV insertion site (1 superior, 2 inferior. 3 both)")
+# ================= Variable type declarations =================
+# Binary features (0/1)
+BINARY_FEATURES: List[str] = [
+    "Female",
+    "DM",
+    "HTN",
+    "HLP",
+    "AF",
+    "Beta Blocker",
+    "ACEi/ARB/ARNi",
+    "Aldosterone Antagonist",
+    "VT/VF/SCD",
+    "AAD",
+    "CRT",
+    # Not model features but treated as binary for cleaning
+    "ICD",
 ]
-ADV_LGE_BINARY: List[str] = [c for c in ADV_LGE_NOMINAL if c not in ADV_LGE_ORDINAL]
+
+# Nominal (multi-level, not ordinal) categorical features
+NOMINAL_MULTICLASS_FEATURES: List[str] = [
+    _normalize_column_name(
+        "LGE_Extent (1; subendocardial, 2; mid mural, 3; epicardial, 4; transmural; 5 circumural)"
+    ),
+    *ADV_LGE_NOMINAL,
+]
+
+# Ordinal categorical features kept as numeric ordered
+ORDINAL_FEATURES: List[str] = [
+    "LGE_Score",
+    "NYHA Class",
+]
 
 
 def create_undersampled_dataset(
@@ -1043,9 +1068,9 @@ def generate_tableone_by_sex_icd(
         "CrCl>45",
         "Significant LGE",
     ]
-    # Extend categorical set with Advanced LGE binary variables if present
+    # Extend categorical set with Advanced LGE nominal variables if present
     try:
-        adv_lge_cats = [c for c in ADV_LGE_BINARY if c in variables]
+        adv_lge_cats = [c for c in ADV_LGE_NOMINAL if c in variables]
     except Exception:
         adv_lge_cats = []
     categorical_cols = [c for c in known_cats if c in variables] + adv_lge_cats
@@ -2347,24 +2372,8 @@ def conversion_and_imputation(
         df[ordinal] = _encode_nyha_ordinal(df[ordinal])
 
     # Convert binary columns to numeric
-    binary_cols = [
-        "Female",
-        "DM",
-        "HTN",
-        "HLP",
-        "AF",
-        "Beta Blocker",
-        "ACEi/ARB/ARNi",
-        "Aldosterone Antagonist",
-        "VT/VF/SCD",
-        "AAD",
-        "CRT",
-        "ICD",
-        # Newly added binary variables
-        "LGE_Circumural",
-        "LGE_Ring-Like",
-    ]
-    exist_bin = [c for c in binary_cols if c in df.columns]
+    binary_cols = [c for c in BINARY_FEATURES if c in df.columns]
+    exist_bin = list(binary_cols)
     for c in exist_bin:
         if df[c].dtype == "object":
             df[c] = df[c].replace(
@@ -2372,20 +2381,27 @@ def conversion_and_imputation(
             ).infer_objects(copy=False)
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Broadly coerce all requested feature columns to numeric when possible
-    # This covers Advanced/DERIVATIVE columns that are binary-like but not in known list
+    # Prepare nominal multi-class: cast to string category without forcing numeric
+    for c in NOMINAL_MULTICLASS_FEATURES:
+        if c in df.columns:
+            df[c] = df[c].astype(str)
+
+    # Ordinal categorical: encode with robust ordinal mapping where needed
+    if "NYHA Class" in df.columns:
+        df["NYHA Class"] = _encode_nyha_ordinal(df["NYHA Class"])
+
+    # For all remaining features, coerce plausibly numeric strings to float; leave nominal as-is
     yes_no_map = {"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0}
     for c in features:
-        if c in df.columns and df[c].dtype == "object":
-            df[c] = df[c].replace(yes_no_map).infer_objects(copy=False)
-            # Extract numerics from strings like "1 superior" -> 1
-            try:
-                df[c] = (
-                    df[c].astype(str).str.extract(r"(-?\d+(?:\.\d+)?)").astype(float)
-                )
-            except Exception:
-                pass
-        if c in df.columns:
+        if c in df.columns and c not in NOMINAL_MULTICLASS_FEATURES:
+            if df[c].dtype == "object":
+                df[c] = df[c].replace(yes_no_map).infer_objects(copy=False)
+                try:
+                    df[c] = (
+                        df[c].astype(str).str.extract(r"(-?\d+(?:\.\d+)?)").astype(float)
+                    )
+                except Exception:
+                    pass
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # Imputation on feature matrix
@@ -2410,16 +2426,10 @@ def conversion_and_imputation(
         if col in df.columns:
             imputed_X[col] = df[col].values
 
-    # Map to 0/1 only for confirmed binary cols (exclude ordinal LGE variables)
-    try:
-        adv_bin_cols = [c for c in ADV_LGE_BINARY if c in imputed_X.columns]
-    except Exception:
-        adv_bin_cols = []
-    for c in list(dict.fromkeys(exist_bin + adv_bin_cols)):
+    # Map binary to 0/1 (only declared binary features)
+    for c in exist_bin:
         if c in imputed_X.columns:
-            imputed_X[c] = (
-                pd.to_numeric(imputed_X[c], errors="coerce") >= 0.5
-            ).astype(float)
+            imputed_X[c] = (pd.to_numeric(imputed_X[c], errors="coerce") >= 0.5).astype(float)
 
     # Round NYHA Class
     if "NYHA Class" in imputed_X.columns:
@@ -2511,24 +2521,12 @@ def load_dataframes() -> pd.DataFrame:
     )
 
     # Variables
-    categorical = [
-        "Female",
-        "DM",
-        "HTN",
-        "HLP",
-        "AF",
-        "NYHA Class",
-        "Beta Blocker",
-        "ACEi/ARB/ARNi",
-        "Aldosterone Antagonist",
-        "VT/VF/SCD",
-        "AAD",
-        "CRT",
-        "ICD",
+    # Mark categorical columns for I/O consistency (binary + nominal)
+    categorical = [c for c in BINARY_FEATURES if c in nicm.columns] + [
+        c for c in NOMINAL_MULTICLASS_FEATURES if c in nicm.columns
     ]
-    # Extend with newly introduced Advanced LGE binary columns (exclude ordinal)
-    categorical += [c for c in ADV_LGE_BINARY if c in nicm.columns]
-    nicm[categorical] = nicm[categorical].astype("object")
+    if categorical:
+        nicm[categorical] = nicm[categorical].astype("object")
     var = nicm.columns.tolist()
     labels = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
     features = [v for v in var if v not in labels]
@@ -2858,8 +2856,8 @@ FEATURE_SETS = {
         "CrCl>45",
         # Include composite LGE score if present; downstream aliasing will drop if missing
         "LGE_Score",
-        # Advanced LGE variables (binary subset only; ordinal handled numerically)
-        *ADV_LGE_BINARY,
+        # Advanced LGE variables (treated as nominal multi-class; not binarized)
+        *ADV_LGE_NOMINAL,
     ],
 }
 
