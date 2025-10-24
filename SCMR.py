@@ -2492,7 +2492,20 @@ def conversion_and_imputation(
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # Imputation on feature matrix
-    X = df[features].copy()
+    # Only include features that are actually present after alias resolution
+    present_features = [c for c in features if c in df.columns]
+    missing_features = [c for c in features if c not in df.columns]
+    if missing_features:
+        try:
+            warnings.warn(
+                "The following requested features were not found and will be ignored: "
+                + ", ".join(missing_features)
+            )
+        except Exception:
+            pass
+    if not present_features:
+        return pd.DataFrame()
+    X = df[present_features].copy()
     # Optional: downcast float64 to float32 before MissForest to speed up
     try:
         X = X.apply(lambda s: s.astype(np.float32) if s.dtype.kind == "f" else s)
