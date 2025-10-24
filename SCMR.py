@@ -7,6 +7,7 @@ import argparse
 import numpy as np
 import pandas as pd
 import matplotlib
+
 # Use non-interactive backend for HPC/SLURM
 try:
     matplotlib.use("Agg", force=True)
@@ -711,106 +712,104 @@ def run_heldout_training_and_evaluation(
             if not tr_agn.empty:
                 cph = fit_cox_model(tr_agn, used_agnostic_feats, time_col, event_col)
             # Use 3-year absolute risk for thresholding and predictions
-            tr_risk = predict_absolute_risk_at_horizon(cph, tr_agn, used_agnostic_feats, HORIZON_DAYS)
+            tr_risk = predict_absolute_risk_at_horizon(
+                cph, tr_agn, used_agnostic_feats, HORIZON_DAYS
+            )
             thr = float(np.nanmedian(tr_risk))
 
-                # Persist
-                base_path = os.path.join(models_dir, featset_name, "sex_agnostic")
-                _ensure_dir(base_path)
-                _save_pickle(cph, os.path.join(base_path, "model.pkl"))
-                _save_json(
-                    {"threshold": thr, "features": used_agnostic_feats},
-                    os.path.join(base_path, "meta.json"),
-                )
-                # Coef plot
-                plot_cox_coefficients(
-                    cph,
-                    f"{featset_name} Sex-Agnostic Cox Coefficients",
-                    reference_df=tr_agn,
-                    effect_scale="per_sd",
-                    save_path=os.path.join(
-                        figs_dir, f"{featset_name}_sex_agnostic_coefs.png"
-                    ),
-                )
+            # Persist
+            base_path = os.path.join(models_dir, featset_name, "sex_agnostic")
+            _ensure_dir(base_path)
+            _save_pickle(cph, os.path.join(base_path, "model.pkl"))
+            _save_json(
+                {"threshold": thr, "features": used_agnostic_feats},
+                os.path.join(base_path, "meta.json"),
+            )
+            # Coef plot
+            plot_cox_coefficients(
+                cph,
+                f"{featset_name} Sex-Agnostic Cox Coefficients",
+                reference_df=tr_agn,
+                effect_scale="per_sd",
+                save_path=os.path.join(
+                    figs_dir, f"{featset_name}_sex_agnostic_coefs.png"
+                ),
+            )
 
-                # Evaluate on heldout test
-                _progress(
-                    f"[Heldout] {featset_name}: Evaluating sex-agnostic on test and exporting plots..."
-                )
-                te_eval = te.copy()
-                risk = predict_absolute_risk_at_horizon(cph, te_eval, used_agnostic_feats, HORIZON_DAYS)
-                te_eval["pred_prob"] = risk
-                te_eval["pred_label"] = (risk >= thr).astype(int)
-                merged = (
-                    te_eval[
-                        [
-                            "MRN",
-                            "Female",
-                            "pred_label",
-                            "pred_prob",
-                            time_col,
-                            event_col,
-                        ]
+            # Evaluate on heldout test
+            _progress(
+                f"[Heldout] {featset_name}: Evaluating sex-agnostic on test and exporting plots..."
+            )
+            te_eval = te.copy()
+            risk = predict_absolute_risk_at_horizon(
+                cph, te_eval, used_agnostic_feats, HORIZON_DAYS
+            )
+            te_eval["pred_prob"] = risk
+            te_eval["pred_label"] = (risk >= thr).astype(int)
+            merged = (
+                te_eval[
+                    [
+                        "MRN",
+                        "Female",
+                        "pred_label",
+                        "pred_prob",
+                        time_col,
+                        event_col,
                     ]
-                    .dropna(subset=[time_col, event_col])
-                    .drop_duplicates(subset=["MRN"])  # one row per MRN
-                    .rename(columns={event_col: "PE"})
-                )
-                # Save preds
-                merged.to_csv(
-                    os.path.join(
-                        preds_dir, f"{featset_name}_sex_agnostic_test_preds.csv"
-                    ),
-                    index=False,
-                )
-                # KM + log-rank
-                plot_km_two_subplots_by_gender(
-                    merged,
-                    save_path=os.path.join(
-                        figs_dir, f"{featset_name}_sex_agnostic_km_by_gender.png"
-                    ),
-                )
-                # Metrics
-                mask_m = merged["Female"].values == 0
-                mask_f = merged["Female"].values == 1
-                c_all = _safe_cindex(
-                    merged["PE_Time"].values,
-                    merged["PE"].values,
-                    merged["pred_prob"].values,
-                )
-                c_m = _safe_cindex(
-                    merged.loc[mask_m, "PE_Time"].values,
-                    merged.loc[mask_m, "PE"].values,
-                    merged.loc[mask_m, "pred_prob"].values,
-                )
-                c_f = _safe_cindex(
-                    merged.loc[mask_f, "PE_Time"].values,
-                    merged.loc[mask_f, "PE"].values,
-                    merged.loc[mask_f, "pred_prob"].values,
-                )
-                pvals = _compute_logrank_pvalues_by_gender(merged)
-                hrs = _compute_hr_by_gender(merged)
-                rows.append(
-                    {
-                        "feature_set": featset_name,
-                        "mode": "sex_agnostic",
-                        "c_index_all": c_all,
-                        "c_index_male": c_m,
-                        "c_index_female": c_f,
-                        "logrank_p_male": pvals.get("male"),
-                        "logrank_p_female": pvals.get("female"),
-                        "hr_male": hrs.get("male", (np.nan, np.nan, np.nan))[0],
-                        "hr_male_ci_low": hrs.get("male", (np.nan, np.nan, np.nan))[1],
-                        "hr_male_ci_high": hrs.get("male", (np.nan, np.nan, np.nan))[2],
-                        "hr_female": hrs.get("female", (np.nan, np.nan, np.nan))[0],
-                        "hr_female_ci_low": hrs.get("female", (np.nan, np.nan, np.nan))[
-                            1
-                        ],
-                        "hr_female_ci_high": hrs.get(
-                            "female", (np.nan, np.nan, np.nan)
-                        )[2],
-                    }
-                )
+                ]
+                .dropna(subset=[time_col, event_col])
+                .drop_duplicates(subset=["MRN"])  # one row per MRN
+                .rename(columns={event_col: "PE"})
+            )
+            # Save preds
+            merged.to_csv(
+                os.path.join(preds_dir, f"{featset_name}_sex_agnostic_test_preds.csv"),
+                index=False,
+            )
+            # KM + log-rank
+            plot_km_two_subplots_by_gender(
+                merged,
+                save_path=os.path.join(
+                    figs_dir, f"{featset_name}_sex_agnostic_km_by_gender.png"
+                ),
+            )
+            # Metrics
+            mask_m = merged["Female"].values == 0
+            mask_f = merged["Female"].values == 1
+            c_all = _safe_cindex(
+                merged["PE_Time"].values,
+                merged["PE"].values,
+                merged["pred_prob"].values,
+            )
+            c_m = _safe_cindex(
+                merged.loc[mask_m, "PE_Time"].values,
+                merged.loc[mask_m, "PE"].values,
+                merged.loc[mask_m, "pred_prob"].values,
+            )
+            c_f = _safe_cindex(
+                merged.loc[mask_f, "PE_Time"].values,
+                merged.loc[mask_f, "PE"].values,
+                merged.loc[mask_f, "pred_prob"].values,
+            )
+            pvals = _compute_logrank_pvalues_by_gender(merged)
+            hrs = _compute_hr_by_gender(merged)
+            rows.append(
+                {
+                    "feature_set": featset_name,
+                    "mode": "sex_agnostic",
+                    "c_index_all": c_all,
+                    "c_index_male": c_m,
+                    "c_index_female": c_f,
+                    "logrank_p_male": pvals.get("male"),
+                    "logrank_p_female": pvals.get("female"),
+                    "hr_male": hrs.get("male", (np.nan, np.nan, np.nan))[0],
+                    "hr_male_ci_low": hrs.get("male", (np.nan, np.nan, np.nan))[1],
+                    "hr_male_ci_high": hrs.get("male", (np.nan, np.nan, np.nan))[2],
+                    "hr_female": hrs.get("female", (np.nan, np.nan, np.nan))[0],
+                    "hr_female_ci_low": hrs.get("female", (np.nan, np.nan, np.nan))[1],
+                    "hr_female_ci_high": hrs.get("female", (np.nan, np.nan, np.nan))[2],
+                }
+            )
         except Exception as e:
             warnings.warn(f"[Heldout][{featset_name}] sex-agnostic failed: {e}")
 
@@ -837,7 +836,9 @@ def run_heldout_training_and_evaluation(
                 cph_m = fit_cox_model(
                     tr_m, used_shared_specific_feats, time_col, event_col
                 )
-                tr_risk_m = predict_absolute_risk_at_horizon(cph_m, tr_m, used_shared_specific_feats, HORIZON_DAYS)
+                tr_risk_m = predict_absolute_risk_at_horizon(
+                    cph_m, tr_m, used_shared_specific_feats, HORIZON_DAYS
+                )
                 thr_m = float(np.nanmedian(tr_risk_m))
                 models_specific["male"] = cph_m
                 thresholds_specific["male"] = thr_m
@@ -868,7 +869,9 @@ def run_heldout_training_and_evaluation(
                 cph_f = fit_cox_model(
                     tr_f, used_shared_specific_feats, time_col, event_col
                 )
-                tr_risk_f = predict_absolute_risk_at_horizon(cph_f, tr_f, used_shared_specific_feats, HORIZON_DAYS)
+                tr_risk_f = predict_absolute_risk_at_horizon(
+                    cph_f, tr_f, used_shared_specific_feats, HORIZON_DAYS
+                )
                 thr_f = float(np.nanmedian(tr_risk_f))
                 models_specific["female"] = cph_f
                 thresholds_specific["female"] = thr_f
@@ -1428,14 +1431,18 @@ def fit_cox_model(
             try:
                 pen_fb = os.environ.get("SCMR_COX_PEN_FALLBACK")
                 pen_fb_val = (
-                    float(pen_fb) if pen_fb is not None and pen_fb.strip() != "" else 1.0
+                    float(pen_fb)
+                    if pen_fb is not None and pen_fb.strip() != ""
+                    else 1.0
                 )
             except Exception:
                 pen_fb_val = 1.0
             try:
                 l1_fb = os.environ.get("SCMR_COX_L1_RATIO_FALLBACK")
                 l1_fb_val = (
-                    float(l1_fb) if l1_fb is not None and l1_fb.strip() != "" else l1_val
+                    float(l1_fb)
+                    if l1_fb is not None and l1_fb.strip() != ""
+                    else l1_val
                 )
             except Exception:
                 l1_fb_val = l1_val
@@ -1735,7 +1742,9 @@ def stability_select_features(
     # Allow environment override for stability threshold; default slightly lower (0.3)
     try:
         env_thr = os.environ.get("SCMR_FS_THRESHOLD")
-        eff_thr = float(env_thr) if env_thr is not None and env_thr.strip() != "" else 0.3
+        eff_thr = (
+            float(env_thr) if env_thr is not None and env_thr.strip() != "" else 0.3
+        )
     except Exception:
         eff_thr = 0.3
     # Keep features meeting frequency threshold, with anchor bias
@@ -1969,7 +1978,9 @@ def sex_specific_full_inference(
         _progress("[Full] Sex-specific: Training male model and plotting...")
         used_features_m = list(shared_features)
         cph_m = fit_cox_model(data_m, used_features_m, "PE_Time", "VT/VF/SCD")
-        r_m = predict_absolute_risk_at_horizon(cph_m, data_m, used_features_m, HORIZON_DAYS)
+        r_m = predict_absolute_risk_at_horizon(
+            cph_m, data_m, used_features_m, HORIZON_DAYS
+        )
         thresholds["male"] = float(np.nanmedian(r_m))
         models["male"] = cph_m
         plot_cox_coefficients(
@@ -1984,7 +1995,9 @@ def sex_specific_full_inference(
         _progress("[Full] Sex-specific: Training female model and plotting...")
         used_features_f = list(shared_features)
         cph_f = fit_cox_model(data_f, used_features_f, "PE_Time", "VT/VF/SCD")
-        r_f = predict_absolute_risk_at_horizon(cph_f, data_f, used_features_f, HORIZON_DAYS)
+        r_f = predict_absolute_risk_at_horizon(
+            cph_f, data_f, used_features_f, HORIZON_DAYS
+        )
         thresholds["female"] = float(np.nanmedian(r_f))
         models["female"] = cph_f
         plot_cox_coefficients(
@@ -2000,14 +2013,18 @@ def sex_specific_full_inference(
     if "male" in models and not out[out["Female"] == 0].empty:
         te_m = out[out["Female"] == 0]
         # If selection happened, the model params capture the selected set, so we just pass any list
-        risk_m = predict_absolute_risk_at_horizon(models["male"], te_m, list(models["male"].params_.index), HORIZON_DAYS)
+        risk_m = predict_absolute_risk_at_horizon(
+            models["male"], te_m, list(models["male"].params_.index), HORIZON_DAYS
+        )
         out.loc[out["Female"] == 0, "pred_prob"] = risk_m
         out.loc[out["Female"] == 0, "pred_label"] = (
             risk_m >= thresholds["male"]
         ).astype(int)
     if "female" in models and not out[out["Female"] == 1].empty:
         te_f = out[out["Female"] == 1]
-        risk_f = predict_absolute_risk_at_horizon(models["female"], te_f, list(models["female"].params_.index), HORIZON_DAYS)
+        risk_f = predict_absolute_risk_at_horizon(
+            models["female"], te_f, list(models["female"].params_.index), HORIZON_DAYS
+        )
         out.loc[out["Female"] == 1, "pred_prob"] = risk_f
         out.loc[out["Female"] == 1, "pred_label"] = (
             risk_f >= thresholds["female"]
@@ -2214,7 +2231,9 @@ def evaluate_split(
         # Threshold must be derived from training risks (avoid test leakage)
         tr_risk = predict_absolute_risk_at_horizon(cph, tr, used_features, HORIZON_DAYS)
         thr = threshold_by_top_quantile(tr_risk, 0.5)
-        risk_scores = predict_absolute_risk_at_horizon(cph, test_df, used_features, HORIZON_DAYS)
+        risk_scores = predict_absolute_risk_at_horizon(
+            cph, test_df, used_features, HORIZON_DAYS
+        )
         pred = (risk_scores >= thr).astype(int)
         cidx = concordance_index(test_df[time_col], -risk_scores, test_df[event_col])
         return pred, risk_scores, {"c_index": cidx}
@@ -2232,9 +2251,13 @@ def evaluate_split(
             )
         cph = fit_cox_model(tr_m, used_features, time_col, event_col)
         # Threshold from training male subset
-        tr_risk_m = predict_absolute_risk_at_horizon(cph, tr_m, used_features, HORIZON_DAYS)
+        tr_risk_m = predict_absolute_risk_at_horizon(
+            cph, tr_m, used_features, HORIZON_DAYS
+        )
         thr = threshold_by_top_quantile(tr_risk_m, 0.5)
-        risk_m = predict_absolute_risk_at_horizon(cph, te_m, used_features, HORIZON_DAYS)
+        risk_m = predict_absolute_risk_at_horizon(
+            cph, te_m, used_features, HORIZON_DAYS
+        )
         pred_m = (risk_m >= thr).astype(int)
         pred = np.zeros(len(test_df), dtype=int)
         risk_scores = np.zeros(len(test_df))
@@ -2257,9 +2280,13 @@ def evaluate_split(
             )
         cph = fit_cox_model(tr_f, used_features, time_col, event_col)
         # Threshold from training female subset
-        tr_risk_f = predict_absolute_risk_at_horizon(cph, tr_f, used_features, HORIZON_DAYS)
+        tr_risk_f = predict_absolute_risk_at_horizon(
+            cph, tr_f, used_features, HORIZON_DAYS
+        )
         thr = threshold_by_top_quantile(tr_risk_f, 0.5)
-        risk_f = predict_absolute_risk_at_horizon(cph, te_f, used_features, HORIZON_DAYS)
+        risk_f = predict_absolute_risk_at_horizon(
+            cph, te_f, used_features, HORIZON_DAYS
+        )
         pred_f = (risk_f >= thr).astype(int)
         pred = np.zeros(len(test_df), dtype=int)
         risk_scores = np.zeros(len(test_df))
@@ -2316,9 +2343,13 @@ def evaluate_split(
                         pass
             cph_m = fit_cox_model(tr_m, used_features_m, time_col, event_col)
             # Threshold from training male subset
-            tr_risk_m = predict_absolute_risk_at_horizon(cph_m, tr_m, used_features_m, HORIZON_DAYS)
+            tr_risk_m = predict_absolute_risk_at_horizon(
+                cph_m, tr_m, used_features_m, HORIZON_DAYS
+            )
             thr_m = threshold_by_top_quantile(tr_risk_m, 0.5)
-            risk_m = predict_absolute_risk_at_horizon(cph_m, te_m, used_features_m, HORIZON_DAYS)
+            risk_m = predict_absolute_risk_at_horizon(
+                cph_m, te_m, used_features_m, HORIZON_DAYS
+            )
             pred_m = (risk_m >= thr_m).astype(int)
             mask_m = test_df["Female"].values == 0
             pred[mask_m] = pred_m
@@ -2364,9 +2395,13 @@ def evaluate_split(
                         pass
             cph_f = fit_cox_model(tr_f, used_features_f, time_col, event_col)
             # Threshold from training female subset
-            tr_risk_f = predict_absolute_risk_at_horizon(cph_f, tr_f, used_features_f, HORIZON_DAYS)
+            tr_risk_f = predict_absolute_risk_at_horizon(
+                cph_f, tr_f, used_features_f, HORIZON_DAYS
+            )
             thr_f = threshold_by_top_quantile(tr_risk_f, 0.5)
-            risk_f = predict_absolute_risk_at_horizon(cph_f, te_f, used_features_f, HORIZON_DAYS)
+            risk_f = predict_absolute_risk_at_horizon(
+                cph_f, te_f, used_features_f, HORIZON_DAYS
+            )
             pred_f = (risk_f >= thr_f).astype(int)
             mask_f = test_df["Female"].values == 1
             pred[mask_f] = pred_f
@@ -2463,9 +2498,11 @@ def conversion_and_imputation(
     exist_bin = list(binary_cols)
     for c in exist_bin:
         if df[c].dtype == "object":
-            df[c] = df[c].replace(
-                {"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0}
-            ).infer_objects(copy=False)
+            df[c] = (
+                df[c]
+                .replace({"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0})
+                .infer_objects(copy=False)
+            )
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # Prepare nominal multi-class: cast to string category without forcing numeric
@@ -2485,7 +2522,10 @@ def conversion_and_imputation(
                 df[c] = df[c].replace(yes_no_map).infer_objects(copy=False)
                 try:
                     df[c] = (
-                        df[c].astype(str).str.extract(r"(-?\d+(?:\.\d+)?)").astype(float)
+                        df[c]
+                        .astype(str)
+                        .str.extract(r"(-?\d+(?:\.\d+)?)")
+                        .astype(float)
                     )
                 except Exception:
                     pass
@@ -2529,7 +2569,9 @@ def conversion_and_imputation(
     # Map binary to 0/1 (only declared binary features)
     for c in exist_bin:
         if c in imputed_X.columns:
-            imputed_X[c] = (pd.to_numeric(imputed_X[c], errors="coerce") >= 0.5).astype(float)
+            imputed_X[c] = (pd.to_numeric(imputed_X[c], errors="coerce") >= 0.5).astype(
+                float
+            )
 
     # Round NYHA Class
     if "NYHA Class" in imputed_X.columns:
@@ -2674,8 +2716,16 @@ def run_cox_experiments(
     """
     model_configs = [
         {"name": "Sex-agnostic (Cox, undersampled)", "mode": "sex_agnostic"},
-        {"name": "Sex-specific Shared (Cox)", "mode": "sex_specific", "variant": "shared"},
-        {"name": "Sex-specific Distinct (Cox)", "mode": "sex_specific", "variant": "distinct"},
+        {
+            "name": "Sex-specific Shared (Cox)",
+            "mode": "sex_specific",
+            "variant": "shared",
+        },
+        {
+            "name": "Sex-specific Distinct (Cox)",
+            "mode": "sex_specific",
+            "variant": "distinct",
+        },
     ]
     metrics = ["c_index_all", "c_index_male", "c_index_female"]
 
@@ -2757,8 +2807,16 @@ def run_cox_experiments(
                         verbose=False,
                     ) or list(base_feats)
                     # per-sex distinct feature selection on respective subsets
-                    tr_m_local = tr[tr["Female"] == 0].dropna(subset=[time_col, event_col]).copy()
-                    tr_f_local = tr[tr["Female"] == 1].dropna(subset=[time_col, event_col]).copy()
+                    tr_m_local = (
+                        tr[tr["Female"] == 0]
+                        .dropna(subset=[time_col, event_col])
+                        .copy()
+                    )
+                    tr_f_local = (
+                        tr[tr["Female"] == 1]
+                        .dropna(subset=[time_col, event_col])
+                        .copy()
+                    )
                     sel_m = stability_select_features(
                         df=tr_m_local if not tr_m_local.empty else tr,
                         candidate_features=list(base_feats),
@@ -2805,7 +2863,10 @@ def run_cox_experiments(
                     if cfg.get("variant") == "distinct":
                         overrides = {"male": list(sel_m), "female": list(sel_f)}
                     else:
-                        overrides = {"male": list(sel_shared), "female": list(sel_shared)}
+                        overrides = {
+                            "male": list(sel_shared),
+                            "female": list(sel_shared),
+                        }
                     _progress(f"seed={seed}: Train/Eval {name} (sex-specific)")
                     pred, risk, met = evaluate_split(
                         tr,
@@ -2942,6 +3003,7 @@ FEATURE_SETS = {
         "Female",
         "Age at CMR",
         "BMI",
+        "BSA",
         "DM",
         "HTN",
         "HLP",
@@ -2952,31 +3014,42 @@ FEATURE_SETS = {
         "LV Mass Index",
         "RVEDVi",
         "RVEF",
-        "LA EF",
         "LAVi",
         "LGE Burden 5SD",
         "MRF (%)",
         "Sphericity Index",
-        "Relative Wall Thickness",
-        "MV Annular Diameter",
         "QRS",
-        "QTc",
-        "CrCl>45",
-        # Include composite LGE score if present; downstream aliasing will drop if missing
-        "LGE_Score",
-        # Advanced LGE variables (treated as nominal multi-class; not binarized)
-        *ADV_LGE_NOMINAL,
     ],
 }
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run SCMR experiments (SLURM-ready)")
-    parser.add_argument("--mode", choices=["legacy", "heldout", "full"], default=os.environ.get("SCMR_MODE", "heldout"), help="Which pipeline to run")
-    parser.add_argument("--results_dir", default=os.environ.get("SCMR_RESULTS_DIR", os.path.join(os.getcwd(), "results")))
-    parser.add_argument("--n_splits", type=int, default=int(os.environ.get("SCMR_N_SPLITS", "5")))
-    parser.add_argument("--heldout_test_size", type=float, default=float(os.environ.get("SCMR_HELDOUT_TEST_SIZE", "0.3")))
-    parser.add_argument("--heldout_seed", type=int, default=int(os.environ.get("SCMR_HELDOUT_SEED", "42")))
+    parser.add_argument(
+        "--mode",
+        choices=["legacy", "heldout", "full"],
+        default=os.environ.get("SCMR_MODE", "heldout"),
+        help="Which pipeline to run",
+    )
+    parser.add_argument(
+        "--results_dir",
+        default=os.environ.get(
+            "SCMR_RESULTS_DIR", os.path.join(os.getcwd(), "results")
+        ),
+    )
+    parser.add_argument(
+        "--n_splits", type=int, default=int(os.environ.get("SCMR_N_SPLITS", "5"))
+    )
+    parser.add_argument(
+        "--heldout_test_size",
+        type=float,
+        default=float(os.environ.get("SCMR_HELDOUT_TEST_SIZE", "0.3")),
+    )
+    parser.add_argument(
+        "--heldout_seed",
+        type=int,
+        default=int(os.environ.get("SCMR_HELDOUT_SEED", "42")),
+    )
     args = parser.parse_args()
 
     # Load and prepare data
