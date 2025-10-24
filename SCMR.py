@@ -207,6 +207,139 @@ def _build_alias_map(columns: List[str]) -> Dict[str, str]:
 
 
 # ==========================================
+# Diagnostics helpers (column resolution + drift)
+# ==========================================
+
+def analyze_column_resolution(
+    df: pd.DataFrame, features: List[str], labels: List[str]
+) -> Dict[str, Any]:
+    """Analyze how requested columns map to actual DataFrame columns.
+
+    Returns a dictionary with keys:
+    - requested: the original requested list (features + labels)
+    - resolved_columns: actual columns found (after alias resolution)
+    - rename_map: mapping original_df_col -> canonical_requested_name
+    - missing_requested: requested columns not found
+    - present_features: subset of requested features present
+    - present_labels: subset of requested labels present
+    """
+    out: Dict[str, Any] = {}
+    # Normalize incoming df columns similar to conversion_and_imputation
+    cols_norm = [_normalize_column_name(c) for c in df.columns]
+    df_norm = df.copy()
+    df_norm.columns = cols_norm
+
+    requested: List[str] = list(dict.fromkeys(list(features) + list(labels)))
+    alias_map = _build_alias_map(df_norm.columns.tolist())
+
+    resolved_columns: List[str] = []
+    rename_map: Dict[str, str] = {}
+    missing_requested: List[str] = []
+
+    for col in requested:
+        if col in df_norm.columns:
+            resolved_columns.append(col)
+            continue
+        key = _simplify_name(col)
+        matched = alias_map.get(key)
+        if matched is not None:
+            resolved_columns.append(matched)
+            if matched != col:
+                rename_map[matched] = col
+        else:
+            missing_requested.append(col)
+
+    present_features = [c for c in features if (c in resolved_columns) or (c in rename_map.values())]
+    present_labels = [c for c in labels if (c in resolved_columns) or (c in rename_map.values())]
+
+    out["requested"] = requested
+    out["resolved_columns"] = resolved_columns
+    out["rename_map"] = rename_map
+    out["missing_requested"] = missing_requested
+    out["present_features"] = present_features
+    out["present_labels"] = present_labels
+    return out
+
+
+def compute_smd_drift_report(
+    reference_df: pd.DataFrame,
+    external_df: pd.DataFrame,
+    features: List[str],
+) -> pd.DataFrame:
+    """Compute per-feature drift metrics between a reference and an external dataset.
+
+    - For numeric (including binary and ordinal) features: Standardized Mean Difference (SMD)
+    - For nominal multi-class features: report category overlap and cardinality
+    The function gracefully skips features absent in either dataset.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    ref = reference_df.copy()
+    ext = external_df.copy()
+    # Ensure numeric coercion for numeric-like cols
+    def _is_numeric_feature(name: str) -> bool:
+        if name in NOMINAL_MULTICLASS_FEATURES:
+            return False
+        return True
+
+    for feat in features:
+        if feat not in ref.columns or feat not in ext.columns:
+            continue
+        row: Dict[str, Any] = {"feature": feat}
+
+        if _is_numeric_feature(feat):
+            r = pd.to_numeric(ref[feat], errors="coerce")
+            e = pd.to_numeric(ext[feat], errors="coerce")
+            r_non = r.dropna()
+            e_non = e.dropna()
+            r_mean = float(r_non.mean()) if len(r_non) else float("nan")
+            e_mean = float(e_non.mean()) if len(e_non) else float("nan")
+            r_std = float(r_non.std(ddof=1)) if len(r_non) > 1 else float("nan")
+            e_std = float(e_non.std(ddof=1)) if len(e_non) > 1 else float("nan")
+            # pooled sd
+            try:
+                pooled = np.sqrt(
+                    np.nanmean([r_std ** 2 if not np.isnan(r_std) else np.nan, e_std ** 2 if not np.isnan(e_std) else np.nan])
+                )
+            except Exception:
+                pooled = float("nan")
+            smd = (e_mean - r_mean) / pooled if pooled and not np.isnan(pooled) and pooled > 0 else float("nan")
+            row.update(
+                {
+                    "type": "numeric",
+                    "ref_mean": r_mean,
+                    "ref_std": r_std,
+                    "ext_mean": e_mean,
+                    "ext_std": e_std,
+                    "smd": float(smd),
+                    "ref_missing_rate": float(r.isna().mean()),
+                    "ext_missing_rate": float(e.isna().mean()),
+                }
+            )
+        else:
+            r = ref[feat].astype(str)
+            e = ext[feat].astype(str)
+            r_cats = set(pd.unique(r[r.notna()]))
+            e_cats = set(pd.unique(e[e.notna()]))
+            overlap = len(r_cats & e_cats)
+            new_in_ext = len(e_cats - r_cats)
+            row.update(
+                {
+                    "type": "categorical",
+                    "ref_cardinality": int(len(r_cats)),
+                    "ext_cardinality": int(len(e_cats)),
+                    "overlap": int(overlap),
+                    "new_categories_in_ext": int(new_in_ext),
+                    "ref_missing_rate": float(pd.isna(ref[feat]).mean()),
+                    "ext_missing_rate": float(pd.isna(ext[feat]).mean()),
+                }
+            )
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+# ==========================================
 # Advanced LGE nominal feature names (normalized)
 # ==========================================
 ADV_LGE_NOMINAL: List[str] = [
