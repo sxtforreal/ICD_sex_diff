@@ -254,37 +254,56 @@ def evaluate_with_saved_models(
                 cols = [id_col, "pred_label", "pred_prob", "PE_Time", "VT/VF/SCD"]
                 if "Female" in te_eval.columns:
                     cols.insert(1, "Female")
-                merged = (
-                    te_eval[[c for c in cols if c in te_eval.columns]]
-                    .dropna(subset=["PE_Time", "VT/VF/SCD"]).drop_duplicates(subset=[id_col])
-                    .rename(columns={"VT/VF/SCD": "PE"})
-                )
+
+                # Build merged predictions robustly regardless of missing outcome columns
+                present_cols = [c for c in cols if c in te_eval.columns]
+                merged = te_eval[present_cols].copy()
+                has_outcome = ("PE_Time" in merged.columns) and ("VT/VF/SCD" in merged.columns)
+                if has_outcome:
+                    merged = (
+                        merged.dropna(subset=["PE_Time", "VT/VF/SCD"]).drop_duplicates(subset=[id_col])
+                        .rename(columns={"VT/VF/SCD": "PE"})
+                    )
+                else:
+                    warnings.warn(
+                        f"[{featset_name}] sex-agnostic external eval: missing columns for metrics: "
+                        f"{[c for c in ['PE_Time', 'VT/VF/SCD'] if c not in merged.columns]} — saving predictions only."
+                    )
+                    if "VT/VF/SCD" in merged.columns:
+                        merged = merged.rename(columns={"VT/VF/SCD": "PE"})
                 merged.to_csv(
                     os.path.join(preds_dir, f"{featset_name}_sex_agnostic_{dataset_name}_preds.csv"),
                     index=False,
                 )
-                c_all = SCMR._safe_cindex(
-                    merged["PE_Time"].values, merged["PE"].values, merged["pred_prob"].values
-                )
-                c_m = float("nan")
-                c_f = float("nan")
-                if "Female" in merged.columns:
-                    mask_m = merged["Female"].values == 0
-                    mask_f = merged["Female"].values == 1
-                    if mask_m.any():
-                        c_m = SCMR._safe_cindex(
-                            merged.loc[mask_m, "PE_Time"].values,
-                            merged.loc[mask_m, "PE"].values,
-                            merged.loc[mask_m, "pred_prob"].values,
-                        )
-                    if mask_f.any():
-                        c_f = SCMR._safe_cindex(
-                            merged.loc[mask_f, "PE_Time"].values,
-                            merged.loc[mask_f, "PE"].values,
-                            merged.loc[mask_f, "pred_prob"].values,
-                        )
-                pvals = SCMR._compute_logrank_pvalues_by_gender(merged)
-                hrs = SCMR._compute_hr_by_gender(merged)
+
+                # Metrics (if possible)
+                if has_outcome and not merged.empty:
+                    c_all = SCMR._safe_cindex(
+                        merged["PE_Time"].values, merged["PE"].values, merged["pred_prob"].values
+                    )
+                    c_m = float("nan")
+                    c_f = float("nan")
+                    if "Female" in merged.columns:
+                        mask_m = merged["Female"].values == 0
+                        mask_f = merged["Female"].values == 1
+                        if mask_m.any():
+                            c_m = SCMR._safe_cindex(
+                                merged.loc[mask_m, "PE_Time"].values,
+                                merged.loc[mask_m, "PE"].values,
+                                merged.loc[mask_m, "pred_prob"].values,
+                            )
+                        if mask_f.any():
+                            c_f = SCMR._safe_cindex(
+                                merged.loc[mask_f, "PE_Time"].values,
+                                merged.loc[mask_f, "PE"].values,
+                                merged.loc[mask_f, "pred_prob"].values,
+                            )
+                    pvals = SCMR._compute_logrank_pvalues_by_gender(merged)
+                    hrs = SCMR._compute_hr_by_gender(merged)
+                else:
+                    c_all = c_m = c_f = float("nan")
+                    pvals, hrs = {}, {}
+
                 rows.append(
                     {
                         "dataset": dataset_name,
@@ -293,14 +312,14 @@ def evaluate_with_saved_models(
                         "c_index_all": c_all,
                         "c_index_male": c_m,
                         "c_index_female": c_f,
-                        "logrank_p_male": pvals.get("male"),
-                        "logrank_p_female": pvals.get("female"),
-                        "hr_male": hrs.get("male", (np.nan, np.nan, np.nan))[0],
-                        "hr_male_ci_low": hrs.get("male", (np.nan, np.nan, np.nan))[1],
-                        "hr_male_ci_high": hrs.get("male", (np.nan, np.nan, np.nan))[2],
-                        "hr_female": hrs.get("female", (np.nan, np.nan, np.nan))[0],
-                        "hr_female_ci_low": hrs.get("female", (np.nan, np.nan, np.nan))[1],
-                        "hr_female_ci_high": hrs.get("female", (np.nan, np.nan, np.nan))[2],
+                        "logrank_p_male": pvals.get("male") if pvals else np.nan,
+                        "logrank_p_female": pvals.get("female") if pvals else np.nan,
+                        "hr_male": (hrs.get("male", (np.nan, np.nan, np.nan))[0] if hrs else np.nan),
+                        "hr_male_ci_low": (hrs.get("male", (np.nan, np.nan, np.nan))[1] if hrs else np.nan),
+                        "hr_male_ci_high": (hrs.get("male", (np.nan, np.nan, np.nan))[2] if hrs else np.nan),
+                        "hr_female": (hrs.get("female", (np.nan, np.nan, np.nan))[0] if hrs else np.nan),
+                        "hr_female_ci_low": (hrs.get("female", (np.nan, np.nan, np.nan))[1] if hrs else np.nan),
+                        "hr_female_ci_high": (hrs.get("female", (np.nan, np.nan, np.nan))[2] if hrs else np.nan),
                     }
                 )
             except Exception as e:
@@ -325,7 +344,10 @@ def evaluate_with_saved_models(
 
                 # Require Female column for sex-specific evaluation; otherwise skip
                 if "Female" not in df.columns:
-                    raise RuntimeError("Female column not found; skipping sex-specific evaluation for this feature set.")
+                    warnings.warn(
+                        f"[{featset_name}] sex-specific external eval skipped: Female column not found."
+                    )
+                    continue
 
                 te_out = df.copy()
                 if "pred_prob" not in te_out.columns:
@@ -365,32 +387,49 @@ def evaluate_with_saved_models(
                 id_col = "MRN" if "MRN" in te_out.columns else "_row_id"
                 if id_col == "_row_id" and "_row_id" not in te_out.columns:
                     te_out["_row_id"] = np.arange(len(te_out))
-                merged = (
-                    te_out[[c for c in [id_col, "Female", "pred_label", "pred_prob", "PE_Time", "VT/VF/SCD"] if c in te_out.columns]]
-                    .dropna(subset=["PE_Time", "VT/VF/SCD"]).drop_duplicates(subset=[id_col])
-                    .rename(columns={"VT/VF/SCD": "PE"})
-                )
+                # Build merged predictions robustly regardless of missing outcome columns
+                base_cols = [id_col, "Female", "pred_label", "pred_prob", "PE_Time", "VT/VF/SCD"]
+                present_cols = [c for c in base_cols if c in te_out.columns]
+                merged = te_out[present_cols].copy()
+                has_outcome = ("PE_Time" in merged.columns) and ("VT/VF/SCD" in merged.columns)
+                if has_outcome:
+                    merged = (
+                        merged.dropna(subset=["PE_Time", "VT/VF/SCD"]).drop_duplicates(subset=[id_col])
+                        .rename(columns={"VT/VF/SCD": "PE"})
+                    )
+                else:
+                    warnings.warn(
+                        f"[{featset_name}] sex-specific external eval: missing columns for metrics: "
+                        f"{[c for c in ['PE_Time', 'VT/VF/SCD'] if c not in merged.columns]} — saving predictions only."
+                    )
+                    if "VT/VF/SCD" in merged.columns:
+                        merged = merged.rename(columns={"VT/VF/SCD": "PE"})
                 merged.to_csv(
                     os.path.join(preds_dir, f"{featset_name}_sex_specific_{dataset_name}_preds.csv"),
                     index=False,
                 )
-                mask_m = merged["Female"].values == 0
-                mask_f = merged["Female"].values == 1
-                c_all = SCMR._safe_cindex(
-                    merged["PE_Time"].values, merged["PE"].values, merged["pred_prob"].values
-                )
-                c_m = SCMR._safe_cindex(
-                    merged.loc[mask_m, "PE_Time"].values,
-                    merged.loc[mask_m, "PE"].values,
-                    merged.loc[mask_m, "pred_prob"].values,
-                )
-                c_f = SCMR._safe_cindex(
-                    merged.loc[mask_f, "PE_Time"].values,
-                    merged.loc[mask_f, "PE"].values,
-                    merged.loc[mask_f, "pred_prob"].values,
-                )
-                pvals = SCMR._compute_logrank_pvalues_by_gender(merged)
-                hrs = SCMR._compute_hr_by_gender(merged)
+                # Metrics (if possible)
+                if has_outcome and not merged.empty:
+                    mask_m = merged["Female"].values == 0
+                    mask_f = merged["Female"].values == 1
+                    c_all = SCMR._safe_cindex(
+                        merged["PE_Time"].values, merged["PE"].values, merged["pred_prob"].values
+                    )
+                    c_m = SCMR._safe_cindex(
+                        merged.loc[mask_m, "PE_Time"].values,
+                        merged.loc[mask_m, "PE"].values,
+                        merged.loc[mask_m, "pred_prob"].values,
+                    )
+                    c_f = SCMR._safe_cindex(
+                        merged.loc[mask_f, "PE_Time"].values,
+                        merged.loc[mask_f, "PE"].values,
+                        merged.loc[mask_f, "pred_prob"].values,
+                    )
+                    pvals = SCMR._compute_logrank_pvalues_by_gender(merged)
+                    hrs = SCMR._compute_hr_by_gender(merged)
+                else:
+                    c_all = c_m = c_f = float("nan")
+                    pvals, hrs = {}, {}
                 rows.append(
                     {
                         "dataset": dataset_name,
@@ -399,14 +438,14 @@ def evaluate_with_saved_models(
                         "c_index_all": c_all,
                         "c_index_male": c_m,
                         "c_index_female": c_f,
-                        "logrank_p_male": pvals.get("male"),
-                        "logrank_p_female": pvals.get("female"),
-                        "hr_male": hrs.get("male", (np.nan, np.nan, np.nan))[0],
-                        "hr_male_ci_low": hrs.get("male", (np.nan, np.nan, np.nan))[1],
-                        "hr_male_ci_high": hrs.get("male", (np.nan, np.nan, np.nan))[2],
-                        "hr_female": hrs.get("female", (np.nan, np.nan, np.nan))[0],
-                        "hr_female_ci_low": hrs.get("female", (np.nan, np.nan, np.nan))[1],
-                        "hr_female_ci_high": hrs.get("female", (np.nan, np.nan, np.nan))[2],
+                        "logrank_p_male": pvals.get("male") if pvals else np.nan,
+                        "logrank_p_female": pvals.get("female") if pvals else np.nan,
+                        "hr_male": (hrs.get("male", (np.nan, np.nan, np.nan))[0] if hrs else np.nan),
+                        "hr_male_ci_low": (hrs.get("male", (np.nan, np.nan, np.nan))[1] if hrs else np.nan),
+                        "hr_male_ci_high": (hrs.get("male", (np.nan, np.nan, np.nan))[2] if hrs else np.nan),
+                        "hr_female": (hrs.get("female", (np.nan, np.nan, np.nan))[0] if hrs else np.nan),
+                        "hr_female_ci_low": (hrs.get("female", (np.nan, np.nan, np.nan))[1] if hrs else np.nan),
+                        "hr_female_ci_high": (hrs.get("female", (np.nan, np.nan, np.nan))[2] if hrs else np.nan),
                     }
                 )
             except Exception as e:
