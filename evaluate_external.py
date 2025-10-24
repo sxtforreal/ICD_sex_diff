@@ -406,6 +406,70 @@ def _prepare_external_for_features(ext_raw: pd.DataFrame, features: List[str], l
     # First, ensure PE_Time if possible
     ext_raw2 = _derive_endpoints_if_needed(ext_raw)
 
+    # Derive engineered variables to mirror SCMR.load_dataframes
+    try:
+        # Age by decade
+        if "Age at CMR" in ext_raw2.columns and "Age by decade" not in ext_raw2.columns:
+            ext_raw2["Age by decade"] = (pd.to_numeric(ext_raw2["Age at CMR"], errors="coerce") // 10).values
+    except Exception:
+        pass
+    try:
+        # Cockcroft-Gault -> CrCl>45
+        if (
+            "CrCl>45" not in ext_raw2.columns
+            and "Cockcroft-Gault Creatinine Clearance (mL/min)" in ext_raw2.columns
+        ):
+            ext_raw2["CrCl>45"] = (
+                (pd.to_numeric(ext_raw2["Cockcroft-Gault Creatinine Clearance (mL/min)"], errors="coerce") > 45)
+                .fillna(False)
+                .astype(int)
+            )
+        # If CG clearance not present but components exist, compute then threshold
+        elif {
+            "Age at CMR",
+            "Weight (Kg)",
+            "Female",
+            "Serum creatinine (within 3 months of MRI)",
+        }.issubset(ext_raw2.columns):
+            def _cg_row(row: pd.Series) -> Any:
+                try:
+                    return scmr.CG_equation(
+                        pd.to_numeric(row["Age at CMR"], errors="coerce"),
+                        pd.to_numeric(row["Weight (Kg)"], errors="coerce"),
+                        int(pd.to_numeric(row["Female"], errors="coerce")),
+                        pd.to_numeric(row["Serum creatinine (within 3 months of MRI)"], errors="coerce"),
+                    )
+                except Exception:
+                    return np.nan
+            try:
+                ext_raw2["Cockcroft-Gault Creatinine Clearance (mL/min)"] = ext_raw2.apply(_cg_row, axis=1)
+                ext_raw2["CrCl>45"] = (
+                    (pd.to_numeric(ext_raw2["Cockcroft-Gault Creatinine Clearance (mL/min)"], errors="coerce") > 45)
+                    .fillna(False)
+                    .astype(int)
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        # NYHA>2
+        if "NYHA Class" in ext_raw2.columns and "NYHA>2" not in ext_raw2.columns:
+            ext_raw2["NYHA Class"] = scmr._encode_nyha_ordinal(ext_raw2["NYHA Class"]).astype("Int64")
+            ext_raw2["NYHA>2"] = (pd.to_numeric(ext_raw2["NYHA Class"], errors="coerce") > 2).fillna(False).astype(int)
+    except Exception:
+        pass
+    try:
+        # Significant LGE
+        if "LGE Burden 5SD" in ext_raw2.columns and "Significant LGE" not in ext_raw2.columns:
+            ext_raw2["Significant LGE"] = (
+                (pd.to_numeric(ext_raw2["LGE Burden 5SD"], errors="coerce") > 2)
+                .fillna(False)
+                .astype(int)
+            )
+    except Exception:
+        pass
+
     # Use SCMR diagnostics to analyze mapping and missingness
     try:
         analysis = scmr.analyze_column_resolution(ext_raw2, features, labels)
@@ -645,6 +709,27 @@ def main() -> None:
         missing_in_ext = [c for c in feats if c not in ext_df.columns]
         if missing_in_ext:
             warnings.warn(f"[{featset}][{mode}] Missing features in external dataset: {missing_in_ext}")
+
+        # Persist per-model missingness before imputation
+        try:
+            rows = []
+            # pre_ext_df may be empty if analysis failed; guard accordingly
+            has_pre = 'pre_ext_df' in locals() and isinstance(pre_ext_df, pd.DataFrame)
+            for ftr in feats:
+                present = bool(has_pre and (ftr in pre_ext_df.columns))
+                if present:
+                    miss_rate = float(pd.to_numeric(pre_ext_df[ftr], errors="coerce").isna().mean())
+                else:
+                    miss_rate = 1.0
+                rows.append({"feature": ftr, "present": present, "missing_rate": miss_rate})
+            rep = pd.DataFrame(rows)
+            rep.to_csv(os.path.join(out_meta, f"{featset}_{mode}_missingness.csv"), index=False)
+            if missing_in_ext:
+                with open(os.path.join(out_meta, f"{featset}_{mode}_missing_features.txt"), "w", encoding="utf-8") as f:
+                    for m in missing_in_ext:
+                        f.write(str(m) + "\n")
+        except Exception:
+            pass
 
         # Load model objects
         model_obj = None
