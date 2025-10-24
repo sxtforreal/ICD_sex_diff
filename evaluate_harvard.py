@@ -128,7 +128,12 @@ def load_harvard_dataframe(harvard_xlsx: str) -> pd.DataFrame:
     # Keep unique order
     feature_superset = list(dict.fromkeys(feature_superset))
 
-    clean = SCMR.conversion_and_imputation(raw, feature_superset, labels)
+    # Exclude engineered-after-imputation features from the preprocessing request
+    # They will be created below once the base matrix is clean/imputed
+    derived_after_imputation = {"Age by decade", "CrCl>45", "NYHA>2", "Significant LGE"}
+    feature_superset_for_impute = [f for f in feature_superset if f not in derived_after_imputation]
+
+    clean = SCMR.conversion_and_imputation(raw, feature_superset_for_impute, labels)
 
     # Engineer additional features as in SCMR.load_dataframes
     if "Age at CMR" in clean.columns:
@@ -158,6 +163,7 @@ def evaluate_with_saved_models(
     df: pd.DataFrame,
     results_dir: str,
     dataset_name: str,
+    model_name: str | None = None,
 ) -> pd.DataFrame:
     models_dir = os.path.join(results_dir, "heldout", "models")
     preds_dir = os.path.join(results_dir, "heldout", "preds")
@@ -169,8 +175,11 @@ def evaluate_with_saved_models(
         warnings.warn(f"Models directory not found: {models_dir}")
         return pd.DataFrame()
 
-    # Loop over feature sets trained
-    for featset_name in sorted(os.listdir(models_dir)):
+    # Loop over feature sets (or restrict to one model_name)
+    featset_names = [model_name] if model_name else sorted(os.listdir(models_dir))
+    for featset_name in featset_names:
+        if featset_name is None:
+            continue
         feat_dir = os.path.join(models_dir, featset_name)
         if not os.path.isdir(feat_dir):
             continue
@@ -179,13 +188,25 @@ def evaluate_with_saved_models(
         agn_dir = os.path.join(feat_dir, "sex_agnostic")
         model_pkl = os.path.join(agn_dir, "model.pkl")
         meta_json = os.path.join(agn_dir, "meta.json")
-        if os.path.exists(model_pkl) and os.path.exists(meta_json):
+        if os.path.exists(model_pkl) and (os.path.exists(meta_json) or True):
             try:
                 with open(model_pkl, "rb") as f:
                     cph = pickle.load(f)
-                meta = _load_json(meta_json)
-                used_feats: List[str] = list(meta.get("features", []))
-                thr: float = float(meta.get("threshold", np.nan))
+                used_feats: List[str] = []
+                thr: float = float("nan")
+                if os.path.exists(meta_json):
+                    try:
+                        meta = _load_json(meta_json)
+                        used_feats = list(meta.get("features", []))
+                        thr = float(meta.get("threshold", np.nan))
+                    except Exception:
+                        pass
+                # Fallback: infer features from model if meta missing or empty
+                if not used_feats:
+                    try:
+                        used_feats = [str(x) for x in getattr(cph, "params_", pd.Series()).index.tolist()]
+                    except Exception:
+                        used_feats = []
 
                 te_eval = df.copy()
                 risk = SCMR.predict_absolute_risk_at_horizon(
@@ -245,11 +266,17 @@ def evaluate_with_saved_models(
         meta_json = os.path.join(spe_dir, "meta.json")
         model_m = os.path.join(spe_dir, "male_model.pkl")
         model_f = os.path.join(spe_dir, "female_model.pkl")
-        if os.path.exists(meta_json) and (os.path.exists(model_m) or os.path.exists(model_f)):
+        if (os.path.exists(model_m) or os.path.exists(model_f)) and (os.path.exists(meta_json) or True):
             try:
-                meta = _load_json(meta_json)
-                used_feats: List[str] = list(meta.get("features", []))
-                thresholds: Dict[str, float] = {k: float(v) for k, v in meta.get("thresholds", {}).items()}
+                used_feats: List[str] = []
+                thresholds: Dict[str, float] = {}
+                if os.path.exists(meta_json):
+                    try:
+                        meta = _load_json(meta_json)
+                        used_feats = list(meta.get("features", []))
+                        thresholds = {k: float(v) for k, v in meta.get("thresholds", {}).items()}
+                    except Exception:
+                        pass
 
                 te_out = df.copy()
                 if "pred_prob" not in te_out.columns:
@@ -260,6 +287,11 @@ def evaluate_with_saved_models(
                 if os.path.exists(model_m):
                     with open(model_m, "rb") as f:
                         cph_m = pickle.load(f)
+                    if not used_feats:
+                        try:
+                            used_feats = [str(x) for x in getattr(cph_m, "params_", pd.Series()).index.tolist()]
+                        except Exception:
+                            used_feats = []
                     te_m = te_out[te_out["Female"] == 0]
                     if not te_m.empty:
                         r_m = SCMR.predict_absolute_risk_at_horizon(cph_m, te_m, used_feats, SCMR.HORIZON_DAYS)
@@ -269,6 +301,11 @@ def evaluate_with_saved_models(
                 if os.path.exists(model_f):
                     with open(model_f, "rb") as f:
                         cph_f = pickle.load(f)
+                    if not used_feats:
+                        try:
+                            used_feats = [str(x) for x in getattr(cph_f, "params_", pd.Series()).index.tolist()]
+                        except Exception:
+                            used_feats = []
                     te_f = te_out[te_out["Female"] == 1]
                     if not te_f.empty:
                         r_f = SCMR.predict_absolute_risk_at_horizon(cph_f, te_f, used_feats, SCMR.HORIZON_DAYS)
@@ -359,6 +396,7 @@ def main():
     parser.add_argument("--retrain", action="store_true", help="Force retraining held-out models before external evaluation")
     parser.add_argument("--test_size", type=float, default=0.3, help="Held-out test size for internal split if retraining")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for held-out split if retraining")
+    parser.add_argument("--model_name", default=os.environ.get("MODEL_NAME", None), help="Only evaluate this model folder name under results/heldout/models")
 
     args = parser.parse_args()
 
@@ -393,7 +431,7 @@ def main():
 
     df_harvard = load_harvard_dataframe(args.harvard_xlsx)
 
-    harv_summary = evaluate_with_saved_models(df_harvard, results_dir, dataset_name="harvard")
+    harv_summary = evaluate_with_saved_models(df_harvard, results_dir, dataset_name="harvard", model_name=args.model_name)
 
     # 3) Combine and export
     combined_path = combine_and_export(internal_summary, harv_summary, results_dir)
