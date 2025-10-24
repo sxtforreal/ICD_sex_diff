@@ -18,6 +18,12 @@ import matplotlib.pyplot as plt
 plt.switch_backend("Agg")
 from typing import Dict, List, Tuple, Any
 
+# Opt-in to future pandas behavior to avoid noisy downcasting warnings
+try:
+    pd.set_option("future.no_silent_downcasting", True)
+except Exception:
+    pass
+
 # ==========================================
 # Global store for selected features (Proposed & Advanced only)
 # ==========================================
@@ -95,6 +101,54 @@ def _simplify_name(name: str) -> str:
     lowered = name.lower()
     simplified = re.sub(r"[^a-z0-9]+", " ", lowered).strip()
     return simplified
+
+
+def _coerce_yes_no_to_binary(series: pd.Series) -> pd.Series:
+    """Coerce common yes/no-like strings to {0,1} without using Series.replace.
+
+    Accepted truthy: yes, y, true, t, 1
+    Accepted falsy:  no, n, false, f, 0
+    Leaves other values unchanged; numeric coercion is handled downstream.
+    """
+    try:
+        s = series.astype(str).str.strip().str.lower()
+        result = series.copy()
+        truthy = {"yes", "y", "true", "t", "1"}
+        falsy = {"no", "n", "false", "f", "0"}
+        mask_true = s.isin(truthy)
+        mask_false = s.isin(falsy)
+        if mask_true.any():
+            result.loc[mask_true] = 1
+        if mask_false.any():
+            result.loc[mask_false] = 0
+        return result
+    except Exception:
+        return series
+
+
+def _coerce_female_binary(series: pd.Series) -> pd.Series:
+    """Specialized coercion for a `Female` column to {0,1}.
+
+    Maps female-like tokens to 1 and male-like tokens to 0, also handles yes/no and 1/0.
+    """
+    try:
+        s = series.astype(str).str.strip().str.lower()
+        result = series.copy()
+        # Prefer explicit gender tokens first
+        mask_female_word = s.str.fullmatch(r"(?i)female") | (s == "f")
+        mask_male_word = s.str.fullmatch(r"(?i)male") | (s == "m")
+        if mask_female_word.any():
+            result.loc[mask_female_word] = 1
+        if mask_male_word.any():
+            result.loc[mask_male_word] = 0
+        # Fallback to yes/no style if still not numeric
+        unresolved = ~mask_female_word & ~mask_male_word
+        if unresolved.any():
+            tmp = _coerce_yes_no_to_binary(s[unresolved])
+            result.loc[unresolved] = tmp
+        return result
+    except Exception:
+        return _coerce_yes_no_to_binary(series)
 
 
 def _encode_nyha_ordinal(series: pd.Series) -> pd.Series:
@@ -2498,11 +2552,10 @@ def conversion_and_imputation(
     exist_bin = list(binary_cols)
     for c in exist_bin:
         if df[c].dtype == "object":
-            df[c] = (
-                df[c]
-                .replace({"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0})
-                .infer_objects(copy=False)
-            )
+            if c == "Female":
+                df[c] = _coerce_female_binary(df[c])
+            else:
+                df[c] = _coerce_yes_no_to_binary(df[c])
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # Prepare nominal multi-class: cast to string category without forcing numeric
@@ -2515,11 +2568,10 @@ def conversion_and_imputation(
         df["NYHA Class"] = _encode_nyha_ordinal(df["NYHA Class"])
 
     # For all remaining features, coerce plausibly numeric strings to float; leave nominal as-is
-    yes_no_map = {"Yes": 1, "No": 0, "Y": 1, "N": 0, "True": 1, "False": 0}
     for c in features:
         if c in df.columns and c not in NOMINAL_MULTICLASS_FEATURES:
             if df[c].dtype == "object":
-                df[c] = df[c].replace(yes_no_map).infer_objects(copy=False)
+                df[c] = _coerce_yes_no_to_binary(df[c])
                 try:
                     df[c] = (
                         df[c]
