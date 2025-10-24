@@ -9,6 +9,7 @@ import numpy as np
 
 # Reuse the existing pipeline utilities without modifying repo code
 import SCMR
+from lifelines import KaplanMeierFitter
 
 
 def _ensure_dir(path: str) -> None:
@@ -462,6 +463,328 @@ def evaluate_with_saved_models(
     return summary_df
 
 
+def _basic_dataset_stats(df: pd.DataFrame) -> dict:
+    out: dict = {"n": int(len(df))}
+    if "VT/VF/SCD" in df.columns:
+        try:
+            e = pd.to_numeric(df["VT/VF/SCD"], errors="coerce")
+            out["event_rate"] = float(np.nanmean(e))
+        except Exception:
+            out["event_rate"] = float("nan")
+    else:
+        out["event_rate"] = float("nan")
+    if "PE_Time" in df.columns:
+        try:
+            t = pd.to_numeric(df["PE_Time"], errors="coerce")
+            out["pe_time_median_days"] = float(np.nanmedian(t))
+        except Exception:
+            out["pe_time_median_days"] = float("nan")
+    else:
+        out["pe_time_median_days"] = float("nan")
+    if "Female" in df.columns:
+        try:
+            f = pd.to_numeric(df["Female"], errors="coerce")
+            out["female_rate"] = float(np.nanmean(f))
+        except Exception:
+            out["female_rate"] = float("nan")
+    else:
+        out["female_rate"] = float("nan")
+    return out
+
+
+def _km_survival_at_horizon(df: pd.DataFrame, horizon_days: int) -> float:
+    try:
+        cols_ok = {"PE_Time", "VT/VF/SCD"}.issubset(set(df.columns))
+        if not cols_ok:
+            return float("nan")
+        sub = df.dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
+        if sub.empty:
+            return float("nan")
+        kmf = KaplanMeierFitter()
+        kmf.fit(durations=sub["PE_Time"].astype(float), event_observed=sub["VT/VF/SCD"].astype(int))
+        # Evaluate S(t) at horizon by step-wise interpolation similar to SCMR
+        ser = kmf.survival_function_["KM_estimate"]
+        idx = pd.to_numeric(pd.Index(ser.index), errors="coerce")
+        ser.index = idx
+        ser = ser.sort_index()
+        valid = ser[ser.index <= float(horizon_days)]
+        if not valid.empty:
+            return float(valid.iloc[-1])
+        return float("nan")
+    except Exception:
+        return float("nan")
+
+
+def generate_harvard_diagnostics(
+    df_internal: pd.DataFrame,
+    df_harvard: pd.DataFrame,
+    results_dir: str,
+    model_name: str | None = None,
+) -> str:
+    """Create drift, missingness, and calibration diagnostics to explain external underperformance.
+
+    Returns the path to the diagnostics directory.
+    """
+    diag_dir = os.path.join(results_dir, "heldout", "diagnostics_harvard")
+    _ensure_dir(diag_dir)
+
+    # Save basic dataset-level stats
+    basic = {
+        "internal": _basic_dataset_stats(df_internal),
+        "harvard": _basic_dataset_stats(df_harvard),
+    }
+    try:
+        with open(os.path.join(diag_dir, "dataset_stats.json"), "w") as f:
+            json.dump(basic, f, indent=2)
+    except Exception:
+        pass
+
+    # Figure out which feature set folders exist under saved models
+    models_dir = os.path.join(results_dir, "heldout", "models")
+    if not os.path.isdir(models_dir):
+        return diag_dir
+
+    if model_name:
+        names = os.listdir(models_dir)
+        chosen = [n for n in names if n.lower() == str(model_name).lower()]
+        featset_names = chosen if chosen else [model_name]
+    else:
+        featset_names = sorted(os.listdir(models_dir))
+
+    # Diagnostics per feature set
+    for featset_name in featset_names:
+        if featset_name is None:
+            continue
+        feat_dir = os.path.join(models_dir, featset_name)
+        if not os.path.isdir(feat_dir):
+            continue
+
+        # Determine candidate features to assess drift on
+        candidate_features: list[str] = list(SCMR.FEATURE_SETS.get(featset_name, []))
+        # Engineering parity with loaders
+        derived_after_imputation = {"Age by decade", "CrCl>45", "NYHA>2", "Significant LGE"}
+        features_for_drift = list(candidate_features)
+
+        # Build drift vs internal on the same cleaned matrices
+        ref = df_internal.copy()
+        ext = df_harvard.copy()
+
+        # Column resolution overview for transparency
+        try:
+            labels = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
+            res_int = SCMR.analyze_column_resolution(ref, candidate_features, labels)
+            res_ext = SCMR.analyze_column_resolution(ext, candidate_features, labels)
+        except Exception:
+            res_int, res_ext = {}, {}
+
+        # Compute SMD drift; function skips missing features gracefully
+        try:
+            drift_df = SCMR.compute_smd_drift_report(ref, ext, features_for_drift)
+        except Exception:
+            # Fallback: empty
+            drift_df = pd.DataFrame(columns=["feature", "type", "smd"])  # type: ignore
+
+        # Save drift to CSV
+        out_feat_dir = os.path.join(diag_dir, featset_name)
+        _ensure_dir(out_feat_dir)
+        try:
+            drift_df.to_csv(os.path.join(out_feat_dir, "drift_smd.csv"), index=False)
+        except Exception:
+            pass
+        try:
+            with open(os.path.join(out_feat_dir, "column_resolution_internal.json"), "w") as f:
+                json.dump(res_int, f, indent=2)
+        except Exception:
+            pass
+        try:
+            with open(os.path.join(out_feat_dir, "column_resolution_harvard.json"), "w") as f:
+                json.dump(res_ext, f, indent=2)
+        except Exception:
+            pass
+
+        # Missing features on Harvard
+        missing_in_harv = [f for f in features_for_drift if f not in df_harvard.columns]
+        missing_in_int = [f for f in features_for_drift if f not in df_internal.columns]
+
+        # Baseline survival calibration check and model-feature drift using sex-agnostic model if available
+        s0_train = float("nan")
+        model_features: list[str] = []
+        agn_dir = os.path.join(feat_dir, "sex_agnostic")
+        model_pkl = os.path.join(agn_dir, "model.pkl")
+        if os.path.exists(model_pkl):
+            try:
+                with open(model_pkl, "rb") as f:
+                    cph = pickle.load(f)
+                s0_train = float(SCMR._baseline_survival_at_horizon(cph, SCMR.HORIZON_DAYS))
+                model_features = [str(x) for x in getattr(cph, "params_", pd.Series()).index.tolist()]
+            except Exception:
+                pass
+
+        drift_model_feats = pd.DataFrame()
+        if model_features:
+            try:
+                drift_model_feats = SCMR.compute_smd_drift_report(ref, ext, model_features)
+            except Exception:
+                drift_model_feats = pd.DataFrame()
+            try:
+                drift_model_feats.to_csv(os.path.join(out_feat_dir, "drift_smd_model_features.csv"), index=False)
+            except Exception:
+                pass
+
+        s_km_internal = _km_survival_at_horizon(df_internal, SCMR.HORIZON_DAYS)
+        s_km_harvard = _km_survival_at_horizon(df_harvard, SCMR.HORIZON_DAYS)
+
+        # Top drift features by |SMD|
+        try:
+            top = (
+                drift_df.assign(abs_smd=lambda d: d["smd"].abs())
+                .sort_values("abs_smd", ascending=False)
+                .head(15)
+            )
+            top_feats = [str(x) for x in top["feature"].tolist()]
+        except Exception:
+            top_feats = []
+
+        summary = {
+            "feature_set": featset_name,
+            "missing_features_in_harvard": missing_in_harv,
+            "missing_features_in_internal": missing_in_int,
+            "top_drift_features_by_abs_smd": top_feats,
+            "s0_train_at_horizon": s0_train,
+            "km_survival_internal_at_horizon": s_km_internal,
+            "km_survival_harvard_at_horizon": s_km_harvard,
+            "model_features": model_features,
+            "n_model_features_missing_in_harvard": int(
+                sum(1 for f in model_features if f not in df_harvard.columns)
+            ) if model_features else None,
+        }
+        try:
+            with open(os.path.join(out_feat_dir, "summary.json"), "w") as f:
+                json.dump(summary, f, indent=2)
+        except Exception:
+            pass
+
+    return diag_dir
+
+
+def generate_common_tableone(
+    df_internal: pd.DataFrame,
+    df_harvard: pd.DataFrame,
+    results_dir: str,
+) -> str:
+    """Generate a TableOne-style comparison between internal and Harvard on common variables.
+
+    Writes an Excel file with the summary. Uses tableone if available; otherwise a fallback summary.
+    Returns the output Excel path.
+    """
+    diag_dir = os.path.join(results_dir, "heldout", "diagnostics_harvard")
+    _ensure_dir(diag_dir)
+    out_path = os.path.join(diag_dir, "tableone_common_internal_vs_harvard.xlsx")
+
+    # Prepare combined frame and detect common columns
+    int_df = df_internal.copy()
+    harv_df = df_harvard.copy()
+    int_df["dataset"] = "internal"
+    harv_df["dataset"] = "harvard"
+
+    excluded = {"dataset", "MRN", "_row_id", "pred_prob", "pred_label"}
+    # Labels often not part of baseline characteristic table; exclude but can be added if desired
+    excluded |= {"VT/VF/SCD", "PE_Time", "ICD"}
+
+    common = [
+        c
+        for c in sorted(set(int_df.columns).intersection(set(harv_df.columns)))
+        if c not in excluded
+    ]
+    if not common:
+        # Nothing to compare
+        return out_path
+
+    combined = pd.concat([int_df, harv_df], ignore_index=True)
+
+    # Identify categorical variables from SCMR declarations where applicable
+    categorical = [c for c in common if c in getattr(SCMR, "BINARY_FEATURES", [])]
+    categorical += [c for c in common if c in getattr(SCMR, "NOMINAL_MULTICLASS_FEATURES", [])]
+    # Ensure uniqueness
+    categorical = sorted(list(dict.fromkeys(categorical)))
+
+    # Coerce categorical types for robustness
+    for c in categorical:
+        if c in combined.columns:
+            combined[c] = combined[c].astype("category")
+
+    # Attempt to use tableone if available
+    try:
+        from tableone import TableOne  # type: ignore
+
+        tab_cols = common
+        tab_cat = [c for c in tab_cols if c in categorical]
+        tab1 = TableOne(
+            combined,
+            columns=tab_cols,
+            categorical=tab_cat,
+            groupby="dataset",
+            pval=True,
+            missing=True,
+        )
+        table_df = getattr(tab1, "tableone", None)
+        if table_df is None:
+            # Fallback to HTML parsing if the attribute is not present
+            try:
+                table_df = pd.read_html(tab1.as_html())[0]
+            except Exception:
+                table_df = None
+        if table_df is not None:
+            table_df.to_excel(out_path, index=True)
+            return out_path
+    except Exception:
+        # Proceed to fallback summary
+        pass
+
+    # Fallback: simple descriptive stats by dataset
+    # Split numeric vs categorical based on observed dtype
+    numeric_cols = [c for c in common if pd.api.types.is_numeric_dtype(combined[c])]
+    # Try to coerce plausibly numeric strings
+    for c in common:
+        if c not in numeric_cols and combined[c].dtype == "object":
+            try:
+                coerced = pd.to_numeric(combined[c], errors="coerce")
+                if coerced.notna().any():
+                    combined[c] = coerced
+                    numeric_cols.append(c)
+            except Exception:
+                pass
+    numeric_cols = sorted(list(dict.fromkeys(numeric_cols)))
+    cat_cols = sorted([c for c in common if c not in numeric_cols])
+
+    with pd.ExcelWriter(out_path) as writer:
+        if numeric_cols:
+            num_summary = (
+                combined.groupby("dataset")[numeric_cols]
+                .agg(["count", "mean", "std", "median"])
+                .transpose()
+            )
+            num_summary.to_excel(writer, sheet_name="numeric")
+        if cat_cols:
+            # For each categorical, output counts and proportions per dataset
+            all_cat_frames: list[pd.DataFrame] = []
+            for c in cat_cols:
+                vc = combined.groupby(["dataset", c]).size().unstack(level=0, fill_value=0)
+                # Add row-wise proportions
+                prop = vc.div(vc.sum(axis=1).replace(0, np.nan), axis=0)
+                vc.columns = [f"{col}_count" for col in vc.columns]
+                prop.columns = [f"{col}_prop" for col in prop.columns]
+                cat_table = pd.concat([vc, prop], axis=1)
+                # Add a spacer row
+                cat_table.index = pd.MultiIndex.from_product([[c], cat_table.index])
+                all_cat_frames.append(cat_table)
+            if all_cat_frames:
+                cat_summary = pd.concat(all_cat_frames, axis=0)
+                cat_summary.to_excel(writer, sheet_name="categorical")
+
+    return out_path
+
+
 def combine_and_export(
     internal_summary: pd.DataFrame,
     external_summary: pd.DataFrame,
@@ -525,6 +848,20 @@ def main():
     df_harvard = load_harvard_dataframe(args.harvard_xlsx, restrict_to_feature_set=args.model_name)
 
     harv_summary = evaluate_with_saved_models(df_harvard, results_dir, dataset_name="harvard", model_name=args.model_name)
+
+    # 2.5) Diagnostics: why external might underperform
+    try:
+        diag_dir = generate_harvard_diagnostics(df_internal, df_harvard, results_dir, model_name=args.model_name)
+        print(f"- Diagnostics written to: {diag_dir}")
+    except Exception as e:
+        warnings.warn(f"Diagnostics generation failed: {e}")
+
+    # 2.6) TableOne-style comparison on common variables
+    try:
+        tab1_path = generate_common_tableone(df_internal, df_harvard, results_dir)
+        print(f"- TableOne (common vars) saved: {tab1_path}")
+    except Exception as e:
+        warnings.warn(f"TableOne (common) generation failed: {e}")
 
     # 3) Combine and export
     combined_path = combine_and_export(internal_summary, harv_summary, results_dir)
