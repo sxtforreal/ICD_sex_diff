@@ -90,13 +90,37 @@ def _read_excel_robust(path: str) -> pd.DataFrame:
         return _norm_cols(sheets).copy()
 
 
-def load_harvard_dataframe(harvard_xlsx: str) -> pd.DataFrame:
+def load_harvard_dataframe(harvard_xlsx: str, restrict_to_feature_set: str | None = None) -> pd.DataFrame:
     if not os.path.exists(harvard_xlsx):
         raise FileNotFoundError(
             f"Harvard dataset not found at '{harvard_xlsx}'. Set --harvard_xlsx or HARVARD_XLSX."
         )
 
     raw = _read_excel_robust(harvard_xlsx)
+
+    # Align with SCMR preprocessing: fill Cockcroft-Gault CrCl if missing
+    try:
+        def _fill_cg(row: pd.Series) -> Any:
+            try:
+                val = row["Cockcroft-Gault Creatinine Clearance (mL/min)"]
+            except Exception:
+                val = np.nan
+            if pd.notna(val):
+                return val
+            try:
+                return SCMR.CG_equation(
+                    row["Age at CMR"],
+                    row["Weight (Kg)"],
+                    row["Female"],
+                    row["Serum creatinine (within 3 months of MRI)"],
+                )
+            except Exception:
+                return np.nan
+
+        raw["Cockcroft-Gault Creatinine Clearance (mL/min)"] = raw.apply(_fill_cg, axis=1)
+    except Exception:
+        # Best-effort; proceed if inputs not available
+        pass
 
     # Attempt PE_Time derivation if missing
     if "PE_Time" not in raw.columns:
@@ -120,13 +144,16 @@ def load_harvard_dataframe(harvard_xlsx: str) -> pd.DataFrame:
         except Exception:
             pass
 
-    # Build a superset of candidate features across all feature sets
+    # Build candidate features: strictly the requested model set if provided; otherwise union
     labels = ["MRN", "VT/VF/SCD", "ICD", "PE_Time"]
     feature_superset: List[str] = []
-    for v in SCMR.FEATURE_SETS.values():
-        feature_superset.extend(v)
-    # Keep unique order
-    feature_superset = list(dict.fromkeys(feature_superset))
+    if restrict_to_feature_set and restrict_to_feature_set in SCMR.FEATURE_SETS:
+        feature_superset = list(SCMR.FEATURE_SETS[restrict_to_feature_set])
+    else:
+        for v in SCMR.FEATURE_SETS.values():
+            feature_superset.extend(v)
+        # Keep unique order
+        feature_superset = list(dict.fromkeys(feature_superset))
 
     # Exclude engineered-after-imputation features from the preprocessing request
     # They will be created below once the base matrix is clean/imputed
@@ -176,7 +203,13 @@ def evaluate_with_saved_models(
         return pd.DataFrame()
 
     # Loop over feature sets (or restrict to one model_name)
-    featset_names = [model_name] if model_name else sorted(os.listdir(models_dir))
+    if model_name:
+        # Match folder name case-insensitively for robustness
+        names = os.listdir(models_dir)
+        chosen = [n for n in names if n.lower() == str(model_name).lower()]
+        featset_names = chosen if chosen else [model_name]
+    else:
+        featset_names = sorted(os.listdir(models_dir))
     for featset_name in featset_names:
         if featset_name is None:
             continue
@@ -209,35 +242,47 @@ def evaluate_with_saved_models(
                         used_feats = []
 
                 te_eval = df.copy()
+                # Ensure an identifier column exists even if MRN is missing
+                id_col = "MRN" if "MRN" in te_eval.columns else "_row_id"
+                if id_col == "_row_id" and "_row_id" not in te_eval.columns:
+                    te_eval["_row_id"] = np.arange(len(te_eval))
                 risk = SCMR.predict_absolute_risk_at_horizon(
                     cph, te_eval, used_feats, SCMR.HORIZON_DAYS
                 )
                 te_eval["pred_prob"] = risk
                 te_eval["pred_label"] = (risk >= thr).astype(int)
+                cols = [id_col, "pred_label", "pred_prob", "PE_Time", "VT/VF/SCD"]
+                if "Female" in te_eval.columns:
+                    cols.insert(1, "Female")
                 merged = (
-                    te_eval[["MRN", "Female", "pred_label", "pred_prob", "PE_Time", "VT/VF/SCD"]]
-                    .dropna(subset=["PE_Time", "VT/VF/SCD"]).drop_duplicates(subset=["MRN"])
+                    te_eval[[c for c in cols if c in te_eval.columns]]
+                    .dropna(subset=["PE_Time", "VT/VF/SCD"]).drop_duplicates(subset=[id_col])
                     .rename(columns={"VT/VF/SCD": "PE"})
                 )
                 merged.to_csv(
                     os.path.join(preds_dir, f"{featset_name}_sex_agnostic_{dataset_name}_preds.csv"),
                     index=False,
                 )
-                mask_m = merged["Female"].values == 0
-                mask_f = merged["Female"].values == 1
                 c_all = SCMR._safe_cindex(
                     merged["PE_Time"].values, merged["PE"].values, merged["pred_prob"].values
                 )
-                c_m = SCMR._safe_cindex(
-                    merged.loc[mask_m, "PE_Time"].values,
-                    merged.loc[mask_m, "PE"].values,
-                    merged.loc[mask_m, "pred_prob"].values,
-                )
-                c_f = SCMR._safe_cindex(
-                    merged.loc[mask_f, "PE_Time"].values,
-                    merged.loc[mask_f, "PE"].values,
-                    merged.loc[mask_f, "pred_prob"].values,
-                )
+                c_m = float("nan")
+                c_f = float("nan")
+                if "Female" in merged.columns:
+                    mask_m = merged["Female"].values == 0
+                    mask_f = merged["Female"].values == 1
+                    if mask_m.any():
+                        c_m = SCMR._safe_cindex(
+                            merged.loc[mask_m, "PE_Time"].values,
+                            merged.loc[mask_m, "PE"].values,
+                            merged.loc[mask_m, "pred_prob"].values,
+                        )
+                    if mask_f.any():
+                        c_f = SCMR._safe_cindex(
+                            merged.loc[mask_f, "PE_Time"].values,
+                            merged.loc[mask_f, "PE"].values,
+                            merged.loc[mask_f, "pred_prob"].values,
+                        )
                 pvals = SCMR._compute_logrank_pvalues_by_gender(merged)
                 hrs = SCMR._compute_hr_by_gender(merged)
                 rows.append(
@@ -278,6 +323,10 @@ def evaluate_with_saved_models(
                     except Exception:
                         pass
 
+                # Require Female column for sex-specific evaluation; otherwise skip
+                if "Female" not in df.columns:
+                    raise RuntimeError("Female column not found; skipping sex-specific evaluation for this feature set.")
+
                 te_out = df.copy()
                 if "pred_prob" not in te_out.columns:
                     te_out["pred_prob"] = np.nan
@@ -312,9 +361,13 @@ def evaluate_with_saved_models(
                         te_out.loc[te_out["Female"] == 1, "pred_prob"] = r_f
                         te_out.loc[te_out["Female"] == 1, "pred_label"] = (r_f >= thresholds.get("female", np.nan)).astype(int)
 
+                # Build merged output with robust ID handling
+                id_col = "MRN" if "MRN" in te_out.columns else "_row_id"
+                if id_col == "_row_id" and "_row_id" not in te_out.columns:
+                    te_out["_row_id"] = np.arange(len(te_out))
                 merged = (
-                    te_out[["MRN", "Female", "pred_label", "pred_prob", "PE_Time", "VT/VF/SCD"]]
-                    .dropna(subset=["PE_Time", "VT/VF/SCD"]).drop_duplicates(subset=["MRN"])
+                    te_out[[c for c in [id_col, "Female", "pred_label", "pred_prob", "PE_Time", "VT/VF/SCD"] if c in te_out.columns]]
+                    .dropna(subset=["PE_Time", "VT/VF/SCD"]).drop_duplicates(subset=[id_col])
                     .rename(columns={"VT/VF/SCD": "PE"})
                 )
                 merged.to_csv(
@@ -429,7 +482,8 @@ def main():
             f"Harvard dataset not found at '{args.harvard_xlsx}'. Place it there or pass --harvard_xlsx."
         )
 
-    df_harvard = load_harvard_dataframe(args.harvard_xlsx)
+    # Restrict preprocessing to the selected model's declared columns when provided
+    df_harvard = load_harvard_dataframe(args.harvard_xlsx, restrict_to_feature_set=args.model_name)
 
     harv_summary = evaluate_with_saved_models(df_harvard, results_dir, dataset_name="harvard", model_name=args.model_name)
 
