@@ -738,7 +738,12 @@ def main() -> None:
     parser.add_argument("--external_sheet", default=None, help="Sheet name for Excel (optional)")
     parser.add_argument("--results_dir", default=os.path.join(os.getcwd(), "results"), help="Results directory (default: ./results)")
     parser.add_argument("--models_dir", default=None, help="Models root directory (default: <results_dir>/heldout/models)")
-    parser.add_argument("--limit_feature_sets", nargs="*", default=None, help="Limit to specific feature sets (e.g., Proposed Advanced)")
+    parser.add_argument(
+        "--limit_feature_sets",
+        nargs="*",
+        default=None,
+        help="Limit to specific feature sets (default: Advanced)",
+    )
     parser.add_argument("--mode", choices=["risk", "fs", "both"], default="both", help="Which evaluation blocks to run")
     parser.add_argument("--n_splits", type=int, default=50, help="Number of CV splits for feature-selection mode (default 50)")
     args = parser.parse_args()
@@ -761,7 +766,10 @@ def main() -> None:
     ext_raw = _read_external_dataframe(args.external_path, args.external_sheet)
 
     # Prepare feature-set filters for both sections
-    selected_featset_names: Optional[List[str]] = list(args.limit_feature_sets) if args.limit_feature_sets else None
+    # Default to only evaluating the Advanced feature set if not specified
+    selected_featset_names: Optional[List[str]] = (
+        list(args.limit_feature_sets) if args.limit_feature_sets else ["Advanced"]
+    )
 
     # Discover trained models (for risk-score mode)
     _progress("Discovering trained models and metadata...")
