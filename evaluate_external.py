@@ -120,6 +120,69 @@ def _derive_endpoints_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _augment_engineered_features_compat(df: pd.DataFrame) -> pd.DataFrame:
+    """Add engineered features to match SCMR.load_dataframes behavior.
+
+    - Age by decade from Age at CMR
+    - CrCl>45 from Cockcroft-Gault Creatinine Clearance (mL/min); if missing, try to compute
+    - NYHA>2 from NYHA Class
+    - Significant LGE from LGE Burden 5SD
+    """
+    out = df.copy()
+
+    # Age by decade
+    if "Age at CMR" in out.columns:
+        try:
+            out["Age by decade"] = (pd.to_numeric(out["Age at CMR"], errors="coerce") // 10).astype("Int64")
+        except Exception:
+            pass
+
+    # Cockcroft-Gault CrCl and CrCl>45
+    cg_col = "Cockcroft-Gault Creatinine Clearance (mL/min)"
+    if cg_col not in out.columns:
+        # Try to compute if source columns exist
+        needed = ["Age at CMR", "Weight (Kg)", "Female", "Serum creatinine (within 3 months of MRI)"]
+        if all(c in out.columns for c in needed):
+            try:
+                def _row_cg(row: pd.Series) -> float:
+                    try:
+                        return scmr.CG_equation(
+                            age=float(row["Age at CMR"]),
+                            weight=float(row["Weight (Kg)"]),
+                            female=int(pd.to_numeric(row["Female"], errors="coerce") or 0),
+                            serum_creatinine=float(row["Serum creatinine (within 3 months of MRI)"]),
+                        )
+                    except Exception:
+                        return np.nan
+
+                out[cg_col] = out.apply(_row_cg, axis=1)
+            except Exception:
+                # leave as missing
+                pass
+
+    if cg_col in out.columns:
+        try:
+            out["CrCl>45"] = (pd.to_numeric(out[cg_col], errors="coerce") > 45).astype(int)
+        except Exception:
+            pass
+
+    # NYHA>2
+    if "NYHA Class" in out.columns:
+        try:
+            out["NYHA>2"] = (pd.to_numeric(out["NYHA Class"], errors="coerce") > 2).astype(int)
+        except Exception:
+            pass
+
+    # Significant LGE
+    if "LGE Burden 5SD" in out.columns:
+        try:
+            out["Significant LGE"] = (pd.to_numeric(out["LGE Burden 5SD"], errors="coerce") > 2).astype(int)
+        except Exception:
+            pass
+
+    return out
+
+
 def _discover_models(models_root: str) -> List[Dict[str, Any]]:
     """Discover saved models and metadata under models_root structure created by SCMR.
 
@@ -374,6 +437,44 @@ def _plot_calibration_curve_3yr(
                 pass
 
     return calib_df
+
+
+def _run_feature_selection_cv(
+    ext_df: pd.DataFrame,
+    feature_set_names: Optional[List[str]],
+    n_splits: int,
+    export_dir: str,
+) -> Tuple[Dict[str, Dict[str, List[float]]], pd.DataFrame]:
+    """Run 50-split CV on the external dataset using SCMR's training pipeline.
+
+    Returns (raw_results, summary_table) and writes an Excel to export_dir.
+    """
+    # Select feature sets to use
+    all_fs: Dict[str, List[str]] = getattr(scmr, "FEATURE_SETS", {})
+    if not all_fs:
+        raise RuntimeError("SCMR.FEATURE_SETS not available.")
+    if feature_set_names:
+        fs_map = {k: v for k, v in all_fs.items() if k in set(feature_set_names)}
+    else:
+        fs_map = dict(all_fs)
+
+    os.makedirs(export_dir, exist_ok=True)
+    export_xlsx = os.path.join(export_dir, "feature_selection_summary.xlsx")
+
+    results, summary_table = scmr.run_cox_experiments(
+        df=ext_df,
+        feature_sets=fs_map,
+        N=int(n_splits),
+        time_col="PE_Time",
+        event_col="VT/VF/SCD",
+        export_excel_path=export_xlsx,
+    )
+    # Also save CSV
+    try:
+        summary_table.to_csv(os.path.join(export_dir, "feature_selection_summary.csv"))
+    except Exception:
+        pass
+    return results, summary_table
 
 def _generate_tableone_by_cohort(
     ref_df: pd.DataFrame,
@@ -632,12 +733,19 @@ def _evaluate_sex_specific(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate trained SCMR models on an external dataset (no retraining)")
+    parser = argparse.ArgumentParser(description="Evaluate on external dataset with two modes: risk-score (use trained SCMR weights) and feature-selection CV (retrain on external)")
     parser.add_argument("--external_path", required=True, help="Path to external dataset (CSV/XLSX)")
     parser.add_argument("--external_sheet", default=None, help="Sheet name for Excel (optional)")
     parser.add_argument("--results_dir", default=os.path.join(os.getcwd(), "results"), help="Results directory (default: ./results)")
     parser.add_argument("--models_dir", default=None, help="Models root directory (default: <results_dir>/heldout/models)")
-    parser.add_argument("--limit_feature_sets", nargs="*", default=None, help="Optional: limit to specific feature sets (e.g., Proposed Advanced)")
+    parser.add_argument(
+        "--limit_feature_sets",
+        nargs="*",
+        default=None,
+        help="Limit to specific feature sets (default: Advanced)",
+    )
+    parser.add_argument("--mode", choices=["risk", "fs", "both"], default="both", help="Which evaluation blocks to run")
+    parser.add_argument("--n_splits", type=int, default=50, help="Number of CV splits for feature-selection mode (default 50)")
     args = parser.parse_args()
 
     results_dir = args.results_dir
@@ -657,25 +765,49 @@ def main() -> None:
     _progress("Reading external dataset...")
     ext_raw = _read_external_dataframe(args.external_path, args.external_sheet)
 
+    # Prepare feature-set filters for both sections
+    # Default to only evaluating the Advanced feature set if not specified
+    selected_featset_names: Optional[List[str]] = (
+        list(args.limit_feature_sets) if args.limit_feature_sets else ["Advanced"]
+    )
+
+    # Discover trained models (for risk-score mode)
     _progress("Discovering trained models and metadata...")
     model_specs = _discover_models(models_root)
-    if args.limit_feature_sets:
-        keep = set(args.limit_feature_sets)
+    if selected_featset_names:
+        keep = set(selected_featset_names)
         model_specs = [m for m in model_specs if m.get("feature_set") in keep]
-    if not model_specs:
-        raise RuntimeError(f"No trained model artifacts found under: {models_root}")
 
-    # Build a union of all requested features across discovered models
+    # Build a union of all requested features across discovered models AND requested feature sets
     requested_features: List[str] = []
+    # From discovered models/meta
     for spec in model_specs:
         feats = list(spec.get("features") or [])
         if not feats:
-            # fallback to default feature sets mapping if meta missing
             try:
-                feats = list(scmr.FEATURE_SETS.get(spec["feature_set"], []))
+                feats = list(scmr.FEATURE_SETS.get(spec.get("feature_set", ""), []))
             except Exception:
                 feats = []
         requested_features.extend(feats)
+    # From selected FEATURE_SETS (ensures TableOne + FS have needed variables)
+    try:
+        feature_sets_all = getattr(scmr, "FEATURE_SETS", {})
+        if feature_sets_all:
+            names_iter = (
+                [n for n in feature_sets_all.keys() if (not selected_featset_names or n in set(selected_featset_names))]
+            )
+            for name in names_iter:
+                requested_features.extend(list(feature_sets_all.get(name, [])))
+    except Exception:
+        pass
+    # Add auxiliary raw columns used to derive engineered features
+    requested_features.extend([
+        "Cockcroft-Gault Creatinine Clearance (mL/min)",
+        "Weight (Kg)",
+        "Serum creatinine (within 3 months of MRI)",
+        "LGE Burden 5SD",
+        "Age at CMR",
+    ])
     # Deduplicate while preserving order
     requested_features = list(dict.fromkeys(requested_features))
 
@@ -688,6 +820,8 @@ def main() -> None:
 
     _progress("Preprocessing external dataset to align features/labels (before and after imputation)...")
     pre_ext_df, ext_df = _prepare_external_for_features(ext_raw, requested_features, labels)
+    # Add engineered features to match SCMR training
+    ext_df = _augment_engineered_features_compat(ext_df)
 
     # Report feature presence and missingness before imputation
     missing_report_rows: List[Dict[str, Any]] = []
@@ -719,9 +853,36 @@ def main() -> None:
     except Exception as e:
         warnings.warn(f"[Drift] Failed to compute SMD drift report: {e}")
 
-    # Evaluate each discovered model on the imputed external dataset
+    # Section 1: TableOne comparisons per feature set (SCMR vs External)
+    try:
+        fs_all = getattr(scmr, "FEATURE_SETS", {})
+        names_iter = (
+            [n for n in fs_all.keys() if (not selected_featset_names or n in set(selected_featset_names))]
+            if isinstance(fs_all, dict)
+            else []
+        )
+        for name in names_iter:
+            try:
+                _generate_tableone_by_cohort(
+                    ref_df,
+                    ext_df,
+                    variables=[c for c in list(fs_all.get(name, [])) if (c in ref_df.columns or c in ext_df.columns)],
+                    output_excel_path=os.path.join(out_tables, f"tableone_{name}_cohort.xlsx"),
+                )
+            except Exception as e:
+                warnings.warn(f"[TableOne] Failed for feature set {name}: {e}")
+    except Exception as e:
+        warnings.warn(f"[TableOne] Skipped global TableOne generation: {e}")
+
+    # Section 2: Risk-score mode (use trained SCMR weights/thresholds)
+    if args.mode in ("risk", "both"):
+        if not model_specs:
+            warnings.warn(f"[Risk] No trained model artifacts found under: {models_root}; skipping risk-score evaluation")
+        else:
+            _progress("Evaluating external dataset with SCMR-trained models (risk-score mode)...")
+            # Evaluate each discovered model on the imputed external dataset
     summary_rows: List[Dict[str, Any]] = []
-    for spec in model_specs:
+    for spec in (model_specs if args.mode in ("risk", "both") else []):
         featset = spec.get("feature_set")
         mode = spec.get("mode")
         feats = list(spec.get("features") or [])
@@ -754,8 +915,7 @@ def main() -> None:
         except Exception as e:
             warnings.warn(f"[{featset}][{mode}] Failed to load model pickle(s): {e}")
 
-        # Produce per-model TableOne comparing SCMR vs External for actually used features
-        # Do this BEFORE evaluation to diagnose potential drift impacting performance
+        # Additionally, per-model TableOne (features actually used by this model)
         try:
             _generate_tableone_by_cohort(
                 ref_df,
@@ -822,7 +982,7 @@ def main() -> None:
             continue
 
 
-    # Save summary metrics
+    # Save summary metrics for risk-score mode
     if summary_rows:
         summary = pd.DataFrame(summary_rows)
         try:
@@ -833,6 +993,20 @@ def main() -> None:
             summary.to_excel(os.path.join(out_metrics, "external_eval_summary.xlsx"), index=False)
         except Exception:
             pass
+
+    # Section 3: Feature selection mode (retrain on external with CV)
+    if args.mode in ("fs", "both"):
+        _progress("Running feature-selection CV (SCMR-style) on external dataset...")
+        fs_dir = os.path.join(out_root, "feature_selection")
+        try:
+            _run_feature_selection_cv(
+                ext_df=ext_df,
+                feature_set_names=selected_featset_names,
+                n_splits=int(args.n_splits),
+                export_dir=fs_dir,
+            )
+        except Exception as e:
+            warnings.warn(f"[FS CV] Failed: {e}")
 
     _progress("Done. Outputs saved under results/external_eval/")
 
