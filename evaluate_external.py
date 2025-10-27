@@ -665,6 +665,18 @@ def main() -> None:
         except Exception as e:
             warnings.warn(f"[{featset}][{mode}] Failed to load model pickle(s): {e}")
 
+        # Produce per-model TableOne comparing SCMR vs External for actually used features
+        # Do this BEFORE evaluation to diagnose potential drift impacting performance
+        try:
+            _generate_tableone_by_cohort(
+                ref_df,
+                ext_df,
+                variables=[c for c in feats if c in ref_df.columns or c in ext_df.columns],
+                output_excel_path=os.path.join(out_tables, f"tableone_{featset}_{mode}_cohort.xlsx"),
+            )
+        except Exception as e:
+            warnings.warn(f"[TableOne] Failed for {featset} {mode}: {e}")
+
         # Evaluate
         pred_csv_name = f"{featset}_{mode}_external_preds.csv"
         fig_path = os.path.join(out_figs, f"{featset}_{mode}_km_by_gender.png")
@@ -698,16 +710,6 @@ def main() -> None:
             warnings.warn(f"[{featset}][{mode}] Skipped: model objects not available")
             continue
 
-        # Produce per-model TableOne comparing SCMR vs External for actually used features
-        try:
-            _generate_tableone_by_cohort(
-                ref_df,
-                ext_df,
-                variables=[c for c in feats if c in ref_df.columns or c in ext_df.columns],
-                output_excel_path=os.path.join(out_tables, f"tableone_{featset}_{mode}_cohort.xlsx"),
-            )
-        except Exception as e:
-            warnings.warn(f"[TableOne] Failed for {featset} {mode}: {e}")
 
     # Save summary metrics
     if summary_rows:
