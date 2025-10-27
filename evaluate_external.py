@@ -439,41 +439,185 @@ def _plot_calibration_curve_3yr(
     return calib_df
 
 
-def _run_feature_selection_cv(
+def _run_fixed_features_cv(
     ext_df: pd.DataFrame,
-    feature_set_names: Optional[List[str]],
+    model_specs: List[Dict[str, Any]],
     n_splits: int,
     export_dir: str,
 ) -> Tuple[Dict[str, Dict[str, List[float]]], pd.DataFrame]:
-    """Run 50-split CV on the external dataset using SCMR's training pipeline.
+    """Run CV on the external dataset using fixed features from SCMR models.
 
-    Returns (raw_results, summary_table) and writes an Excel to export_dir.
+    - No feature selection within splits
+    - Uses features stored in SCMR-heldout meta.json for each discovered model
+    - Retrains weights only on each split
+    Returns (raw_results, summary_table) and writes an Excel/CSV to export_dir.
     """
-    # Select feature sets to use
-    all_fs: Dict[str, List[str]] = getattr(scmr, "FEATURE_SETS", {})
-    if not all_fs:
-        raise RuntimeError("SCMR.FEATURE_SETS not available.")
-    if feature_set_names:
-        fs_map = {k: v for k, v in all_fs.items() if k in set(feature_set_names)}
-    else:
-        fs_map = dict(all_fs)
+    if not model_specs:
+        raise RuntimeError("No discovered SCMR model specs; cannot run fixed-features CV.")
 
     os.makedirs(export_dir, exist_ok=True)
-    export_xlsx = os.path.join(export_dir, "feature_selection_summary.xlsx")
+    export_xlsx = os.path.join(export_dir, "fixed_features_cv_summary.xlsx")
 
-    results, summary_table = scmr.run_cox_experiments(
-        df=ext_df,
-        feature_sets=fs_map,
-        N=int(n_splits),
-        time_col="PE_Time",
-        event_col="VT/VF/SCD",
-        export_excel_path=export_xlsx,
+    # Prepare results container: keys mirror SCMR summary style
+    metrics_keys = ["c_index_all", "c_index_male", "c_index_female"]
+    results: Dict[str, Dict[str, List[float]]] = {}
+
+    # Helper to compute safe c-index like SCMR.run_cox_experiments
+    def _safe_cidx(t: np.ndarray, e: np.ndarray, r: np.ndarray) -> float:
+        try:
+            if t.size < 2:
+                return float("nan")
+            if np.all(~np.isfinite(r)) or np.allclose(r, r[0], equal_nan=True):
+                return float("nan")
+            return float(concordance_index(t, -r, e))
+        except Exception:
+            return float("nan")
+
+    # Group model specs by (feature_set, mode) and iterate
+    for spec in model_specs:
+        featset = spec.get("feature_set", "")
+        mode = spec.get("mode", "")
+        feats = list(spec.get("features") or [])
+        if not feats:
+            try:
+                feats = list(getattr(scmr, "FEATURE_SETS", {}).get(featset, []))
+            except Exception:
+                feats = []
+        # Build display key for results consistent with SCMR naming
+        if mode == "sex_agnostic":
+            name = f"{featset} - Sex-agnostic (Cox, undersampled)"
+        elif mode == "sex_specific":
+            name = f"{featset} - Sex-specific Shared (Cox)"
+        else:
+            name = f"{featset} - {mode}"
+
+        results[name] = {m: [] for m in metrics_keys}
+
+        # Run splits
+        for seed in range(int(n_splits)):
+            base_df = ext_df.dropna(subset=["PE_Time", "VT/VF/SCD"]).copy()
+            if base_df.empty:
+                # No labels available; cannot evaluate
+                for m in metrics_keys:
+                    results[name][m].append(float("nan"))
+                continue
+            try:
+                tr, te = scmr.stratified_train_test_split_by_columns(
+                    base_df,
+                    cols=["Female", "VT/VF/SCD", "ICD"],
+                    test_size=0.3,
+                    random_state=seed,
+                )
+            except Exception:
+                # Fallback to sklearn split exposed via SCMR
+                tr, te = scmr.train_test_split(
+                    base_df,
+                    test_size=0.3,
+                    random_state=seed,
+                    stratify=base_df["VT/VF/SCD"],
+                )
+
+            # Evaluate with fixed features and no within-split selection
+            if mode == "sex_agnostic":
+                _, risk, met = scmr.evaluate_split(
+                    train_df=tr,
+                    test_df=te,
+                    feature_cols=feats,
+                    time_col="PE_Time",
+                    event_col="VT/VF/SCD",
+                    mode="sex_agnostic",
+                    seed=seed,
+                    use_undersampling=True,
+                    disable_within_split_feature_selection=True,
+                )
+            elif mode == "sex_specific":
+                overrides = {"male": list(feats), "female": list(feats)}
+                _, risk, met = scmr.evaluate_split(
+                    train_df=tr,
+                    test_df=te,
+                    feature_cols=feats,
+                    time_col="PE_Time",
+                    event_col="VT/VF/SCD",
+                    mode="sex_specific",
+                    seed=seed,
+                    use_undersampling=False,
+                    disable_within_split_feature_selection=True,
+                    sex_specific_feature_override=overrides,
+                )
+            else:
+                # Unknown mode in spec; skip
+                for m in metrics_keys:
+                    results[name][m].append(float("nan"))
+                continue
+
+            # Overall c-index from evaluate_split
+            cidx_all = float(met.get("c_index", float("nan")))
+
+            # Sex-specific c-index on risk vector
+            try:
+                mask_m = te["Female"].values == 0
+                mask_f = te["Female"].values == 1
+                risk_arr = np.asarray(risk)
+                cidx_m = _safe_cidx(
+                    te.loc[mask_m, "PE_Time"].values,
+                    te.loc[mask_m, "VT/VF/SCD"].values,
+                    risk_arr[mask_m],
+                )
+                cidx_f = _safe_cidx(
+                    te.loc[mask_f, "PE_Time"].values,
+                    te.loc[mask_f, "VT/VF/SCD"].values,
+                    risk_arr[mask_f],
+                )
+            except Exception:
+                cidx_m, cidx_f = float("nan"), float("nan")
+
+            results[name]["c_index_all"].append(cidx_all)
+            results[name]["c_index_male"].append(cidx_m)
+            results[name]["c_index_female"].append(cidx_f)
+
+    # Summarize like SCMR.run_cox_experiments
+    summary = {}
+    for model_name, mvals in results.items():
+        summary[model_name] = {}
+        for metric, values in mvals.items():
+            arr = np.array(values, dtype=float)
+            mu = np.nanmean(arr)
+            se = np.nanstd(arr, ddof=1) / max(1, np.sqrt(np.sum(~np.isnan(arr))))
+            ci = 1.96 * se
+            summary[model_name][metric] = (mu, mu - ci, mu + ci)
+
+    summary_df = pd.concat(
+        {
+            model: pd.DataFrame.from_dict(
+                mvals, orient="index", columns=["mean", "ci_lower", "ci_upper"]
+            )
+            for model, mvals in summary.items()
+        },
+        axis=0,
     )
-    # Also save CSV
+
+    formatted = summary_df.apply(
+        lambda row: f"{row['mean']:.3f} ({row['ci_lower']:.3f}, {row['ci_upper']:.3f})",
+        axis=1,
+    )
+    summary_table = formatted.unstack(level=1)
+    summary_table = summary_table.rename(
+        columns={
+            "c_index_all": "all",
+            "c_index_male": "male",
+            "c_index_female": "female",
+        }
+    )
+
     try:
-        summary_table.to_csv(os.path.join(export_dir, "feature_selection_summary.csv"))
+        summary_table.to_csv(os.path.join(export_dir, "fixed_features_cv_summary.csv"))
     except Exception:
         pass
+    try:
+        summary_table.to_excel(export_xlsx, index=True, index_label="RowName")
+    except Exception:
+        pass
+
     return results, summary_table
 
 def _generate_tableone_by_cohort(
@@ -733,7 +877,7 @@ def _evaluate_sex_specific(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate on external dataset with two modes: risk-score (use trained SCMR weights) and feature-selection CV (retrain on external)")
+    parser = argparse.ArgumentParser(description="Evaluate on external dataset: risk-score (use trained SCMR weights) and fixed-features CV (retrain weights only, no selection)")
     parser.add_argument("--external_path", required=True, help="Path to external dataset (CSV/XLSX)")
     parser.add_argument("--external_sheet", default=None, help="Sheet name for Excel (optional)")
     parser.add_argument("--results_dir", default=os.path.join(os.getcwd(), "results"), help="Results directory (default: ./results)")
@@ -744,7 +888,7 @@ def main() -> None:
         default=None,
         help="Limit to specific feature sets (default: Advanced)",
     )
-    parser.add_argument("--mode", choices=["risk", "fs", "both"], default="both", help="Which evaluation blocks to run")
+    parser.add_argument("--mode", choices=["risk", "fs", "both"], default="both", help="Which evaluation blocks to run (fs uses SCMR-selected features without re-selection)")
     parser.add_argument("--n_splits", type=int, default=50, help="Number of CV splits for feature-selection mode (default 50)")
     args = parser.parse_args()
 
@@ -994,19 +1138,20 @@ def main() -> None:
         except Exception:
             pass
 
-    # Section 3: Feature selection mode (retrain on external with CV)
+    # Section 3: Fixed-features CV (retrain weights only using SCMR-selected features)
     if args.mode in ("fs", "both"):
-        _progress("Running feature-selection CV (SCMR-style) on external dataset...")
+        _progress("Running fixed-features CV (no feature selection; retrain weights) on external dataset...")
         fs_dir = os.path.join(out_root, "feature_selection")
         try:
-            _run_feature_selection_cv(
+            # Use discovered model specs filtered by selected feature sets
+            _run_fixed_features_cv(
                 ext_df=ext_df,
-                feature_set_names=selected_featset_names,
+                model_specs=model_specs,
                 n_splits=int(args.n_splits),
                 export_dir=fs_dir,
             )
         except Exception as e:
-            warnings.warn(f"[FS CV] Failed: {e}")
+            warnings.warn(f"[Fixed-Features CV] Failed: {e}")
 
     _progress("Done. Outputs saved under results/external_eval/")
 
