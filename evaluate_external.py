@@ -51,70 +51,213 @@ def _read_external_dataframe(path: str, sheet: Optional[str] = None) -> pd.DataF
     return df
 
 
+def _filter_rows_strict_binary(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only rows where Female, ICD, VT/VF/SCD are strictly {0,1}.
+
+    - Uses robust coercion for Female (male/female tokens) and yes/no for ICD/VT/VF/SCD
+    - Drops rows with missing or other values
+    - If a column is absent, it's ignored for filtering
+    """
+    if df.empty:
+        return df
+
+    out = df.copy()
+
+    # Build simplified-name mapping for robust column resolution
+    try:
+        simp_to_orig = {scmr._simplify_name(c): c for c in out.columns}
+    except Exception:
+        def _fallback_simplify(x: Any) -> str:
+            s = str(x) if not isinstance(x, str) else x
+            s = s.strip().lower()
+            return re.sub(r"[^a-z0-9]+", " ", s).strip()
+        simp_to_orig = {_fallback_simplify(c): c for c in out.columns}
+
+    def _resolve(keys: List[str]) -> Optional[str]:
+        for k in keys:
+            if k in simp_to_orig:
+                return simp_to_orig[k]
+        return None
+
+    female_col = _resolve(["female"])
+    icd_col = _resolve(["icd"])  # should match exactly
+    evt_col = _resolve(["vt vf scd", "vtvfscd"]) or ("VT/VF/SCD" if "VT/VF/SCD" in out.columns else None)
+
+    masks: List[pd.Series] = []
+    # Female
+    if female_col is not None:
+        try:
+            series = out[female_col]
+            if series.dtype == "object":
+                series = scmr._coerce_female_binary(series)
+            series = pd.to_numeric(series, errors="coerce")
+            out[female_col] = series
+            masks.append(series.isin([0, 1]))
+        except Exception:
+            pass
+    # ICD
+    if icd_col is not None:
+        try:
+            series = out[icd_col]
+            if series.dtype == "object":
+                series = scmr._coerce_yes_no_to_binary(series)
+            series = pd.to_numeric(series, errors="coerce")
+            out[icd_col] = series
+            masks.append(series.isin([0, 1]))
+        except Exception:
+            pass
+    # VT/VF/SCD
+    if evt_col is not None:
+        try:
+            series = out[evt_col]
+            if series.dtype == "object":
+                series = scmr._coerce_yes_no_to_binary(series)
+            series = pd.to_numeric(series, errors="coerce")
+            out[evt_col] = series
+            masks.append(series.isin([0, 1]))
+        except Exception:
+            pass
+
+    if masks:
+        keep = masks[0]
+        for m in masks[1:]:
+            keep = keep & m
+        out = out[keep].reset_index(drop=True)
+    return out
+
 def _derive_endpoints_if_needed(df: pd.DataFrame) -> pd.DataFrame:
-    """Derive PE_Time if missing but date columns exist, following SCMR logic."""
+    """Derive PE_Time when possible using robust date parsing and column matching.
+
+    This version explicitly supports external date strings such as
+    '7/30/2011  12:00:00 AM' for both VT/VF/SCD and MRI dates and avoids
+    negative durations by returning NaN if an event/follow-up date precedes MRI.
+    """
     df = df.copy()
     if "PE_Time" in df.columns:
         return df
 
-    # Try to locate likely date columns via simplified names
-    def _simplify(name: Any) -> str:
-        s = str(name) if not isinstance(name, str) else name
-        s = s.strip().lower()
-        s = re.sub(r"\s+", " ", s)
-        return s
+    # Build simplified-name mapping using SCMR's robust simplifier
+    try:
+        simp_to_orig = {scmr._simplify_name(c): c for c in df.columns}
+    except Exception:
+        def _fallback_simplify(x: Any) -> str:
+            s = str(x) if not isinstance(x, str) else x
+            s = s.strip().lower()
+            return re.sub(r"[^a-z0-9]+", " ", s).strip()
+        simp_to_orig = {_fallback_simplify(c): c for c in df.columns}
 
-    cols = {_simplify(c): c for c in df.columns}
-    mri_col = cols.get("mri date") or cols.get("date of mri") or cols.get("mri_date")
-    event_date_col = cols.get("date vt/vf/scd") or cols.get("vt/vf/scd date")
-    end_fu_col = cols.get("end follow-up date") or cols.get("end of follow-up") or cols.get("follow-up end date")
+    # Helper: parse datetime robustly from mixed string formats
+    def _parse_dt_series(s: pd.Series) -> pd.Series:
+        try:
+            s2 = s.astype(str).str.strip()
+            # Collapse multiple spaces between date and time
+            s2 = s2.str.replace(r"\s+", " ", regex=True)
+            return pd.to_datetime(
+                s2,
+                errors="coerce",
+                dayfirst=False,  # external format is month/day
+                infer_datetime_format=True,
+                utc=False,
+            )
+        except Exception:
+            return pd.to_datetime(s, errors="coerce")
+
+    # Resolve MRI date column
+    mri_col = None
+    for key in [
+        "mri date",
+        "date of mri",
+        "mri_date",
+        "mri",
+        "mri datetime",
+    ]:
+        if key in simp_to_orig:
+            mri_col = simp_to_orig[key]
+            break
+
+    # Resolve event date column (support variants like 'VTVFSCD Date')
+    event_date_col = None
+    # Direct keys first
+    for key in [
+        "vt vf scd date",
+        "date vt vf scd",
+        "vtvfscd date",
+        "date vtvfscd",
+        "vt vfs cd date",
+        "vtvfs cd date",
+    ]:
+        if key in simp_to_orig:
+            event_date_col = simp_to_orig[key]
+            break
+    # Heuristic: any column whose simplified name contains 'date' and the tokens vt,vf,scd
+    if event_date_col is None:
+        for simp, orig in simp_to_orig.items():
+            if "date" in simp and ("vtvfscd" in simp or ("vt" in simp and "vf" in simp and "scd" in simp)):
+                event_date_col = orig
+                break
+
+    # Resolve end-of-followup date
+    end_fu_col = None
+    for key in [
+        "end follow up date",
+        "end follow-up date",
+        "follow up end date",
+        "end of follow up",
+        "follow-up end date",
+        "last follow up date",
+        "last follow-up date",
+    ]:
+        if key in simp_to_orig:
+            end_fu_col = simp_to_orig[key]
+            break
 
     if mri_col is None or (event_date_col is None and end_fu_col is None):
-        # Cannot derive
         return df
 
+    # Parse dates
     try:
-        df[mri_col] = pd.to_datetime(df[mri_col])
+        df[mri_col] = _parse_dt_series(df[mri_col])
     except Exception:
         return df
-
     if event_date_col and event_date_col in df.columns:
-        df[event_date_col] = pd.to_datetime(df[event_date_col], errors="coerce")
+        df[event_date_col] = _parse_dt_series(df[event_date_col])
     if end_fu_col and end_fu_col in df.columns:
-        df[end_fu_col] = pd.to_datetime(df[end_fu_col], errors="coerce")
+        df[end_fu_col] = _parse_dt_series(df[end_fu_col])
 
-    # Need event indicator to decide which date to use; if not present, try to coerce from strings
+    # Event indicator
     evt_col = "VT/VF/SCD" if "VT/VF/SCD" in df.columns else None
     if evt_col is None:
-        # Attempt to create from yes/no-like column names
+        # Try to infer from common labels
         for candidate in df.columns:
-            key = _simplify(candidate)
-            if key in {"vt/vf/scd", "event", "primary endpoint", "pe"}:
+            simp = scmr._simplify_name(candidate) if isinstance(candidate, str) else ""
+            if simp in {"vt vf scd", "event", "primary endpoint", "pe"}:
                 evt_col = candidate
                 break
     if evt_col is not None and df[evt_col].dtype == "object":
-        # Use SCMR binary coercion
         try:
             df[evt_col] = scmr._coerce_yes_no_to_binary(df[evt_col])
         except Exception:
             df[evt_col] = pd.to_numeric(df[evt_col], errors="coerce")
 
-    # Compute PE_Time following SCMR.load_dataframes
+    # Compute PE_Time with negative-day guard
     try:
-        df["PE_Time"] = df.apply(
-            lambda row: (
-                (row[event_date_col] - row[mri_col]).days
-                if (evt_col and pd.to_numeric(row.get(evt_col, np.nan), errors="coerce") == 1)
-                and pd.notna(row.get(event_date_col))
-                and pd.notna(row.get(mri_col))
-                else (
-                    (row[end_fu_col] - row[mri_col]).days
-                    if pd.notna(row.get(end_fu_col)) and pd.notna(row.get(mri_col))
-                    else np.nan
-                )
-            ),
-            axis=1,
-        )
+        def _compute_days(row: pd.Series) -> Any:
+            try:
+                mri = row.get(mri_col)
+                evt = row.get(event_date_col) if event_date_col else pd.NaT
+                endfu = row.get(end_fu_col) if end_fu_col else pd.NaT
+                pe_flag = pd.to_numeric(row.get(evt_col, np.nan), errors="coerce")
+                if pd.notna(pe_flag) and int(pe_flag) == 1 and pd.notna(evt) and pd.notna(mri):
+                    days = (evt - mri).days
+                    return days if days >= 0 else np.nan
+                if pd.notna(endfu) and pd.notna(mri):
+                    days = (endfu - mri).days
+                    return days if days >= 0 else np.nan
+                return np.nan
+            except Exception:
+                return np.nan
+
+        df["PE_Time"] = df.apply(_compute_days, axis=1)
     except Exception:
         pass
     return df
@@ -908,6 +1051,11 @@ def main() -> None:
 
     _progress("Reading external dataset...")
     ext_raw = _read_external_dataframe(args.external_path, args.external_sheet)
+    # Strictly filter rows where Female/ICD/VT/VF/SCD are not {0,1}
+    before_n = len(ext_raw)
+    ext_raw = _filter_rows_strict_binary(ext_raw)
+    after_n = len(ext_raw)
+    _progress(f"Filtered non-binary rows in Female/ICD/VT/VF/SCD: kept {after_n}/{before_n}")
 
     # Prepare feature-set filters for both sections
     # Default to only evaluating the Advanced feature set if not specified
