@@ -286,6 +286,95 @@ def _plot_km_by_gender(df_with_preds: pd.DataFrame, save_path: Optional[str] = N
                 pass
 
 
+def _plot_calibration_curve_3yr(
+    df_with_preds: pd.DataFrame,
+    save_path: Optional[str] = None,
+    bins: int = 10,
+) -> Optional[pd.DataFrame]:
+    """Plot 3-year calibration curve using KM-based observed risk per bin.
+
+    Returns a dataframe with per-bin calibration if computed; None otherwise.
+    """
+    needed = {"pred_prob", "PE_Time", "PE"}
+    if df_with_preds.empty or not needed.issubset(df_with_preds.columns):
+        return None
+
+    df = df_with_preds.dropna(subset=["pred_prob", "PE_Time", "PE"]).copy()
+    if df.empty:
+        return None
+
+    # Create quantile bins on predicted risk
+    try:
+        df["calib_bin"], bin_edges = pd.qcut(
+            df["pred_prob"], q=bins, labels=False, retbins=True, duplicates="drop"
+        )
+    except Exception:
+        # Fallback to equal-width bins when qcut fails
+        try:
+            df["calib_bin"] = pd.cut(df["pred_prob"], bins=bins, labels=False, include_lowest=True)
+            bin_edges = None
+        except Exception:
+            return None
+
+    rows: List[Dict[str, Any]] = []
+    horizon_days = getattr(scmr, "HORIZON_DAYS", 3 * 365)
+
+    # Compute observed risk via KM at 3 years per bin
+    for bin_id, grp in df.groupby("calib_bin"):
+        if grp.empty:
+            continue
+        kmf = KaplanMeierFitter()
+        try:
+            kmf.fit(durations=grp["PE_Time"], event_observed=grp["PE"])
+            s_at_h = float(kmf.predict(horizon_days))
+            obs_risk = max(0.0, min(1.0, 1.0 - s_at_h))
+        except Exception:
+            obs_risk = float("nan")
+        rows.append(
+            {
+                "bin": int(bin_id) if pd.notna(bin_id) else -1,
+                "n": int(len(grp)),
+                "pred_mean": float(np.nanmean(grp["pred_prob"].values)),
+                "obs_risk": obs_risk,
+            }
+        )
+
+    if not rows:
+        return None
+
+    calib_df = pd.DataFrame(rows).sort_values("pred_mean").reset_index(drop=True)
+
+    # Plot
+    fig = None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Ideal")
+        ax.plot(calib_df["pred_mean"], calib_df["obs_risk"], marker="o", color="steelblue", label="Observed")
+        ax.set_xlabel("Predicted 3-year risk")
+        ax.set_ylabel("Observed 3-year risk (KM)")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.grid(alpha=0.3)
+        ax.legend(loc="best")
+        plt.tight_layout()
+        if save_path:
+            _ensure_dir(os.path.dirname(save_path))
+            plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.close()
+    except Exception:
+        if fig is not None:
+            try:
+                import matplotlib.pyplot as plt  # type: ignore
+                plt.close()
+            except Exception:
+                pass
+
+    return calib_df
+
 def _generate_tableone_by_cohort(
     ref_df: pd.DataFrame,
     ext_df: pd.DataFrame,
@@ -684,6 +773,17 @@ def main() -> None:
             m_thr = spec.get("threshold")
             merged, metrics = _evaluate_sex_agnostic(model_obj, feats, m_thr, ext_df)
             _plot_km_by_gender(merged, fig_path)
+            # 3-year calibration curve
+            calib_path = os.path.join(out_figs, f"{featset}_{mode}_calibration_3yr.png")
+            calib_df = _plot_calibration_curve_3yr(merged, calib_path, bins=10)
+            if calib_df is not None:
+                try:
+                    calib_df.to_csv(
+                        os.path.join(out_metrics, f"{featset}_{mode}_calibration_3yr.csv"),
+                        index=False,
+                    )
+                except Exception:
+                    pass
             try:
                 merged.to_csv(os.path.join(out_preds, pred_csv_name), index=False)
             except Exception:
@@ -697,6 +797,17 @@ def main() -> None:
             thresholds = dict(spec.get("thresholds", {}))
             merged, metrics = _evaluate_sex_specific(male_model, female_model, feats, thresholds, ext_df)
             _plot_km_by_gender(merged, fig_path)
+            # 3-year calibration curve
+            calib_path = os.path.join(out_figs, f"{featset}_{mode}_calibration_3yr.png")
+            calib_df = _plot_calibration_curve_3yr(merged, calib_path, bins=10)
+            if calib_df is not None:
+                try:
+                    calib_df.to_csv(
+                        os.path.join(out_metrics, f"{featset}_{mode}_calibration_3yr.csv"),
+                        index=False,
+                    )
+                except Exception:
+                    pass
             try:
                 merged.to_csv(os.path.join(out_preds, pred_csv_name), index=False)
             except Exception:
