@@ -775,6 +775,12 @@ def _generate_tableone_by_cohort(
     """
     # Keep only columns that exist in at least one dataset to avoid errors
     vars_present = [c for c in variables if (c in ref_df.columns) or (c in ext_df.columns)]
+    # Always include PE_Time in TableOne if available in either dataset
+    try:
+        if ("PE_Time" in ref_df.columns or "PE_Time" in ext_df.columns) and ("PE_Time" not in vars_present):
+            vars_present.append("PE_Time")
+    except Exception:
+        pass
     ref = ref_df.copy()
     ext = ext_df.copy()
     ref["Cohort"] = "SCMR"
