@@ -19,6 +19,7 @@ from sklearn.metrics import accuracy_score, f1_score, classification_report
 from sklearn.exceptions import ConvergenceWarning
 
 from sksurv.linear_model import CoxPHSurvivalAnalysis
+from sksurv.ensemble import RandomSurvivalForest
 from sksurv.metrics import concordance_index_censored
 from sksurv.util import Surv
 from sksurv.nonparametric import kaplan_meier_estimator
@@ -1414,3 +1415,327 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# ===================== RSF experiments (mirror cox.py) =====================
+
+def create_undersampled_dataset(train_df: pd.DataFrame, label_col: str, random_state: int) -> pd.DataFrame:
+    sampled_parts = []
+    for sex_val in (0, 1):
+        grp = train_df[train_df["Female"] == sex_val]
+        if grp.empty:
+            continue
+        pos = grp[grp[label_col] == 1]
+        neg = grp[grp[label_col] == 0]
+        P, N = len(pos), len(neg)
+        if P == 0 or N == 0:
+            sampled_parts.append(grp.copy())
+            continue
+        target_pos = min(P, N)
+        target_neg = min(N, P)
+        samp_pos = pos.sample(n=target_pos, replace=False, random_state=random_state)
+        samp_neg = neg.sample(n=target_neg, replace=False, random_state=random_state)
+        sampled_parts.append(pd.concat([samp_pos, samp_neg], axis=0))
+    if len(sampled_parts) == 0:
+        return train_df.copy()
+    return (
+        pd.concat(sampled_parts, axis=0)
+        .sample(frac=1.0, random_state=random_state)
+        .reset_index(drop=True)
+    )
+
+
+def _prepare_X_for_model(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
+    X = df.copy()
+    # keep only requested features that exist
+    cols = [c for c in feature_cols if c in X.columns]
+    X = X[cols].copy()
+    # coerce to numeric and fill NaNs with medians
+    for c in X.columns:
+        if not pd.api.types.is_numeric_dtype(X[c]):
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+        if X[c].isnull().any():
+            med = X[c].median()
+            if not np.isfinite(med):
+                med = 0.0
+            X[c] = X[c].fillna(med)
+    # drop all-NaN columns defensively
+    all_nan = X.columns[X.isnull().all()].tolist()
+    if all_nan:
+        X = X.drop(columns=all_nan)
+    # final cast
+    try:
+        X = X.astype(float)
+    except Exception:
+        for c in X.columns:
+            try:
+                X[c] = X[c].astype(float)
+            except Exception:
+                X[c] = pd.to_numeric(X[c], errors="coerce").astype(float).fillna(0.0)
+    return X
+
+
+def fit_rsf_model(train_df: pd.DataFrame, feature_cols: List[str], time_col: str, event_col: str, random_state: int = 0) -> RandomSurvivalForest:
+    df_local = train_df.dropna(subset=[time_col, event_col]).copy()
+    if df_local.empty:
+        raise ValueError("Empty training data for RSF.")
+    X = _prepare_X_for_model(df_local, feature_cols)
+    if X.shape[1] == 0:
+        raise ValueError("No usable features for RSF model.")
+    y = Surv.from_dataframe(event=event_col, time=time_col, data=df_local)
+    rsf = RandomSurvivalForest(
+        n_estimators=500,
+        min_samples_split=10,
+        min_samples_leaf=5,
+        max_features="sqrt",
+        n_jobs=-1,
+        random_state=random_state,
+    )
+    rsf.fit(X, y)
+    # remember feature names
+    try:
+        rsf.feature_names_in_ = np.array(X.columns.tolist())
+    except Exception:
+        pass
+    return rsf
+
+
+def predict_risk_rsf(model: RandomSurvivalForest, df: pd.DataFrame, feature_cols: List[str]) -> np.ndarray:
+    if df is None or len(df) == 0:
+        return np.zeros(0, dtype=float)
+    # align columns to training features if available
+    names = list(getattr(model, "feature_names_in_", []))
+    X = _prepare_X_for_model(df, feature_cols)
+    if names:
+        for c in names:
+            if c not in X.columns:
+                X[c] = 0.0
+        try:
+            X = X.loc[:, names]
+        except Exception:
+            X = X[[c for c in names if c in X.columns]]
+    try:
+        risk = np.asarray(model.predict(X), dtype=float).reshape(-1)
+        finite = np.isfinite(risk)
+        if not finite.any():
+            return np.zeros(len(X), dtype=float)
+        # normalize if constant
+        if np.allclose(risk[finite], risk[finite][0]):
+            return np.zeros(len(X), dtype=float)
+        return risk
+    except Exception:
+        return np.zeros(len(X), dtype=float)
+
+
+def threshold_by_top_quantile(risk_scores: np.ndarray, quantile: float = 0.5) -> float:
+    q = np.nanquantile(risk_scores, quantile)
+    return float(q)
+
+
+def evaluate_split_rsf(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_cols: List[str],
+    time_col: str,
+    event_col: str,
+    mode: str,
+    seed: int,
+    use_undersampling: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+    if mode == "sex_agnostic":
+        used_features = feature_cols
+        tr = create_undersampled_dataset(train_df, event_col, seed) if use_undersampling else train_df
+        model = fit_rsf_model(tr, used_features, time_col, event_col, random_state=seed)
+        risk_scores = predict_risk_rsf(model, test_df, used_features)
+        thr = threshold_by_top_quantile(risk_scores, 0.5)
+        pred = (risk_scores >= thr).astype(int)
+        cidx = concordance_index(test_df[time_col], -risk_scores, test_df[event_col])
+        return pred, risk_scores, {"c_index": cidx}
+
+    if mode == "sex_specific":
+        used_features = [f for f in feature_cols if f != "Female"]
+        pred = np.zeros(len(test_df), dtype=int)
+        risk_scores = np.zeros(len(test_df), dtype=float)
+        # male branch
+        tr_m = train_df[train_df["Female"] == 0]
+        te_m = test_df[test_df["Female"] == 0]
+        if not tr_m.empty and not te_m.empty:
+            m_m = fit_rsf_model(tr_m, used_features, time_col, event_col, random_state=seed)
+            r_m = predict_risk_rsf(m_m, te_m, used_features)
+            thr_m = threshold_by_top_quantile(r_m, 0.5)
+            pred_m = (r_m >= thr_m).astype(int)
+            mask_m = test_df["Female"].values == 0
+            pred[mask_m] = pred_m
+            risk_scores[mask_m] = r_m
+        # female branch
+        tr_f = train_df[train_df["Female"] == 1]
+        te_f = test_df[test_df["Female"] == 1]
+        if not tr_f.empty and not te_f.empty:
+            m_f = fit_rsf_model(tr_f, used_features, time_col, event_col, random_state=seed)
+            r_f = predict_risk_rsf(m_f, te_f, used_features)
+            thr_f = threshold_by_top_quantile(r_f, 0.5)
+            pred_f = (r_f >= thr_f).astype(int)
+            mask_f = test_df["Female"].values == 1
+            pred[mask_f] = pred_f
+            risk_scores[mask_f] = r_f
+        cidx = concordance_index(test_df[time_col], -risk_scores, test_df[event_col])
+        return pred, risk_scores, {"c_index": cidx}
+
+    raise ValueError(f"Unknown mode: {mode}")
+
+
+def run_rsf_experiments(
+    df: pd.DataFrame,
+    feature_sets: Dict[str, List[str]],
+    N: int = 50,
+    time_col: str = "PE_Time",
+    event_col: str = "VT/VF/SCD",
+    export_excel_path: Optional[str] = None,
+) -> Tuple[Dict[str, Dict[str, List[float]]], pd.DataFrame]:
+    model_configs = [
+        {"name": "Sex-agnostic (RSF, undersampled)", "mode": "sex_agnostic"},
+        {"name": "Sex-specific (RSF)", "mode": "sex_specific"},
+    ]
+    metrics = ["c_index_all", "c_index_male", "c_index_female"]
+    results: Dict[str, Dict[str, List[float]]] = {}
+    for featset_name in feature_sets:
+        for cfg in model_configs:
+            results[f"{featset_name} - {cfg['name']}"] = {m: [] for m in metrics}
+
+    for seed in range(N):
+        tr, te = train_test_split(df, test_size=0.3, random_state=seed, stratify=df[event_col])
+        tr = tr.dropna(subset=[time_col, event_col])
+        te = te.dropna(subset=[time_col, event_col])
+        for featset_name, feature_cols in feature_sets.items():
+            for cfg in model_configs:
+                name = f"{featset_name} - {cfg['name']}"
+                use_undersampling = cfg["mode"] == "sex_agnostic"
+                _, risk, met = evaluate_split_rsf(
+                    tr,
+                    te,
+                    feature_cols,
+                    time_col,
+                    event_col,
+                    mode=cfg["mode"],
+                    seed=seed,
+                    use_undersampling=use_undersampling,
+                )
+                cidx_all = met.get("c_index", np.nan)
+                try:
+                    mask_m = te["Female"].values == 0
+                    mask_f = te["Female"].values == 1
+                    def _safe_cidx(t, e, r):
+                        try:
+                            if len(t) < 2:
+                                return np.nan
+                            if np.all(~np.isfinite(r)) or np.allclose(r, r[0]):
+                                return np.nan
+                            return concordance_index(t, -r, e)
+                        except Exception:
+                            return np.nan
+                    cidx_m = _safe_cidx(
+                        te.loc[mask_m, time_col].values,
+                        te.loc[mask_m, event_col].values,
+                        np.asarray(risk)[mask_m],
+                    )
+                    cidx_f = _safe_cidx(
+                        te.loc[mask_f, time_col].values,
+                        te.loc[mask_f, event_col].values,
+                        np.asarray(risk)[mask_f],
+                    )
+                except Exception:
+                    cidx_m, cidx_f = np.nan, np.nan
+                results[name]["c_index_all"].append(cidx_all)
+                results[name]["c_index_male"].append(cidx_m)
+                results[name]["c_index_female"].append(cidx_f)
+
+    # Summarize mean and std
+    summary_rows = []
+    for model, mvals in results.items():
+        row = {"model": model}
+        for metric, values in mvals.items():
+            arr = np.array(values, dtype=float)
+            row[f"{metric}_mean"] = float(np.nanmean(arr))
+            row[f"{metric}_std"] = float(np.nanstd(arr, ddof=1))
+        summary_rows.append(row)
+    summary_df = pd.DataFrame(summary_rows)
+    if export_excel_path is not None:
+        try:
+            os.makedirs(os.path.dirname(export_excel_path), exist_ok=True)
+            summary_df.to_excel(export_excel_path, index=False)
+        except Exception:
+            pass
+    return results, summary_df
+
+
+# RSF-specific three feature sets (names adapted to rsf.py dataset)
+RSF_FEATURE_SETS: Dict[str, List[str]] = {
+    "Guideline": [
+        "NYHA Class",
+        "LVEF",
+    ],
+    "Benchmark": [
+        "Female",
+        "Age at CMR",
+        "BMI",
+        "AF",
+        "Beta Blocker",
+        "LVEF",
+        "QTc",
+        "NYHA Class",
+        "CRT",
+        "AAD",
+        "LGE_LGE Burden 5SD",
+    ],
+    "Proposed": [
+        "Female",
+        "Age at CMR",
+        "BMI",
+        "DM",
+        "HTN",
+        "HLP",
+        "AF",
+        "NYHA Class",
+        "LVEDVi",
+        "LVEF",
+        "LV Mass Index",
+        "RVEDVi",
+        "RVEF",
+        "LA EF",
+        "LAVi",
+        "LGE_LGE Burden 5SD",
+        "MRF (%)",
+        "Sphericity Index",
+        "Relative Wall Thickness",
+        "MV Annular Diameter",
+        "QRS",
+        "QTc",
+        "Beta Blocker",
+        "ACEi/ARB/ARNi",
+        "Aldosterone Antagonist",
+        "AAD",
+        "CRT",
+    ],
+}
+
+
+def main_rsf_experiments(N: int = 100) -> None:
+    df = load_dataframes()
+    export_path = \
+        "/home/sunx/data/aiiih/projects/sunx/projects/ICD/results_rsf.xlsx"
+    _, summary = run_rsf_experiments(
+        df=df,
+        feature_sets=RSF_FEATURE_SETS,
+        N=N,
+        time_col="PE_Time",
+        event_col="VT/VF/SCD",
+        export_excel_path=export_path,
+    )
+    print("Saved Excel:", export_path)
+
+
+if __name__ == "__main__":
+    # Run RSF experiments to mirror cox.py structure (three feature sets, X runs)
+    try:
+        main_rsf_experiments(N=100)
+    except Exception as e:
+        print("[RSF] Experiments failed:", e)
